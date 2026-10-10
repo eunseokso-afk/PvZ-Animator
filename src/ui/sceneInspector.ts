@@ -5,6 +5,7 @@ import { EASES } from '../editor/reanimDoc';
 import { evalLayer, INSTANCE_LOOPS, keyIndexAt, type LayerKey, type SceneDocument } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
+import { uniqueSceneName } from './exporters';
 import { pickAsset, pickImage, previewSound, thumbnail } from './pickers';
 import { checkbox, numberField, select, type NumberField } from './widgets';
 
@@ -121,7 +122,8 @@ export class SceneInspector {
         const name = nameInput.value.trim();
         if (!name) return;
         if (name === doc.name) return;
-        doc.name = name;
+        doc.name = uniqueSceneName(ws, name, doc);
+        nameInput.value = doc.name;
         doc.path = `scenes/${name}`;
         doc.touchVersion();
         ws.emit('docs');
@@ -312,7 +314,7 @@ export class SceneInspector {
               ),
               h(
                 'button',
-                { class: 'btn small primary', onclick: () => void (layer.kind === 'reanim' ? ws.editPrefab(layer.source, doc) : ws.openAsset(layer.source)) },
+                { class: 'btn small primary', onclick: () => void ws.editPrefab(layer.source, doc, layer) },
                 layer.kind === 'reanim' ? '✎ Edit prefab' : '✎ Edit effect',
               ),
             ),

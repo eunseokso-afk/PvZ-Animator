@@ -298,7 +298,7 @@ function encodeCues(sound: SoundCue[], particle: ParticleCue[]): string {
   return parts.join('|');
 }
 
-function decodeCues(text: string): { sound: SoundCue[]; particle: ParticleCue[] } {
+export function decodeCues(text: string): { sound: SoundCue[]; particle: ParticleCue[] } {
   const sound: SoundCue[] = [];
   const particle: ParticleCue[] = [];
   for (const part of text.split('|')) {

@@ -8,14 +8,14 @@ import { AudioEngine } from '../engine/audio';
 import { clamp, seededRandom } from '../engine/math';
 import { ParticleSystem } from '../engine/particleSystem';
 import { gameHiddenTracks } from '../engine/gameVisibility';
-import { interpolateTransform, isFullLastFrame, isLooping, transformMatrix, type FrameTime } from '../engine/reanimRuntime';
+import { animRangeOf, interpolateTransform, isFullLastFrame, isLooping, transformMatrix, type FrameTime } from '../engine/reanimRuntime';
 import { basename, stripExt } from '../engine/vfs';
 import type { ParticleDefinition } from '../formats/particles';
-import type { ReanimTransform } from '../formats/reanim';
-import type { Prefab } from '../engine/sceneRuntime';
+import type { ReanimDefinition, ReanimTransform } from '../formats/reanim';
+import { instanceFrameTime, type Prefab } from '../engine/sceneRuntime';
 import { ParticleDocument } from './particleDoc';
-import { ReanimDocument, type ParticleCue, type SoundCue } from './reanimDoc';
-import { SceneDocument, type LayerPose, type SceneLayer } from './sceneDoc';
+import { CUE_TRACK_NAME, decodeCues, ReanimDocument, type ParticleCue, type SoundCue } from './reanimDoc';
+import { evalLayer, SceneDocument, type LayerPose, type SceneLayer } from './sceneDoc';
 
 export type EditorDocument = ReanimDocument | ParticleDocument | SceneDocument;
 /** Documents with a frame timeline. */
@@ -165,6 +165,18 @@ export class Workspace extends EventTarget {
     return doc;
   }
 
+  /** Close every document and scene (before opening a project). */
+  reset(): void {
+    this.pause();
+    this.docs = [];
+    this.scenes = [];
+    this.active = null;
+    this.previews.clear();
+    this.sceneParticleCache.clear();
+    this.emit('docs');
+    this.emit('change');
+  }
+
   addScene(doc: SceneDocument): void {
     if (!this.scenes.includes(doc)) this.scenes.push(doc);
     this.emit('docs');
@@ -195,13 +207,25 @@ export class Workspace extends EventTarget {
     return def ? { fps: def.fps, tracks: def.tracks } : def;
   }
 
-  /** Open a prefab's reanim for editing, remembering the scene to return to. */
-  async editPrefab(path: string, from: SceneDocument): Promise<void> {
+  /**
+   * Open a layer's prefab (or particle effect) for editing, remembering the scene to
+   * return to. Given the layer, a prefab opens on the animation and frame it shows now.
+   */
+  async editPrefab(path: string, from: SceneDocument, layer?: SceneLayer): Promise<void> {
     const doc = await this.openAsset(path);
-    if (doc) {
-      this.returnTo.set(doc, from);
-      this.emit('docs');
+    if (!doc) return;
+    this.returnTo.set(doc, from);
+    const pose = layer && evalLayer(layer, from.ui.frame);
+    if (doc.kind === 'reanim' && pose) {
+      const prefab = this.prefab(path);
+      if (prefab && (!pose.key.anim || doc.animRanges().some((r) => r.name === pose.key.anim))) {
+        doc.ui.anim = pose.key.anim;
+        const f = instanceFrameTime(prefab, pose, from.fps, from.ui.frame).before;
+        doc.ui.frame = doc.ui.frameEnd = clamp(f, 0, doc.frameCount - 1);
+      }
     }
+    this.emit('docs');
+    this.emit('change');
   }
 
   openDoc(doc: EditorDocument): void {
@@ -485,10 +509,10 @@ export class Workspace extends EventTarget {
     const inclusive = this.firstTick;
     this.firstTick = false;
     if (next >= end) {
-      this.playSoundCues(scene.state.soundCues, prev, end, inclusive);
+      this.playSceneCues(scene, prev, end, inclusive);
       if (scene.ui.loopPlayback && end > 1) {
         next %= end;
-        this.playSoundCues(scene.state.soundCues, -1e-9, next, false);
+        this.playSceneCues(scene, -1e-9, next, false);
         this.sceneParticleCache.clear();
       } else {
         this.playhead = end - 1;
@@ -498,11 +522,64 @@ export class Workspace extends EventTarget {
         return;
       }
     } else {
-      this.playSoundCues(scene.state.soundCues, prev, next, inclusive);
+      this.playSceneCues(scene, prev, next, inclusive);
     }
     this.playhead = next;
     scene.ui.frame = scene.ui.frameEnd = clamp(Math.floor(next), 0, end - 1);
   }
+
+  /** The scene's own sound cues, plus those of every prefab instance whose animation passes a cue. */
+  private playSceneCues(scene: SceneDocument, from: number, to: number, inclusive: boolean): void {
+    this.playSoundCues(scene.state.soundCues, from, to, inclusive);
+    for (const layer of scene.state.layers) {
+      if (layer.kind !== 'reanim' || scene.ui.hidden.has(layer.uid)) continue;
+      const cues = this.prefabSoundCues(layer.source);
+      const prefab = cues.length ? this.prefab(layer.source) : null;
+      if (!prefab) continue;
+      const pose = evalLayer(layer, Math.max(0, to));
+      if (!pose || !pose.visible || pose.key.loop === 'single') continue;
+      const range = animRangeOf({ fps: prefab.fps, tracks: prefab.tracks as ReanimDefinition['tracks'] }, pose.key.anim);
+      const last = range.count - 1;
+      // Unwrapped position in the animation (frames from its start, counting loops).
+      const raw = (f: number, p: LayerPose) => {
+        const ft = instanceFrameTime(prefab, p, scene.fps, f);
+        return ft.before - range.start + ft.fraction + (ft.loops ?? 0) * last;
+      };
+      const prevPose = from >= 0 ? evalLayer(layer, from) : null;
+      // A fresh start (layer appears or its animation restarts) plays cues on its first frame too.
+      const fresh = !prevPose || !prevPose.visible || prevPose.segmentStart !== pose.segmentStart;
+      const a = fresh ? -1e-9 : raw(from, prevPose) - (inclusive ? 1e-9 : 0);
+      const b = raw(to, pose);
+      for (const cue of cues) {
+        const rel = cue.frame - range.start;
+        if (rel < 0 || rel > last) continue;
+        let hit = a < rel && rel <= b;
+        if (!hit && pose.key.loop === 'loop' && last > 0) {
+          // Any later pass: rel + k * last inside (a, b].
+          const k = Math.ceil((a - rel) / last + 1e-9);
+          hit = k > 0 && rel + k * last <= b;
+        }
+        if (hit) this.playSoundCues([cue], -1, cue.frame, false);
+      }
+    }
+  }
+
+  /** Sound cues stored with a prefab: its open document's, or the embedded cue track of the file. */
+  private prefabSoundCues(path: string): SoundCue[] {
+    const doc = this.findDocFor(path);
+    if (doc?.kind === 'reanim') return doc.state.soundCues;
+    const def = this.assets.reanim(path);
+    if (!def) return [];
+    let cues = this.fileCues.get(def);
+    if (!cues) {
+      const track = def.tracks.find((t) => t.name === CUE_TRACK_NAME);
+      cues = track ? decodeCues(track.transforms[0]?.text ?? '').sound : [];
+      this.fileCues.set(def, cues);
+    }
+    return cues;
+  }
+
+  private fileCues = new WeakMap<object, SoundCue[]>();
 
   private playSoundCues(cues: SoundCue[], from: number, to: number, inclusive: boolean): void {
     if (!this.soundEnabled) return;
@@ -535,17 +612,24 @@ export class Workspace extends EventTarget {
       const live = new Set(scene.state.layers.map((l) => l.uid));
       for (const uid of this.sceneParticleCache.keys()) if (!live.has(uid)) this.sceneParticleCache.delete(uid);
     }
+    // The emitter follows the layer's path tick by tick, so a frame looks the same however
+    // it is reached (jumping, stepping, playing or exporting).
+    const at = (tick: number) => evalLayer(layer, trigger + (tick * scene.fps) / 100) ?? pose;
     let p = this.sceneParticleCache.get(layer.uid);
     if (!p || p.def !== def || p.rev !== rev || p.trigger !== trigger || p.ticks > target) {
-      p = { sys: new ParticleSystem(def, pose.x, pose.y, seededRandom(layer.uid * 7919 + trigger)), ticks: 0, trigger, def, rev };
+      const start = at(0);
+      p = { sys: new ParticleSystem(def, start.x, start.y, seededRandom((layer.seed ?? layer.uid) * 7919 + trigger)), ticks: 0, trigger, def, rev };
       this.sceneParticleCache.set(layer.uid, p);
     }
-    p.sys.setPosition(pose.x, pose.y);
-    let budget = 3000;
+    // Simulate all the way (an hour of effect at most), so the result never depends on earlier renders.
+    let budget = 360_000;
     while (p.ticks < target && budget-- > 0) {
+      const q = at(p.ticks);
+      p.sys.setPosition(q.x, q.y);
       p.sys.tick();
       p.ticks++;
     }
+    p.sys.setPosition(pose.x, pose.y);
     return p.sys.dead ? null : p.sys;
   }
 

@@ -384,8 +384,7 @@ export class SceneStage {
     const hit = this.hitLayer(doc, x, y);
     const layer = doc.state.layers[hit];
     if (!layer) return;
-    if (layer.kind === 'reanim') void this.ws.editPrefab(layer.source, doc);
-    else if (layer.kind === 'particle') void this.ws.openAsset(layer.source);
+    if (layer.kind !== 'image') void this.ws.editPrefab(layer.source, doc, layer);
   }
 
   nudge(doc: SceneDocument, dx: number, dy: number): void {
@@ -471,8 +470,8 @@ export class SceneStage {
     const pose = evalLayer(layer, doc.ui.frame);
     const locked = doc.isLocked(li);
     return [
-      ...(layer.kind === 'reanim' ? [{ label: 'Edit prefab', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc) }] : []),
-      ...(layer.kind === 'particle' ? [{ label: 'Edit effect', action: () => void ws.openAsset(layer.source) }] : []),
+      ...(layer.kind === 'reanim' ? [{ label: 'Edit prefab', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc, layer) }] : []),
+      ...(layer.kind === 'particle' ? [{ label: 'Edit effect', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc, layer) }] : []),
       { label: 'Flip horizontally', disabled: !pose || locked, action: () => (this.flip(doc, li, !pose!.flipX), emit()) },
       { label: 'Duplicate', shortcut: 'Ctrl+D', action: () => ((doc.ui.layer = doc.duplicateLayer(li)), emit()) },
       { label: 'Delete layer', shortcut: 'Del', disabled: locked, action: () => (doc.removeLayer(li), emit()) },

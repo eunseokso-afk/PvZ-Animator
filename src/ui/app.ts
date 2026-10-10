@@ -11,7 +11,7 @@ import { cloneSceneState, SceneDocument } from '../editor/sceneDoc';
 import type { EditorDocument, Workspace } from '../editor/workspace';
 import { AssetBrowser } from './assetBrowser';
 import { downloadBlob, h, isTextInput, pickFiles } from './dom';
-import { applyToLibrary, bakeSceneDialog, exportCurrentDoc, exportFrames, exportPak, exportVideo, extractFile, loadProject, saveProject } from './exporters';
+import { applyToLibrary, bakeSceneDialog, exportCurrentDoc, exportFrames, exportPak, exportVideo, extractFile, loadProject, saveProject, uniqueSceneName } from './exporters';
 import { ReanimInspector } from './inspector';
 import { ParticleInspector, ParticlePanel } from './particleEditor';
 import { clearThumbnails, pickAsset, pickImage, previewSound } from './pickers';
@@ -783,7 +783,7 @@ export class App {
           action: async () => {
             const name = await promptText('Rename scene', 'Scene name', scene.name);
             if (name?.trim() && name.trim() !== scene.name) {
-              scene.name = name.trim();
+              scene.name = uniqueSceneName(ws, name.trim(), scene);
               scene.path = `scenes/${scene.name}`;
               scene.touchVersion();
               ws.emit('docs');
@@ -793,7 +793,7 @@ export class App {
         {
           label: 'Duplicate',
           action: () => {
-            const copy = SceneDocument.fromState(`${scene.name} copy`, cloneSceneState(scene.state));
+            const copy = SceneDocument.fromState(uniqueSceneName(ws, `${scene.name} copy`), cloneSceneState(scene.state));
             ws.addScene(copy);
             ws.openDoc(copy);
           },

@@ -182,12 +182,17 @@ interface ProjectDoc {
   ease?: Record<string, Ease>[];
   anim?: string;
   loop?: string;
+  /** Whether the document had changes not yet in the library (missing in older projects). */
+  dirty?: boolean;
 }
 
 interface ProjectScene {
   name: string;
   open: boolean;
   state: SceneState;
+  /** Indexes of layers hidden / locked in the editor. */
+  hidden?: number[];
+  locked?: number[];
 }
 
 interface ProjectFile {
@@ -202,7 +207,10 @@ interface ProjectFile {
 
 export async function saveProject(ws: Workspace): Promise<void> {
   const docs: ProjectDoc[] = ws.docs.flatMap((d): ProjectDoc[] => (d.kind === 'scene' ? [] : [projectDoc(d)]));
-  const scenes: ProjectScene[] = ws.scenes.map((sc) => ({ name: sc.name, open: ws.docs.includes(sc), state: sc.state }));
+  const scenes: ProjectScene[] = ws.scenes.map((sc) => {
+    const indexes = (set: Set<number>) => sc.state.layers.flatMap((l, i) => (set.has(l.uid) ? [i] : []));
+    return { name: sc.name, open: ws.docs.includes(sc), state: sc.state, hidden: indexes(sc.ui.hidden), locked: indexes(sc.ui.locked) };
+  });
   const files: ProjectFile['files'] = [];
   for (const f of ws.assets.vfs.list()) {
     if (f.origin === 'pak') continue;
@@ -217,7 +225,7 @@ export async function saveProject(ws: Workspace): Promise<void> {
 }
 
 function projectDoc(d: ReanimDocument | ParticleDocument): ProjectDoc {
-  if (d.kind === 'particle') return { kind: 'particle', name: d.name, path: d.path, isNew: d.isNew, xml: serializeParticleXml(d.def) };
+  if (d.kind === 'particle') return { kind: 'particle', name: d.name, path: d.path, isNew: d.isNew, dirty: d.dirty, xml: serializeParticleXml(d.def) };
   const tracks = d.state.tracks;
   return {
     kind: 'reanim',
@@ -229,6 +237,7 @@ function projectDoc(d: ReanimDocument | ParticleDocument): ProjectDoc {
     ease: tracks.map((t) => Object.fromEntries(t.ease.flatMap((e, i) => (t.keys[i] && e !== 'linear' ? [[String(i), e]] : [])))),
     anim: d.ui.anim,
     loop: d.ui.loop,
+    dirty: d.dirty,
   };
 }
 
@@ -236,6 +245,12 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
   const text = new TextDecoder().decode(await fileBytes(file));
   const p = JSON.parse(text) as ProjectFile;
   if (p.format !== 'pvz-animator-project') throw new Error('Not a PvZ Animator project file.');
+  // A project replaces the open documents and scenes instead of being merged into them.
+  if (ws.docs.length || ws.scenes.length) {
+    const unsaved = ws.docs.some((d) => d.dirty) || ws.scenes.some((s) => s.dirty);
+    if (unsaved && !(await confirmDialog('Open project', 'Opening a project closes the open documents and scenes. Unsaved changes will be lost.', 'Open project', true))) return;
+    ws.reset();
+  }
   await ws.assets.importFiles(
     p.files.filter((f) => f.origin === 'import').map((f) => ({ path: f.path, data: fromBase64(f.data) })),
   );
@@ -264,23 +279,39 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
       doc = ParticleDocument.fromDefinition(parseParticleXml(d.xml), d.name, d.path);
     }
     doc.isNew = d.isNew;
-    doc.savedVersion = -1;
+    // Unchanged documents stay unchanged (so Build main.pak doesn't repack them).
+    if (d.dirty === false && ws.assets.vfs.has(d.path)) doc.markSaved();
+    else doc.savedVersion = -1;
     ws.openDoc(doc);
   }
   for (const sc of p.scenes ?? []) {
     const state = sc.state;
     // Fresh ids so they never collide with ids handed out in this session.
     for (const l of state.layers) {
+      // Keep particle randomness tied to the saved layer, not to this session's ids.
+      l.seed ??= l.uid;
       l.uid = nextUid();
       for (const k of l.keys) k.tint = [...(k.tint ?? [1, 1, 1])] as [number, number, number];
     }
     for (const c of state.soundCues) c.uid = nextUid();
-    const doc = SceneDocument.fromState(sc.name, state);
+    const doc = SceneDocument.fromState(uniqueSceneName(ws, sc.name), state);
+    for (const i of sc.hidden ?? []) if (state.layers[i]) doc.ui.hidden.add(state.layers[i].uid);
+    for (const i of sc.locked ?? []) if (state.layers[i]) doc.ui.locked.add(state.layers[i].uid);
     doc.markSaved();
     ws.addScene(doc);
     if (sc.open) ws.openDoc(doc);
   }
   ws.status(`Loaded project with ${p.docs.length} documents, ${(p.scenes ?? []).length} scenes${p.pakName && !ws.assets.pak ? ` — open ${p.pakName} to see game assets` : ''}.`, 'success');
+}
+
+/** `name`, or `name 2`, `name 3`… if another scene already uses it (ignoring `except`). */
+export function uniqueSceneName(ws: Workspace, name: string, except?: SceneDocument): string {
+  const taken = new Set(ws.scenes.filter((s) => s !== except).map((s) => s.name.toLowerCase()));
+  if (!taken.has(name.toLowerCase())) return name;
+  const base = name.replace(/ \d+$/, '');
+  let n = 2;
+  while (taken.has(`${base} ${n}`.toLowerCase())) n++;
+  return `${base} ${n}`;
 }
 
 // ---------------------------------------------------------------- rendering exports
@@ -505,7 +536,31 @@ function canvasToPng(c: HTMLCanvasElement): Promise<Uint8Array> {
   );
 }
 
+/** Browsers refuse canvases wider or taller than about 16384 px, or larger than about 268M px. */
+const MAX_CANVAS_SIDE = 16384;
+const MAX_CANVAS_AREA = 268_000_000;
+
+/** Columns for a sprite sheet that fits the browser's canvas limits, or null if none does. */
+export function sheetLayout(n: number, w: number, h: number): { cols: number; rows: number } | null {
+  const maxCols = Math.floor(MAX_CANVAS_SIDE / w);
+  const maxRows = Math.floor(MAX_CANVAS_SIDE / h);
+  if (maxCols < 1 || maxRows < 1 || n * w * h > MAX_CANVAS_AREA) return null;
+  let cols = Math.min(maxCols, Math.ceil(Math.sqrt(n)));
+  if (Math.ceil(n / cols) > maxRows) cols = Math.min(maxCols, Math.ceil(n / maxRows));
+  const rows = Math.ceil(n / cols);
+  if (rows > maxRows || cols * w * rows * h > MAX_CANVAS_AREA) return null;
+  return { cols, rows };
+}
+
 export async function exportFrames(ws: Workspace): Promise<void> {
+  try {
+    await exportFramesInner(ws);
+  } catch (e) {
+    ws.status(`Frame export failed: ${e instanceof Error ? e.message : String(e)}`, 'error');
+  }
+}
+
+async function exportFramesInner(ws: Workspace): Promise<void> {
   ws.pause();
   const target = await exportTarget(ws);
   if (!target) return;
@@ -531,10 +586,19 @@ export async function exportFrames(ws: Workspace): Promise<void> {
     { scale: 1, padding: 8 },
   );
   if (!setup) return;
+  const n = target.frames.length;
+  let cols = Math.ceil(Math.sqrt(n));
+  if (mode === 'sheet') {
+    const layout = sheetLayout(n, setup.width, setup.height);
+    if (!layout) {
+      ws.status(`A ${n}-frame sprite sheet of ${setup.width}×${setup.height} frames is larger than browsers allow. Export a PNG sequence, a lower scale or fewer frames.`, 'error');
+      return;
+    }
+    cols = layout.cols;
+  }
   const r = createRenderer(document.createElement('canvas'));
   r.resize(setup.width, setup.height, 1);
   const pngs: Uint8Array[] = [];
-  const cols = Math.ceil(Math.sqrt(target.frames.length));
   const sheet = mode === 'sheet' ? document.createElement('canvas') : null;
   if (sheet) {
     sheet.width = cols * setup.width;
@@ -566,6 +630,14 @@ export async function exportFrames(ws: Workspace): Promise<void> {
 }
 
 export async function exportVideo(ws: Workspace): Promise<void> {
+  try {
+    await exportVideoInner(ws);
+  } catch (e) {
+    ws.status(`Video export failed: ${e instanceof Error ? e.message : String(e)}`, 'error');
+  }
+}
+
+async function exportVideoInner(ws: Workspace): Promise<void> {
   if (typeof MediaRecorder === 'undefined') {
     ws.status('Video export needs MediaRecorder support (Chrome, Edge or Firefox).', 'error');
     return;
@@ -620,7 +692,8 @@ export async function exportVideo(ws: Workspace): Promise<void> {
         }
         renderFrameTo(target, r, setup, ws.playing ? ws.playhead : target.playingFrame());
         ctx.clearRect(0, 0, out.width, out.height);
-        ctx.drawImage(r.canvas, 0, 0);
+        // Fill the even-size padding too (video encoders need even sizes) instead of leaving a black edge.
+        ctx.drawImage(r.canvas, 0, 0, out.width, out.height);
         if (!ws.playing) {
           setTimeout(resolve, 200);
           return;
@@ -672,6 +745,15 @@ export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Prom
       { class: 'form-col' },
       h('p', null, `Flattens every instance into one reanim: ${parts} part track${parts === 1 ? '' : 's'}, ${scene.state.length} frames at ${scene.state.fps} fps, playable in the game as `, h('b', null, 'anim_scene'), '.'),
       warnings.length ? h('ul', { class: 'warn small' }, warnings.map((w) => h('li', null, w))) : null,
+      scene.state.soundCues.length
+        ? h(
+            'p',
+            { class: 'dim small' },
+            ws.settings.embedCues
+              ? `The ${scene.state.soundCues.length} sound cue(s) go into the reanim's hidden cue track (the game ignores it; PvZ Animator plays them).`
+              : `The ${scene.state.soundCues.length} sound cue(s) stay in the open document only: embedding cues in exported reanims is turned off (Edit menu).`,
+          )
+        : null,
       h('label', { class: 'field-col' }, 'Save as', pathInput),
       checkbox('Open it for editing', open, (v) => (open = v)),
       checkbox('Add it to the library (included in Build main.pak)', library, (v) => (library = v)),
@@ -696,7 +778,10 @@ export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Prom
     const unsaved = existing?.dirty ? ' Its open tab has unsaved changes, which will be lost.' : '';
     if (!(await confirmDialog('Replace file?', `${path} already exists.${unsaved} Replace it with the baked scene?`, 'Replace', true))) return;
   }
-  const xml = serializeReanimXml(definition);
+  // The baked frames are the scene's frames, so the scene's sound cues carry over unchanged.
+  const doc = ReanimDocument.fromDefinition(definition, name, path, ws.settings.simplifyOnImport);
+  doc.state.soundCues = scene.state.soundCues.map((c) => ({ ...c, uid: nextUid() }));
+  const xml = serializeReanimXml(doc.toDefinition(ws.settings.embedCues));
   if (download) downloadBlob(new Blob([xml], { type: 'text/xml' }), basename(path));
   if (library) {
     ws.assets.vfs.set(memoryFile(path, enc.encode(xml), 'generated'));
@@ -704,7 +789,6 @@ export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Prom
   }
   if (existing) ws.closeDoc(existing);
   if (open) {
-    const doc = ReanimDocument.fromDefinition(parseReanimXml(xml), name, path, ws.settings.simplifyOnImport);
     if (library) doc.markSaved();
     ws.openDoc(doc);
   }

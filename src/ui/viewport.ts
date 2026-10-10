@@ -175,7 +175,9 @@ export class Viewport {
       h('button', { class: 'btn small', title: `Back to ${scene.name}`, onclick: () => ws.openDoc(scene) }, `⬅ ${scene.name}`),
       h('span', { class: 'crumb' }, '🎬 ', scene.name),
       h('span', { class: 'crumb-sep' }, '›'),
-      h('span', { class: 'crumb current' }, '▶ ', doc.name, h('span', { class: 'dim' }, '  (prefab — changes show up in the scene)')),
+      doc.kind === 'particle'
+        ? h('span', { class: 'crumb current' }, '✦ ', doc.name, h('span', { class: 'dim' }, '  (effect — changes show up in the scene)'))
+        : h('span', { class: 'crumb current' }, '▶ ', doc.name, h('span', { class: 'dim' }, '  (prefab — changes show up in the scene)')),
     );
   }
 

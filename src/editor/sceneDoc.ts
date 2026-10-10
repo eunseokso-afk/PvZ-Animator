@@ -54,6 +54,8 @@ export interface SceneLayer {
   source: string;
   /** Sorted by frame; never empty. */
   keys: LayerKey[];
+  /** Random seed for a particle layer's simulation, saved so effects look the same after reloading. */
+  seed?: number;
 }
 
 export interface SceneState {
@@ -290,13 +292,16 @@ export class SceneDocument extends DocumentBase<SceneState> {
   uniqueLayerName(base: string): string {
     const names = new Set(this.state.layers.map((l) => l.name.toLowerCase()));
     if (!names.has(base.toLowerCase())) return base;
+    // "Shooter 2" duplicates to "Shooter 3", not "Shooter 2 2".
+    base = base.replace(/ \d+$/, '');
     let i = 2;
     while (names.has(`${base} ${i}`.toLowerCase())) i++;
     return `${base} ${i}`;
   }
 
   addLayer(kind: LayerKind, source: string, name: string, key: Partial<LayerKey>, frame = this.ui.frame): number {
-    const layer: SceneLayer = { uid: nextUid(), name: this.uniqueLayerName(name), kind, source, keys: [defaultKey(frame, key)] };
+    const uid = nextUid();
+    const layer: SceneLayer = { uid, name: this.uniqueLayerName(name), kind, source, keys: [defaultKey(frame, key)], seed: uid };
     this.edit('Add layer', (s) => s.layers.push(layer));
     return this.state.layers.length - 1;
   }
@@ -312,6 +317,7 @@ export class SceneDocument extends DocumentBase<SceneState> {
     if (!src) return -1;
     const copy = cloneLayer(src);
     copy.uid = nextUid();
+    copy.seed = copy.uid;
     copy.name = this.uniqueLayerName(src.name);
     for (const k of copy.keys) {
       k.x += 20;
