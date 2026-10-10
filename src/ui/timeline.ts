@@ -6,6 +6,7 @@
 import { clamp } from '../engine/math';
 import { LOOP_MODES, type LoopMode } from '../engine/reanimRuntime';
 import { basename } from '../engine/vfs';
+import { gameHiddenTracks } from '../engine/gameVisibility';
 import { isMarkerTrack, isRangeTrack } from '../formats/reanim';
 import { EASES, type ReanimDocument } from '../editor/reanimDoc';
 import type { Workspace } from '../editor/workspace';
@@ -370,12 +371,16 @@ export class Timeline {
 
   // ------------------------------------------------------------ drawing
 
+  /** Tracks the game hides from code, computed once per draw. */
+  private gameHidden: Set<number> | null = null;
+
   draw(): void {
     const ctx = this.canvas.getContext('2d')!;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.fillStyle = C.bg;
     ctx.fillRect(0, 0, this.cssW, this.cssH);
     const doc = this.doc;
+    this.gameHidden = doc && this.ws.settings.gameVisibility ? gameHiddenTracks(doc.state.tracks) : null;
     if (!doc) {
       ctx.fillStyle = C.dim;
       ctx.font = '12px system-ui, sans-serif';
@@ -672,11 +677,13 @@ export class Timeline {
     if (!track) return;
     const hidden = doc.ui.hidden.has(track.uid);
     const locked = doc.ui.locked.has(track.uid);
-    ctx.fillStyle = hidden ? '#5a606c' : C.text;
-    ctx.fillText(hidden ? '◌' : '●', 8, y + 14);
+    // Hidden by the game's code (View ▸ In-game part visibility): a hollow, tinted eye.
+    const gameHidden = !hidden && !!this.gameHidden?.has(row.trackIndex);
+    ctx.fillStyle = hidden ? '#5a606c' : gameHidden ? '#c99a5b' : C.text;
+    ctx.fillText(hidden || gameHidden ? '◌' : '●', 8, y + 14);
     ctx.fillStyle = locked ? C.sel : '#5a606c';
     ctx.fillText(locked ? '🔒' : '·', 26, y + 14);
-    const marker = isMarkerTrack(track);
+    const marker = isMarkerTrack(track) || gameHidden;
     ctx.fillStyle = marker ? C.dim : hidden ? '#7d8494' : C.text;
     ctx.font = marker ? 'italic 12px system-ui, sans-serif' : '12px system-ui, sans-serif';
     let name = track.name;

@@ -3,6 +3,7 @@
  * emitters or images, positioned by their tweened keyframes.
  */
 
+import { gameHiddenTracks } from './gameVisibility';
 import { DEFAULT_TRANSFORM, isRangeTrack, type ReanimDefinition, type ReanimTransform } from '../formats/reanim';
 import type { LayerPose, SceneLayer, SceneState } from '../editor/sceneDoc';
 import { evalLayer, poseMatrix } from '../editor/sceneDoc';
@@ -23,6 +24,8 @@ export interface SceneResolver {
   prefab(path: string): Prefab | null | undefined;
   /** Particle system for a particle layer at a frame (positioned and simulated), if available. */
   particles?(layer: SceneLayer, pose: LayerPose, frame: number): ParticleSystem | null;
+  /** Hide the parts the game hides from code (e.g. a plain zombie's accessories). */
+  gameVisibility?: boolean;
 }
 
 /** Prefab frames per second an instance's playhead moves at (Reanimation::Update: a pass lasts count / fps). */
@@ -43,11 +46,14 @@ export function instanceFrameTime(prefab: Prefab, pose: LayerPose, sceneFps: num
   const seconds = Math.max(0, frame - pose.segmentStart) / Math.max(1e-6, sceneFps);
   // As in the game, one pass of a count-frame animation takes count / fps seconds.
   let pos = offset + seconds * instanceFps(prefab, range.count, key.speed);
-  if (key.loop === 'loop') pos %= last;
-  else pos = Math.min(pos, last);
+  let loops = 0;
+  if (key.loop === 'loop') {
+    loops = Math.floor(pos / last);
+    pos -= loops * last;
+  } else pos = Math.min(pos, last);
   const before = Math.floor(pos);
   const after = Math.min(before + 1, last);
-  return { before: range.start + before, after: range.start + after, fraction: before >= last ? 0 : pos - before };
+  return { before: range.start + before, after: range.start + after, fraction: before >= last ? 0 : pos - before, loops };
 }
 
 export interface DrawnLayer {
@@ -117,11 +123,14 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
       if (prefab) {
         const ft = instanceFrameTime(prefab, pose, scene.fps, frame);
         const range = animRangeOf({ fps: prefab.fps, tracks: prefab.tracks as ReanimDefinition['tracks'] }, pose.key.anim);
+        const game = res.gameVisibility ? gameHiddenTracks(prefab.tracks) : null;
         drawReanim(r, assets, prefab.tracks, ft, m, {
           color,
           fps: instanceFps(prefab, range.count, pose.key.speed > 0 ? pose.key.speed : 1),
-          rangeStart: range.start,
+          range: { start: range.start, end: range.start + range.count - 1 },
           screen: view,
+          gameVisibility: res.gameVisibility,
+          hidden: game?.size ? (i) => game.has(i) : undefined,
           collect: parts,
         });
       } else if (prefab === null) {
@@ -220,8 +229,9 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
       warnings.push(`Prefab "${layer.source}" for layer "${layer.name}" is not loaded; it was skipped.`);
       continue;
     }
-    prefab.tracks.forEach((track) => {
-      if (isRangeTrack(track) || track.transforms.length === 0) return;
+    const game = res.gameVisibility ? gameHiddenTracks(prefab.tracks) : null;
+    prefab.tracks.forEach((track, ti) => {
+      if (isRangeTrack(track) || track.transforms.length === 0 || game?.has(ti)) return;
       const transforms: ReanimTransform[] = [];
       let any = false;
       for (let f = 0; f < n; f++) {

@@ -47,11 +47,11 @@ describe('scene layers', () => {
     const l = layer([{ anim: 'anim_b', loop: 'loop' }], [0]);
     // Like the game, one pass of the 3-frame anim_b at 10 fps takes 3 / 10 s = 9 scene frames at 30 fps,
     // so the playhead covers the 2 intervals at 10 * 2 / 3 prefab frames per second.
-    expect(instanceFrameTime(prefab, evalLayer(l, 0)!, 30, 0)).toEqual({ before: 3, after: 4, fraction: 0 });
-    expect(instanceFrameTime(prefab, evalLayer(l, 4.5)!, 30, 4.5)).toEqual({ before: 4, after: 5, fraction: 0 });
-    expect(instanceFrameTime(prefab, evalLayer(l, 9)!, 30, 9).before).toBe(3); // wrapped
+    expect(instanceFrameTime(prefab, evalLayer(l, 0)!, 30, 0)).toEqual({ before: 3, after: 4, fraction: 0, loops: 0 });
+    expect(instanceFrameTime(prefab, evalLayer(l, 4.5)!, 30, 4.5)).toEqual({ before: 4, after: 5, fraction: 0, loops: 0 });
+    expect(instanceFrameTime(prefab, evalLayer(l, 9)!, 30, 9)).toMatchObject({ before: 3, loops: 1 }); // wrapped
     l.keys[0].loop = 'once';
-    expect(instanceFrameTime(prefab, evalLayer(l, 60)!, 30, 60)).toEqual({ before: 5, after: 5, fraction: 0 });
+    expect(instanceFrameTime(prefab, evalLayer(l, 60)!, 30, 60)).toMatchObject({ before: 5, after: 5, fraction: 0 });
     l.keys[0].loop = 'single';
     l.keys[0].startFrame = 1;
     expect(instanceFrameTime(prefab, evalLayer(l, 60)!, 30, 60).before).toBe(4);

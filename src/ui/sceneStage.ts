@@ -58,6 +58,7 @@ export class SceneStage {
       assets: ws.assets,
       prefab: (path) => ws.prefab(path),
       particles: (layer, pose, frame) => ws.sceneParticles(doc, layer, pose, frame),
+      gameVisibility: ws.settings.gameVisibility,
     };
   }
 

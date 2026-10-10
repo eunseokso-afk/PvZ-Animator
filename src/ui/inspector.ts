@@ -1,6 +1,7 @@
 /** Right-hand property panel for reanim documents. */
 
 import { basename } from '../engine/vfs';
+import { gameHiddenTracks } from '../engine/gameVisibility';
 import { isRangeTrack, type ReanimTransform } from '../formats/reanim';
 import { EASES, type ReanimDocument } from '../editor/reanimDoc';
 import type { Workspace } from '../editor/workspace';
@@ -35,6 +36,10 @@ export class ReanimInspector {
     ws.on('docs', refresh);
     ws.on('frame', refresh);
     ws.on('assets', () => {
+      this.lastSig = '';
+      refresh();
+    });
+    ws.on('settings', () => {
       this.lastSig = '';
       refresh();
     });
@@ -250,6 +255,9 @@ export class ReanimInspector {
       h('h3', null, 'Part', h('span', { class: 'dim small' }, ` #${ti}`)),
       h('label', { class: 'field-col' }, 'Track name', nameInput),
       isRangeTrack(track) ? h('div', { class: 'dim small' }, 'anim_ tracks without images mark animation ranges (f = 0 inside, -1 outside).') : null,
+      ws.settings.gameVisibility && gameHiddenTracks(doc.state.tracks).has(ti)
+        ? h('div', { class: 'dim small' }, 'The game hides this part in code unless a zombie type needs it, so it is shown faded only while selected (View ▸ In-game part visibility).')
+        : null,
       track.name.toLowerCase().startsWith('attacher__')
         ? h('div', { class: 'dim small' }, 'Attacher: the text holds "attacher__Reanim__anim_name[fps][once|hold]"; that animation is drawn at this part.')
         : t.text && !t.font

@@ -124,8 +124,10 @@ directory order. Paths are case-insensitive.
 with `f = 0`; the game draws every track that has an image whatever its name (a zombie's head is
 `anim_head1`). Text is drawn only when `font` is set: `attacher__` tracks keep their
 `attacher__Reanim__anim_name[fps][once|hold]` spec in `text`. The image is drawn with its top-left
-corner at the transform origin. Some parts are hidden by the game's code rather than the file (for
-example zombie tongues and accessories), so a raw reanim can show more than the game does.
+corner at the transform origin. Some parts are hidden by the game's code rather than the file: a plain
+zombie hides its cone, bucket, screen door, flag, ducky tube, tongue and mustache, and the credits hide
+most dancers' tongues. **View ▸ In-game part visibility** (on by default) previews them the game's way;
+turn it off to see every part. The files themselves are never changed.
 
 **Compiled reanim** — `u32 0xDEADFED4`, `u32 uncompressedSize`, then zlib data holding the game's
 in-memory structs (schema hash, definition, tracks, transforms and length-prefixed strings).

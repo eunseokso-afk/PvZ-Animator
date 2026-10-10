@@ -7,6 +7,7 @@ import { AssetLibrary } from '../engine/assets';
 import { AudioEngine } from '../engine/audio';
 import { clamp, seededRandom } from '../engine/math';
 import { ParticleSystem } from '../engine/particleSystem';
+import { gameHiddenTracks } from '../engine/gameVisibility';
 import { interpolateTransform, isFullLastFrame, isLooping, transformMatrix, type FrameTime } from '../engine/reanimRuntime';
 import { basename, stripExt } from '../engine/vfs';
 import type { ParticleDefinition } from '../formats/particles';
@@ -30,6 +31,8 @@ export interface Settings {
   lawnGuide: boolean;
   onion: boolean;
   showBounds: boolean;
+  /** Hide parts the game hides from code (zombie accessories, most credits tongues). */
+  gameVisibility: boolean;
 }
 
 const SETTINGS_KEY = 'pvz-animator-settings';
@@ -43,6 +46,7 @@ function loadSettings(): Settings {
     lawnGuide: false,
     onion: false,
     showBounds: true,
+    gameVisibility: true,
   };
   try {
     return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
@@ -84,6 +88,8 @@ export class Workspace extends EventTarget {
   speed = 1;
   /** Fractional frame position while playing. */
   playhead = 0;
+  /** Times the playing reanim wrapped back to the start of its range (attachments run on across it). */
+  loops = 0;
   soundEnabled = true;
   private firstTick = false;
 
@@ -301,10 +307,16 @@ export class Workspace extends EventTarget {
       const { end } = doc.activeRange();
       const before = Math.min(Math.floor(this.playhead), end);
       const after = Math.min(before + 1, end);
-      return { before, after, fraction: before >= end ? 0 : this.playhead - Math.floor(this.playhead) };
+      return { before, after, fraction: before >= end ? 0 : this.playhead - Math.floor(this.playhead), loops: this.loops };
     }
     const f = clamp(doc.ui.frame, 0, doc.frameCount - 1);
     return { before: f, after: f, fraction: 0 };
+  }
+
+  /** Which tracks of a reanim document are not drawn: hidden in the editor, or by the game's code. */
+  hiddenTracks(doc: ReanimDocument): (trackIndex: number) => boolean {
+    const game = this.settings.gameVisibility ? gameHiddenTracks(doc.state.tracks) : null;
+    return (i) => doc.ui.hidden.has(doc.state.tracks[i]?.uid) || !!game?.has(i);
   }
 
   /**
@@ -342,6 +354,7 @@ export class Workspace extends EventTarget {
     if (!doc || this.playing) return;
     const { start, end } = doc.activeRange();
     let f = doc.ui.frame;
+    this.loops = 0;
     if (f < start || f > end) f = start;
     if (f >= end && !isLooping(doc.ui.loop)) f = start;
     this.playhead = f;
@@ -429,6 +442,7 @@ export class Workspace extends EventTarget {
       } else if (next >= endPos) {
         fire.push([prev, endPos - 1e-9]);
         if (isLooping(doc.ui.loop)) {
+          this.loops += Math.floor((next - start) / span);
           next = start + ((next - start) % span);
           fire.push([start - 1e-9, next]);
         } else {

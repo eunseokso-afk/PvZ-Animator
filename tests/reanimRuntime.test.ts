@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_TRANSFORM, getAnimRanges, isRangeTrack, type ReanimDefinition, type ReanimTransform } from '../src/formats/reanim';
 import { drawReanim, type DrawTrackInfo } from '../src/engine/reanimRuntime';
+import { gameHiddenTracks } from '../src/engine/gameVisibility';
 import type { AssetLibrary, LoadedImage } from '../src/engine/assets';
 import type { Renderer } from '../src/engine/renderer';
 import type { Mat } from '../src/engine/math';
@@ -106,10 +107,10 @@ describe('attachers', () => {
     expect(xAt(9)).toBe(0);
   });
 
-  const run = (texts: string[], frame: number, opts: { rangeStart?: number } = {}) => {
+  const run = (texts: string[], frame: number, opts: { range?: { start: number; end: number }; loops?: number; gameVisibility?: boolean } = {}) => {
     const r = recorder();
     const tracks = [{ name: 'attacher__Child', transforms: texts.map((text) => tr({ text })) }];
-    drawReanim(r, assets(child), tracks, at(frame), [1, 0, 0, 1, 0, 0], { fps: 10, ...opts });
+    drawReanim(r, assets(child), tracks, { ...at(frame), loops: opts.loops }, [1, 0, 0, 1, 0, 0], { fps: 10, range: opts.range, gameVisibility: opts.gameVisibility });
     return r.xs[0];
   };
 
@@ -128,14 +129,64 @@ describe('attachers', () => {
   it('times attachers from the start of the animation being played', () => {
     const texts = Array(8).fill('attacher__Child__anim_a[10]');
     expect(run(texts, 6)).toBe(1.5);
-    expect(run(texts, 6, { rangeStart: 4 })).toBe(1.5);
-    expect(run(texts, 6, { rangeStart: 6 })).toBe(0);
+    expect(run(texts, 6, { range: { start: 4, end: 7 } })).toBe(1.5);
+    expect(run(texts, 6, { range: { start: 6, end: 7 } })).toBe(0);
+  });
+
+  it('keeps an unchanged attachment running when a looping parent wraps', () => {
+    // Range 2-5 (one pass = 3 parent frames = 0.3 s = 0.75 of the child's 4-frame loop).
+    const texts = Array(8).fill('attacher__Child__anim_a[10]');
+    const range = { start: 2, end: 5 };
+    expect(run(texts, 2, { range })).toBe(0);
+    // One wrap later the child is 0.75 passes on (frame 2.25), not back at 0.
+    expect(run(texts, 2, { range, loops: 1 })).toBe(2.25);
+    // Two wraps: 1.5 passes -> 0.5 -> frame 1.5.
+    expect(run(texts, 2, { range, loops: 2 })).toBe(1.5);
+  });
+
+  it('keeps the creation tempo for specs without an animation name', () => {
+    // A track-less spec plays the whole 8-frame child; its later [20] tag is ignored like in the game.
+    const x = run(['attacher__Child[10]', 'attacher__Child[20]', 'attacher__Child[20]'], 2);
+    // 0.2 s * 10 fps / 8 frames = 0.25 -> position 7 * 0.25 = 1.75.
+    expect(x).toBe(1.75);
   });
 
   it('collects attached parts under the attacher track', () => {
     const collect: DrawTrackInfo[] = [];
     drawReanim(recorder(), assets(child), parent, at(0), [1, 0, 0, 1, 0, 0], { fps: 10, collect });
     expect(collect.map((c) => [c.trackIndex, c.attached])).toEqual([[0, true]]);
+  });
+});
+
+describe('in-game part visibility', () => {
+  it('hides a plain zombie\'s accessories but not its head', () => {
+    const names = ['anim_walk', 'Zombie_body', 'anim_head1', 'anim_cone', 'anim_bucket', 'anim_screendoor', 'Zombie_flaghand', 'Zombie_duckytube', 'anim_tongue', 'Zombie_mustache', 'anim_hair'];
+    const hidden = gameHiddenTracks(names.map((name) => ({ name })));
+    expect([...hidden].map((i) => names[i])).toEqual(['anim_cone', 'anim_bucket', 'anim_screendoor', 'Zombie_flaghand', 'Zombie_duckytube', 'anim_tongue', 'Zombie_mustache']);
+    expect(gameHiddenTracks([{ name: 'anim_idle' }, { name: 'anim_tongue' }]).size).toBe(0); // not a zombie rig
+  });
+
+  it('turns off credits dancers\' tongues except for every fourth attacher (index 1 mod 4)', () => {
+    const dance: ReanimDefinition = {
+      fps: 12,
+      tracks: [
+        { name: 'body', transforms: [tr({ x: 1, i: 'IMAGE_X' })] },
+        { name: 'anim_tongue', transforms: [tr({ x: 2, i: 'IMAGE_X' })] },
+      ],
+    };
+    const lib = {
+      image: () => img,
+      findReanimPath: () => 'reanim/Zombie_credits_dance.reanim',
+      reanim: () => dance,
+    } as unknown as AssetLibrary;
+    const parent = Array.from({ length: 3 }, () => ({ name: 'attacher__Zombie_credits_dance', transforms: [tr({ text: 'attacher__Zombie_credits_dance' })] }));
+    const r = recorder();
+    drawReanim(r, lib, parent, at(0), [1, 0, 0, 1, 0, 0], { gameVisibility: true });
+    // Attachers 0 and 2 lose the tongue (x = 2); attacher 1 keeps it.
+    expect(r.xs).toEqual([1, 1, 2, 1]);
+    const raw = recorder();
+    drawReanim(raw, lib, parent, at(0), [1, 0, 0, 1, 0, 0]);
+    expect(raw.xs).toHaveLength(6);
   });
 });
 

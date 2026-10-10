@@ -362,7 +362,7 @@ function measure(ws: Workspace, doc: ReanimDocument, frames: number[]): { x: num
   const nr = new NullRenderer();
   for (const f of frames) {
     const infos: DrawTrackInfo[] = [];
-    drawReanim(nr, ws.assets, doc.state.tracks, { before: f, after: f, fraction: 0 }, [1, 0, 0, 1, 0, 0], { collect: infos, fps: ws.playbackFps(doc), rangeStart: doc.activeRange().start, hidden: (i) => doc.ui.hidden.has(doc.state.tracks[i].uid) });
+    drawReanim(nr, ws.assets, doc.state.tracks, { before: f, after: f, fraction: 0 }, [1, 0, 0, 1, 0, 0], { collect: infos, fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility, hidden: ws.hiddenTracks(doc) });
     for (const info of infos) {
       for (const [cx, cy] of [
         [0, 0],
@@ -387,7 +387,7 @@ async function exportTarget(ws: Workspace): Promise<ExportTarget | null> {
   if (scene) {
     await preloadScene(ws, scene);
     const s = scene.state;
-    const res = { assets: ws.assets, prefab: (p: string) => ws.prefab(p), particles: ws.sceneParticles.bind(ws, scene) };
+    const res = { assets: ws.assets, prefab: (p: string) => ws.prefab(p), particles: ws.sceneParticles.bind(ws, scene), gameVisibility: ws.settings.gameVisibility };
     return {
       label: scene.name,
       frames: Array.from({ length: s.length }, (_, i) => i),
@@ -403,7 +403,7 @@ async function exportTarget(ws: Workspace): Promise<ExportTarget | null> {
   await preloadImages(ws, doc.state.tracks);
   const { start, end } = doc.activeRange();
   const frames = Array.from({ length: end - start + 1 }, (_, i) => start + i);
-  const hidden = (i: number) => doc.ui.hidden.has(doc.state.tracks[i].uid);
+  const hidden = ws.hiddenTracks(doc);
   return {
     label: `${doc.name}${doc.ui.anim ? '_' + doc.ui.anim : ''}`,
     frames,
@@ -413,7 +413,7 @@ async function exportTarget(ws: Workspace): Promise<ExportTarget | null> {
     draw: (r, base, frame) => {
       const playing = ws.playing && ws.active === doc;
       const ft = playing ? ws.frameTime(doc) : { before: frame, after: frame, fraction: 0 };
-      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, fps: ws.playbackFps(doc), rangeStart: doc.activeRange().start });
+      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility });
       if (playing) {
         for (const l of ws.live) l.sys.draw(r, ws.assets, base);
       } else {
@@ -657,7 +657,7 @@ export async function exportVideo(ws: Workspace): Promise<void> {
 export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Promise<void> {
   ws.pause();
   await preloadScene(ws, scene);
-  const { definition, warnings } = bakeScene(scene.state, { assets: ws.assets, prefab: (p) => ws.prefab(p) });
+  const { definition, warnings } = bakeScene(scene.state, { assets: ws.assets, prefab: (p) => ws.prefab(p), gameVisibility: ws.settings.gameVisibility });
   const safe = scene.name.replace(/[^A-Za-z0-9_]+/g, '_') || 'Scene';
   const pathInput = h('input', { type: 'text', class: 'wide mono', value: `reanim/${safe}.reanim` });
   let open = true;

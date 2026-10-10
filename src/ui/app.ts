@@ -388,7 +388,7 @@ export class App {
   private viewMenu(): MenuItem[] {
     const ws = this.ws;
     const s = ws.settings;
-    const toggle = (key: 'grid' | 'onion' | 'showBounds' | 'lawnGuide') => () => {
+    const toggle = (key: 'grid' | 'onion' | 'showBounds' | 'lawnGuide' | 'gameVisibility') => () => {
       s[key] = !s[key];
       ws.saveSettings();
     };
@@ -402,6 +402,7 @@ export class App {
       { label: 'Grid', shortcut: 'G', checked: s.grid, action: toggle('grid') },
       { label: 'Show part outlines', shortcut: 'B', checked: s.showBounds, action: toggle('showBounds') },
       { label: 'Lawn cell guide (80×100)', shortcut: 'L', checked: s.lawnGuide, action: toggle('lawnGuide') },
+      { label: 'In-game part visibility (hide what the game hides in code)', checked: s.gameVisibility, action: toggle('gameVisibility') },
       {
         label: 'Background',
         submenu: (['dark', 'light', 'checker', 'lawn', 'night'] as const).map((b) => ({

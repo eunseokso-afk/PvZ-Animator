@@ -6,6 +6,7 @@
 import { imageAlphaAt } from '../engine/assets';
 import { apply, clamp, DEG, invert, type Mat } from '../engine/math';
 import { ParticleSystem } from '../engine/particleSystem';
+import { gameHiddenTracks } from '../engine/gameVisibility';
 import { createRenderer, type Renderer, type RGBA } from '../engine/renderer';
 import { drawReanim, interpolateTransform, transformMatrix, type DrawTrackInfo } from '../engine/reanimRuntime';
 import type { ReanimTransform } from '../formats/reanim';
@@ -407,18 +408,24 @@ export class Viewport {
     const r = this.renderer;
     const view = this.viewMatrix(doc);
     const tracks = doc.state.tracks;
-    const hidden = (i: number) => doc.ui.hidden.has(tracks[i].uid);
+    // Parts the game hides from code stay hidden, except the selected one, shown as a ghost.
+    const game = ws.settings.gameVisibility ? gameHiddenTracks(tracks) : null;
+    const sel = doc.ui.track;
+    const hidden = (i: number) => doc.ui.hidden.has(tracks[i].uid) || (!!game?.has(i) && i !== sel);
+    const tintSel: RGBA = [1, 1, 1, 0.35];
+    const tint = game?.has(sel) ? (i: number) => (i === sel ? tintSel : null) : undefined;
+    const common = { fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility, tint };
     if (ws.settings.onion && !ws.playing) {
       const { start, end } = doc.activeRange();
       const f = doc.ui.frame;
       const ghosts: [number, RGBA][] = [];
       if (f - 1 >= start) ghosts.push([f - 1, [1, 0.45, 0.45, 1]]);
       if (f + 1 <= end) ghosts.push([f + 1, [0.45, 1, 0.55, 1]]);
-      for (const [g, tint] of ghosts) {
-        drawReanim(r, ws.assets, tracks, { before: g, after: g, fraction: 0 }, view, { hidden, alpha: 0.28, color: tint, fps: ws.playbackFps(doc), rangeStart: doc.activeRange().start });
+      for (const [g, onion] of ghosts) {
+        drawReanim(r, ws.assets, tracks, { before: g, after: g, fraction: 0 }, view, { ...common, hidden, alpha: 0.28, color: onion });
       }
     }
-    drawReanim(r, ws.assets, tracks, ws.frameTime(doc), view, { hidden, collect: this.drawn, fps: ws.playbackFps(doc), rangeStart: doc.activeRange().start });
+    drawReanim(r, ws.assets, tracks, ws.frameTime(doc), view, { ...common, hidden, collect: this.drawn });
     const systems = ws.playing ? ws.live.map((l) => l.sys) : ws.pausedParticleSystems(doc);
     for (const s of systems) s.draw(r, ws.assets, view);
   }
