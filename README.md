@@ -19,7 +19,9 @@ included in this repository.
 
 **Reanim editor**
 - WebGL preview that matches the game's transform math (`x`, `y`, `kx`/`ky` skew, `sx`/`sy`, alpha,
-  `f` visibility) and loop modes, including `attacher__` tracks.
+  `f` visibility), timing (one pass of an animation takes frames ÷ fps seconds) and loop modes,
+  including `attacher__` tracks (attached animations restart and blend like `Reanimation` does) and
+  `fullscreen` flash/fade tracks.
 - Direct manipulation: click a part to select it, drag to move, corner handles to scale, top handle to
   rotate (Shift snaps to 15°), Alt+arrows to nudge.
 - Keyframes on top of the game's baked per-frame data: tweens between keys with linear / ease-in /
@@ -36,7 +38,8 @@ included in this repository.
 - Each layer has keyframes for position, rotation, scale, flip, alpha, tint and visibility, tweened with
   easing. A key also chooses which of the prefab's animations plays (`anim_idle`, `anim_shoot`…), with
   loop / play-once / single-frame modes, speed and first frame — like a graphic symbol's looping options.
-- Animate-style timeline: F6 keyframe, F7 blank keyframe, F5 insert frame, drag keys, onion skin.
+- Animate-style timeline: F6 keyframe, F7 blank keyframe, F5 / Shift+F5 insert / remove a frame on the
+  selected layer (Ctrl for all layers), drag keys, lock and hide layers, onion skin.
 - Double-click an instance to edit its prefab; a breadcrumb leads back and edits show up live.
 - Several scenes per project (Scenes tab), saved in project files. **Bake** turns a scene into a single
   `.reanim` (every part of every instance becomes a track) that the game can play as `anim_scene`.
@@ -117,8 +120,12 @@ directory order. Paths are case-insensitive.
 
 **Reanim** — a root-less list of `<fps>` and `<track>` elements. Each `<track>` has a `<name>` and one
 `<t>` per frame; a `<t>` only lists fields that changed since the previous frame (`x`, `y`, `kx`, `ky`,
-`sx`, `sy`, `f`, `a`, `i`, `font`, `text`). Tracks named `anim_*` mark animation ranges with `f = 0`.
-The image is drawn with its top-left corner at the transform origin.
+`sx`, `sy`, `f`, `a`, `i`, `font`, `text`). Tracks named `anim_*` without images mark animation ranges
+with `f = 0`; the game draws every track that has an image whatever its name (a zombie's head is
+`anim_head1`). Text is drawn only when `font` is set: `attacher__` tracks keep their
+`attacher__Reanim__anim_name[fps][once|hold]` spec in `text`. The image is drawn with its top-left
+corner at the transform origin. Some parts are hidden by the game's code rather than the file (for
+example zombie tongues and accessories), so a raw reanim can show more than the game does.
 
 **Compiled reanim** — `u32 0xDEADFED4`, `u32 uncompressedSize`, then zlib data holding the game's
 in-memory structs (schema hash, definition, tracks, transforms and length-prefixed strings).
