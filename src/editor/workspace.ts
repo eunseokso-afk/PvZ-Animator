@@ -1,0 +1,414 @@
+/**
+ * Application state: open documents, the asset library, playback and live
+ * previews. UI panels subscribe to its events.
+ */
+
+import { AssetLibrary } from '../engine/assets';
+import { AudioEngine } from '../engine/audio';
+import { clamp, seededRandom } from '../engine/math';
+import { ParticleSystem } from '../engine/particleSystem';
+import { interpolateTransform, isFullLastFrame, isLooping, transformMatrix, type FrameTime } from '../engine/reanimRuntime';
+import { basename, stripExt } from '../engine/vfs';
+import type { ParticleDefinition } from '../formats/particles';
+import type { ReanimTransform } from '../formats/reanim';
+import { ParticleDocument } from './particleDoc';
+import { ReanimDocument, type ParticleCue } from './reanimDoc';
+
+export type EditorDocument = ReanimDocument | ParticleDocument;
+
+export type WsEvent = 'docs' | 'change' | 'frame' | 'assets' | 'status' | 'settings';
+
+export interface Settings {
+  simplifyOnImport: boolean;
+  embedCues: boolean;
+  background: 'dark' | 'light' | 'checker' | 'lawn' | 'night';
+  grid: boolean;
+  lawnGuide: boolean;
+  onion: boolean;
+  showBounds: boolean;
+}
+
+const SETTINGS_KEY = 'pvz-animator-settings';
+
+function loadSettings(): Settings {
+  const defaults: Settings = {
+    simplifyOnImport: true,
+    embedCues: true,
+    background: 'dark',
+    grid: true,
+    lawnGuide: false,
+    onion: false,
+    showBounds: true,
+  };
+  try {
+    return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') };
+  } catch {
+    return defaults;
+  }
+}
+
+interface LiveSystem {
+  cue: ParticleCue;
+  sys: ParticleSystem;
+}
+
+interface PreviewSystem {
+  sys: ParticleSystem;
+  ticks: number;
+  def: ParticleDefinition;
+  frame: number;
+}
+
+export class Workspace extends EventTarget {
+  readonly assets = new AssetLibrary();
+  readonly audio = new AudioEngine();
+  docs: EditorDocument[] = [];
+  active: EditorDocument | null = null;
+  settings: Settings = loadSettings();
+
+  playing = false;
+  speed = 1;
+  /** Fractional frame position while playing. */
+  playhead = 0;
+  /** Seconds of playback (drives attacher sub-animations). */
+  clock = 0;
+  soundEnabled = true;
+  private firstTick = false;
+
+  /** Last asset the user clicked in the browser (used when adding cues). */
+  selectedAsset: { kind: string; path: string } | null = null;
+  clipboard: ReanimTransform | null = null;
+
+  live: LiveSystem[] = [];
+  private previews = new Map<number, PreviewSystem>();
+
+  constructor() {
+    super();
+    this.assets.addEventListener('change', () => {
+      this.audio.clearCache();
+      this.emit('assets');
+    });
+    this.assets.addEventListener('image', () => this.emit('frame'));
+  }
+
+  emit(type: WsEvent, detail?: unknown): void {
+    this.dispatchEvent(new CustomEvent(type, { detail }));
+  }
+
+  on(type: WsEvent, fn: (e: CustomEvent) => void): void {
+    this.addEventListener(type, fn as EventListener);
+  }
+
+  status(message: string, level: 'info' | 'error' | 'success' = 'info'): void {
+    this.emit('status', { message, level });
+  }
+
+  saveSettings(): void {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(this.settings));
+    } catch {
+      /* private mode */
+    }
+    this.emit('settings');
+  }
+
+  // ------------------------------------------------------------ documents
+
+  get reanim(): ReanimDocument | null {
+    return this.active?.kind === 'reanim' ? this.active : null;
+  }
+
+  get particle(): ParticleDocument | null {
+    return this.active?.kind === 'particle' ? this.active : null;
+  }
+
+  openDoc(doc: EditorDocument): void {
+    if (!this.docs.includes(doc)) this.docs.push(doc);
+    this.setActive(doc);
+  }
+
+  setActive(doc: EditorDocument | null): void {
+    if (this.active === doc) return;
+    this.pause();
+    this.active = doc;
+    this.previews.clear();
+    this.emit('docs');
+    this.emit('change');
+  }
+
+  closeDoc(doc: EditorDocument): void {
+    const i = this.docs.indexOf(doc);
+    if (i < 0) return;
+    this.docs.splice(i, 1);
+    if (this.active === doc) {
+      this.active = null;
+      this.setActive(this.docs[Math.min(i, this.docs.length - 1)] ?? null);
+    }
+    this.emit('docs');
+  }
+
+  findDoc(path: string): EditorDocument | undefined {
+    const key = path.toUpperCase();
+    return this.docs.find((d) => d.path.toUpperCase() === key);
+  }
+
+  /** Open a reanim or particle file from the library in a new tab. */
+  async openAsset(path: string): Promise<EditorDocument | null> {
+    const existing = this.findDoc(path);
+    if (existing) {
+      this.setActive(existing);
+      return existing;
+    }
+    const kind = this.assets.kindOf(this.assets.vfs.get(path) ?? { path, size: 0, origin: 'import', read: async () => new Uint8Array() });
+    const name = stripExt(stripExt(basename(path)));
+    try {
+      if (kind === 'reanim') {
+        const def = await this.assets.loadReanimFile(path);
+        // Compiled files are saved back as XML next to the original location.
+        const target = path.toLowerCase().endsWith('.compiled') ? `reanim/${name}.reanim` : path;
+        const doc = ReanimDocument.fromDefinition(def, name, target, this.settings.simplifyOnImport);
+        this.openDoc(doc);
+        this.status(`Opened ${path} (${def.tracks.length} tracks, ${doc.frameCount} frames @ ${def.fps} fps)`, 'success');
+        return doc;
+      }
+      if (kind === 'particle') {
+        const def = await this.assets.loadParticleFile(path);
+        const doc = ParticleDocument.fromDefinition(def, name, path);
+        this.openDoc(doc);
+        this.status(`Opened ${path} (${def.emitters.length} emitters)`, 'success');
+        return doc;
+      }
+      this.status(`Don't know how to open ${path}`, 'error');
+    } catch (e) {
+      this.status(`Failed to open ${path}: ${(e as Error).message}`, 'error');
+    }
+    return null;
+  }
+
+  uniqueDocPath(dir: string, base: string, ext: string): string {
+    let n = 1;
+    let path = `${dir}/${base}.${ext}`;
+    while (this.findDoc(path) || this.assets.vfs.has(path)) path = `${dir}/${base}${++n}.${ext}`;
+    return path;
+  }
+
+  newReanim(): ReanimDocument {
+    const path = this.uniqueDocPath('reanim', 'NewAnimation', 'reanim');
+    const doc = ReanimDocument.create(stripExt(basename(path)), path, 12, 24);
+    doc.setAnimRange('anim_idle', 0, 23);
+    doc.clearHistory();
+    doc.ui.anim = 'anim_idle';
+    this.openDoc(doc);
+    return doc;
+  }
+
+  newParticle(): ParticleDocument {
+    const path = this.uniqueDocPath('particles', 'NewEffect', 'xml');
+    const doc = ParticleDocument.create(stripExt(basename(path)), path);
+    this.openDoc(doc);
+    return doc;
+  }
+
+  /** Particle definition by path, preferring an open (possibly edited) document. */
+  particleDef(path: string): ParticleDefinition | null | undefined {
+    const doc = this.findDoc(path);
+    if (doc?.kind === 'particle') return doc.def;
+    return this.assets.particle(path);
+  }
+
+  // ------------------------------------------------------------ playback
+
+  frameTime(doc: ReanimDocument): FrameTime {
+    if (this.playing && doc === this.active) {
+      const { end } = doc.activeRange();
+      const before = Math.min(Math.floor(this.playhead), end);
+      const after = Math.min(before + 1, end);
+      return { before, after, fraction: before >= end ? 0 : this.playhead - Math.floor(this.playhead) };
+    }
+    const f = clamp(doc.ui.frame, 0, doc.frameCount - 1);
+    return { before: f, after: f, fraction: 0 };
+  }
+
+  play(): void {
+    const doc = this.reanim;
+    if (!doc || this.playing) return;
+    const { start, end } = doc.activeRange();
+    let f = doc.ui.frame;
+    if (f < start || f > end) f = start;
+    if (f >= end && !isLooping(doc.ui.loop)) f = start;
+    this.playhead = f;
+    this.clock = 0;
+    this.playing = true;
+    this.firstTick = true;
+    this.live = [];
+    this.audio.context; // unlock audio on the user gesture
+    this.emit('change');
+  }
+
+  pause(): void {
+    if (!this.playing) return;
+    this.playing = false;
+    this.live = [];
+    this.previews.clear();
+    const doc = this.reanim;
+    if (doc) doc.ui.frame = doc.ui.frameEnd = clamp(Math.floor(this.playhead), 0, doc.frameCount - 1);
+    this.emit('change');
+  }
+
+  togglePlay(): void {
+    if (this.playing) this.pause();
+    else this.play();
+  }
+
+  setFrame(frame: number, extend = false): void {
+    const doc = this.reanim;
+    if (!doc) return;
+    if (this.playing) this.pause();
+    const f = clamp(Math.round(frame), 0, doc.frameCount - 1);
+    doc.ui.frame = f;
+    if (!extend) doc.ui.frameEnd = f;
+    this.emit('change');
+  }
+
+  stepFrame(delta: number): void {
+    const doc = this.reanim;
+    if (!doc) return;
+    const { start, end } = doc.activeRange();
+    let f = doc.ui.frame + delta;
+    if (f > end) f = start;
+    if (f < start) f = end;
+    this.setFrame(f);
+  }
+
+  /** Advance playback and particle previews by dt seconds. */
+  update(dt: number): boolean {
+    let changed = false;
+    const doc = this.reanim;
+    if (doc && this.playing) {
+      const { start, end } = doc.activeRange();
+      const full = isFullLastFrame(doc.ui.loop);
+      const span = full ? end - start + 1 : end - start;
+      const endPos = start + span;
+      const prev = this.playhead;
+      let next = prev + dt * doc.fps * this.speed;
+      const fire: [number, number][] = [];
+      const inclusiveStart = this.firstTick;
+      this.firstTick = false;
+      if (span <= 0) {
+        next = start;
+        if (inclusiveStart) fire.push([start, start]);
+      } else if (next >= endPos) {
+        fire.push([prev, endPos - 1e-9]);
+        if (isLooping(doc.ui.loop)) {
+          next = start + ((next - start) % span);
+          fire.push([start - 1e-9, next]);
+        } else {
+          next = full ? endPos - 1e-6 : end;
+          this.playhead = next;
+          this.playing = false;
+          doc.ui.frame = doc.ui.frameEnd = end;
+        }
+      } else {
+        fire.push([prev, next]);
+      }
+      for (const [a, b] of fire) this.fireCues(doc, a, b, inclusiveStart && a === prev);
+      if (this.playing) {
+        this.playhead = next;
+        doc.ui.frame = doc.ui.frameEnd = clamp(Math.floor(next), start, end);
+      } else {
+        this.emit('change');
+      }
+      this.clock += dt * this.speed;
+      changed = true;
+    }
+    if (this.live.length) {
+      const d = this.reanim;
+      for (const l of this.live) {
+        if (d) {
+          const [x, y] = this.cuePosition(d, l.cue, d === this.active ? this.frameTime(d) : null);
+          l.sys.setPosition(x, y);
+        }
+        l.sys.advance(dt * this.speed);
+      }
+      this.live = this.live.filter((l) => !l.sys.dead);
+      changed = true;
+    }
+    return changed;
+  }
+
+  private fireCues(doc: ReanimDocument, from: number, to: number, inclusive: boolean): void {
+    const hit = (f: number) => (inclusive ? f >= from : f > from) && f <= to;
+    if (this.soundEnabled) {
+      for (const cue of doc.state.soundCues) {
+        if (!hit(cue.frame)) continue;
+        const file = this.assets.resolveSound(cue.sound);
+        if (!file) continue;
+        const buf = this.audio.peek(file);
+        if (buf) this.audio.play(buf, cue.volume);
+        else
+          void this.audio.load(file).then((b) => {
+            if (b && this.playing) this.audio.play(b, cue.volume);
+          });
+      }
+    }
+    for (const cue of doc.state.particleCues) {
+      if (!hit(cue.frame)) continue;
+      const def = this.particleDef(cue.particle);
+      if (!def) continue;
+      const [x, y] = this.cuePosition(doc, cue, this.frameTime(doc));
+      this.live.push({ cue, sys: new ParticleSystem(def, x, y) });
+    }
+  }
+
+  /** Where a particle cue sits in reanim space at the given frame time. */
+  cuePosition(doc: ReanimDocument, cue: ParticleCue, ft: FrameTime | null): [number, number] {
+    if (cue.track && ft) {
+      const ti = doc.findTrack(cue.track);
+      const track = doc.state.tracks[ti];
+      if (track) {
+        const t = interpolateTransform(track.transforms, ft);
+        const m = transformMatrix(t);
+        return [m[0] * cue.x + m[2] * cue.y + m[4], m[1] * cue.x + m[3] * cue.y + m[5]];
+      }
+    }
+    return [cue.x, cue.y];
+  }
+
+  /**
+   * Particle systems to draw for a paused reanim: each cue that started at or
+   * before the current frame is simulated deterministically up to now.
+   */
+  pausedParticleSystems(doc: ReanimDocument): ParticleSystem[] {
+    const out: ParticleSystem[] = [];
+    const { start } = doc.activeRange();
+    const frame = doc.ui.frame;
+    const ft = this.frameTime(doc);
+    const seen = new Set<number>();
+    for (const cue of doc.state.particleCues) {
+      seen.add(cue.uid);
+      if (cue.frame > frame || cue.frame < start) continue;
+      const def = this.particleDef(cue.particle);
+      if (!def) continue;
+      const targetTicks = Math.round(((frame - cue.frame) / doc.fps) * 100);
+      let p = this.previews.get(cue.uid);
+      if (!p || p.def !== def || p.ticks > targetTicks || p.frame !== cue.frame) {
+        const [x, y] = this.cuePosition(doc, cue, { before: cue.frame, after: cue.frame, fraction: 0 });
+        p = { sys: new ParticleSystem(def, x, y, seededRandom(cue.uid * 7919)), ticks: 0, def, frame: cue.frame };
+        this.previews.set(cue.uid, p);
+      }
+      const [x, y] = this.cuePosition(doc, cue, ft);
+      p.sys.setPosition(x, y);
+      while (p.ticks < targetTicks && p.ticks < 3000) {
+        p.sys.tick();
+        p.ticks++;
+      }
+      if (!p.sys.dead) out.push(p.sys);
+    }
+    for (const uid of [...this.previews.keys()]) if (!seen.has(uid)) this.previews.delete(uid);
+    return out;
+  }
+
+  invalidatePreviews(): void {
+    this.previews.clear();
+  }
+}

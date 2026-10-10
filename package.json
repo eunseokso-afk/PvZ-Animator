@@ -1,0 +1,19 @@
+{
+  "name": "pvz-animator",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Browser-based animation studio for Plants vs. Zombies: open main.pak, edit PopCap reanim animations and particle effects, and sync sounds.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vite": "^7.3.7",
+    "vitest": "^3.2.7"
+  }
+}
