@@ -102,8 +102,8 @@ export class App {
     });
     ws.on('docs', () => this.swapPanels());
     ws.on('change', () => this.updateChrome());
-    ws.on('assets', () => {
-      clearThumbnails();
+    ws.on('assets', (e) => {
+      if ((e.detail as { scope?: string } | undefined)?.scope !== 'definitions') clearThumbnails();
       this.updateChrome();
     });
     ws.on('settings', () => this.updateChrome());

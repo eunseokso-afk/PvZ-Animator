@@ -56,6 +56,8 @@ interface PreviewSystem {
   sys: ParticleSystem;
   ticks: number;
   def: ParticleDefinition;
+  /** Revision of the open particle document it was built from (-1 if none). */
+  rev: number;
   frame: number;
 }
 
@@ -84,9 +86,10 @@ export class Workspace extends EventTarget {
 
   constructor() {
     super();
-    this.assets.addEventListener('change', () => {
-      this.audio.clearCache();
-      this.emit('assets');
+    this.assets.addEventListener('change', (e) => {
+      const scope = (e as CustomEvent<{ scope: string }>).detail?.scope ?? 'all';
+      if (scope === 'all') this.audio.clearCache();
+      this.emit('assets', { scope });
     });
     this.assets.addEventListener('image', () => this.emit('frame'));
   }
@@ -403,11 +406,13 @@ export class Workspace extends EventTarget {
       if (cue.frame > frame || cue.frame < start) continue;
       const def = this.particleDef(cue.particle);
       if (!def) continue;
+      const source = this.findDoc(cue.particle);
+      const rev = source?.kind === 'particle' ? source.revision : -1;
       const targetTicks = Math.round(((frame - cue.frame) / doc.fps) * 100);
       let p = this.previews.get(cue.uid);
-      if (!p || p.def !== def || p.ticks > targetTicks || p.frame !== cue.frame) {
+      if (!p || p.def !== def || p.rev !== rev || p.ticks > targetTicks || p.frame !== cue.frame) {
         const [x, y] = this.cuePosition(doc, cue, { before: cue.frame, after: cue.frame, fraction: 0 });
-        p = { sys: new ParticleSystem(def, x, y, seededRandom(cue.uid * 7919)), ticks: 0, def, frame: cue.frame };
+        p = { sys: new ParticleSystem(def, x, y, seededRandom(cue.uid * 7919)), ticks: 0, def, rev, frame: cue.frame };
         this.previews.set(cue.uid, p);
       }
       const [x, y] = this.cuePosition(doc, cue, ft);

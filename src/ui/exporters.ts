@@ -35,7 +35,7 @@ export function exportCurrentDoc(ws: Workspace): void {
 /** Write a document into the library so other documents (cues, attachers) see it. */
 export function applyToLibrary(ws: Workspace, doc: EditorDocument): void {
   ws.assets.vfs.set(memoryFile(doc.path, serializeDoc(ws, doc), 'generated'));
-  ws.assets.invalidate();
+  ws.assets.invalidate('definitions');
   doc.markSaved();
   doc.isNew = false;
   ws.emit('docs');

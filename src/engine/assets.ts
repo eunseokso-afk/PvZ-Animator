@@ -28,6 +28,9 @@ export interface LoadedImage {
 
 export type AssetKind = 'reanim' | 'particle' | 'image' | 'sound' | 'other';
 
+/** 'definitions' keeps decoded images and sounds (only reanim/particle files changed). */
+export type InvalidateScope = 'all' | 'definitions';
+
 let imageSerial = 1;
 
 const MIME: Record<string, string> = {
@@ -76,8 +79,8 @@ export class AssetLibrary extends EventTarget {
   private extraParticleXml = new Set<string>();
   private pathToImageId = new Map<string, string>();
 
-  emitChange(): void {
-    this.dispatchEvent(new Event('change'));
+  emitChange(scope: InvalidateScope = 'all'): void {
+    this.dispatchEvent(new CustomEvent('change', { detail: { scope } }));
   }
 
   // ------------------------------------------------------------------ loading
@@ -110,6 +113,7 @@ export class AssetLibrary extends EventTarget {
    */
   async importFiles(files: { path: string; data?: Uint8Array; blob?: Blob }[], origin: 'import' | 'generated' | 'demo' = 'import'): Promise<void> {
     let manifestChanged = false;
+    let media = false;
     for (const f of files) {
       const path = normPath(f.path);
       let file: VFile;
@@ -121,13 +125,15 @@ export class AssetLibrary extends EventTarget {
       } else continue;
       this.vfs.set(file);
       if (pathKey(path) === pathKey(RESOURCES_PATH)) manifestChanged = true;
+      const kind = classify(path);
+      if (kind === 'image' || kind === 'sound' || kind === 'other') media = true;
       if (extname(path) === 'xml' && classify(path) !== 'particle' && file.size < 4 * 1024 * 1024) {
         const head = f.data ? f.data.subarray(0, 4096) : new Uint8Array(await f.blob!.slice(0, 4096).arrayBuffer());
         if (/<\s*emitter[\s>]/i.test(decodeText(head))) this.extraParticleXml.add(path.toLowerCase());
       }
     }
     if (manifestChanged) await this.reloadManifest();
-    this.invalidate();
+    this.invalidate(media || manifestChanged ? 'all' : 'definitions');
   }
 
   removeFile(path: string): void {
@@ -149,14 +155,16 @@ export class AssetLibrary extends EventTarget {
   }
 
   /** Drop decoded caches (after files change). */
-  invalidate(): void {
-    this.images.clear();
-    this.imageLoads.clear();
+  invalidate(scope: InvalidateScope = 'all'): void {
+    if (scope === 'all') {
+      this.images.clear();
+      this.imageLoads.clear();
+    }
     this.reanims.clear();
     this.reanimCache.clear();
     this.particles.clear();
     this.particleCache.clear();
-    this.emitChange();
+    this.emitChange(scope);
   }
 
   // ------------------------------------------------------------------ listing

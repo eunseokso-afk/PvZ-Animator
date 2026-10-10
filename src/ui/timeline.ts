@@ -9,7 +9,7 @@ import { basename } from '../engine/vfs';
 import { isAnimTrackName, isMarkerTrack } from '../formats/reanim';
 import { EASES, type ReanimDocument } from '../editor/reanimDoc';
 import type { Workspace } from '../editor/workspace';
-import { h } from './dom';
+import { h, rafThrottle } from './dom';
 import { ASSET_MIME } from './viewport';
 import { numberField, showMenu, type MenuItem, type NumberField } from './widgets';
 
@@ -101,17 +101,20 @@ export class Timeline {
     this.buildToolbar();
     new ResizeObserver(() => this.resize()).observe(this.wrap);
     this.bindInput();
-    const redraw = () => {
+    const redraw = rafThrottle(() => {
       this.syncToolbar();
       this.draw();
-    };
+    });
     ws.on('change', redraw);
     ws.on('docs', redraw);
-    ws.on('frame', () => {
-      this.followPlayhead();
-      this.syncToolbar(true);
-      this.draw();
-    });
+    ws.on(
+      'frame',
+      rafThrottle(() => {
+        this.followPlayhead();
+        this.syncToolbar(true);
+        this.draw();
+      }),
+    );
     ws.on('settings', redraw);
   }
 
@@ -526,8 +529,13 @@ export class Timeline {
         ctx.beginPath();
         ctx.rect(x, y, Math.max(0, nextX - x - 2), ROW_H);
         ctx.clip();
+        const text = (row.kind === 'sound' ? '♪ ' : '✦ ') + label;
+        const tx = x + Math.max(cw, 8) + 2;
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(22, 24, 30, 0.9)';
+        ctx.strokeText(text, tx, y + 14);
         ctx.fillStyle = selected ? C.sel : '#c9ceda';
-        ctx.fillText((row.kind === 'sound' ? '♪ ' : '✦ ') + label, x + Math.max(cw, 8) + 2, y + 14);
+        ctx.fillText(text, tx, y + 14);
         ctx.restore();
       });
       return;
