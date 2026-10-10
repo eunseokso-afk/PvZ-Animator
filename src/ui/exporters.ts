@@ -774,7 +774,7 @@ export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Prom
     return;
   }
   const existing = ws.findDoc(path);
-  if ((library && ws.assets.vfs.has(path)) || existing) {
+  if ((library && ws.assets.vfs.has(path)) || (existing && (open || library))) {
     const unsaved = existing?.dirty ? ' Its open tab has unsaved changes, which will be lost.' : '';
     if (!(await confirmDialog('Replace file?', `${path} already exists.${unsaved} Replace it with the baked scene?`, 'Replace', true))) return;
   }
@@ -787,7 +787,8 @@ export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Prom
     ws.assets.vfs.set(memoryFile(path, enc.encode(xml), 'generated'));
     ws.assets.invalidate('definitions');
   }
-  if (existing) ws.closeDoc(existing);
+  // A download alone leaves open tabs alone.
+  if (existing && (open || library)) ws.closeDoc(existing);
   if (open) {
     if (library) doc.markSaved();
     ws.openDoc(doc);

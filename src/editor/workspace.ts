@@ -190,7 +190,7 @@ export class Workspace extends EventTarget {
 
   /** The document path a library file is edited under: compiled reanims open as reanim/<name>.reanim. */
   editPathFor(path: string): string {
-    if (!path.toLowerCase().endsWith('.compiled')) return path;
+    if (!path.toLowerCase().endsWith('.reanim.compiled')) return path;
     return `reanim/${stripExt(stripExt(basename(path)))}.reanim`;
   }
 

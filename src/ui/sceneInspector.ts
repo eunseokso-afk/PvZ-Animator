@@ -249,6 +249,7 @@ export class SceneInspector {
         },
       });
       this.fields.set(prop, f);
+      f.input.disabled = locked;
       return f.el;
     };
     const nameInput = h('input', {
@@ -278,6 +279,7 @@ export class SceneInspector {
                 'button',
                 {
                   class: 'btn small',
+                  disabled: locked,
                   onclick: async () => {
                     const r = await pickImage(ws, 'Layer image', 'reanim', layer.source);
                     if (r) {
@@ -301,6 +303,7 @@ export class SceneInspector {
                 'button',
                 {
                   class: 'btn small',
+                  disabled: locked,
                   onclick: async () => {
                     const p = await pickAsset(ws, layer.kind === 'reanim' ? 'reanim' : 'particle', layer.kind === 'reanim' ? 'Swap prefab' : 'Swap particle effect');
                     if (p) {
@@ -323,13 +326,14 @@ export class SceneInspector {
     const keyRow = h(
       'div',
       { class: 'insp-key' },
-      h('span', { class: `key-badge${isKey ? ' on' : ''}` }, !pose ? `Starts at ${layer.keys[0].frame}` : isKey ? `◆ Key @ ${frame}` : `Tween (key @ ${key?.frame})`),
+      h('span', { class: `key-badge${isKey && !ws.playing ? ' on' : ''}` }, ws.playing ? 'Playing…' : !pose ? `Starts at ${layer.keys[0].frame}` : isKey ? `◆ Key @ ${frame}` : `Tween (key @ ${key?.frame})`),
       h(
         'button',
         {
           class: 'btn small',
           // The first key is where the layer starts; it can be moved but not removed.
-          disabled: locked || (isKey && ki === 0),
+          // (Disabled while playing: the panel is not rebuilt every frame, so the label would be stale.)
+          disabled: ws.playing || locked || (isKey && ki === 0),
           title: isKey && ki === 0 ? 'The first keyframe is where the layer starts' : undefined,
           onclick: () => {
             // Act on the current frame, not the one this panel was built for.
