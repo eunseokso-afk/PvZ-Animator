@@ -13,7 +13,14 @@ function showStartupError(error: unknown): void {
   hint.textContent = 'Your browser reported this error. A current Chrome, Edge or Firefox is recommended.';
   const details = document.createElement('pre');
   details.className = 'boot-error';
-  details.textContent = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ''}` : String(error);
+  if (error instanceof Error) {
+    // Chrome's stack already starts with "Name: message"; Firefox's does not.
+    const head = `${error.name}: ${error.message}`;
+    const stack = error.stack ?? '';
+    details.textContent = stack.startsWith(head) ? stack : `${head}\n${stack}`;
+  } else {
+    details.textContent = String(error);
+  }
   box.append(title, hint, details);
   host.replaceChildren(box);
 }

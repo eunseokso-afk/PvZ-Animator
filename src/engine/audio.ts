@@ -10,6 +10,7 @@ export class AudioEngine {
   private decoded = new Map<string, AudioBuffer | null>();
   private live = new Set<AudioBufferSourceNode>();
   private recordDest: MediaStreamAudioDestinationNode | null = null;
+  private recordSilence: ConstantSourceNode | null = null;
   volume = 0.8;
   muted = false;
 
@@ -109,10 +110,25 @@ export class AudioEngine {
   startRecording(): MediaStream {
     const ctx = this.context;
     this.recordDest = ctx.createMediaStreamDestination();
+    // Keep the audio track producing (silent) samples even when no sound plays,
+    // otherwise MediaRecorder can stall and produce an empty file.
+    this.recordSilence = ctx.createConstantSource();
+    this.recordSilence.offset.value = 0;
+    this.recordSilence.connect(this.recordDest);
+    this.recordSilence.start();
     return this.recordDest.stream;
   }
 
   stopRecording(): void {
+    if (this.recordSilence) {
+      try {
+        this.recordSilence.stop();
+      } catch {
+        /* already stopped */
+      }
+      this.recordSilence.disconnect();
+      this.recordSilence = null;
+    }
     this.recordDest = null;
   }
 }

@@ -74,7 +74,8 @@ export class Viewport {
     this.stage = h('div', { class: 'stage' }, this.bgCanvas, this.glCanvas, this.ovCanvas, this.info, this.empty);
     this.crumbs = h('div', { class: 'crumbs' });
     this.el = h('div', { class: 'viewport' }, this.tabs, this.crumbs, this.stage);
-    this.renderer = createRenderer(this.glCanvas);
+    this.renderer = createRenderer(this.glCanvas, () => this.invalidate());
+    this.glCanvas = this.renderer.canvas; // the 2D fallback may swap in a new canvas
     this.sceneStage = new SceneStage(ws, {
       view: (d) => this.viewMatrix(d),
       toStage: (d, x, y) => this.toWorld(d, x, y),

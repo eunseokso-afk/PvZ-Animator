@@ -109,6 +109,7 @@ export class App {
       h('footer', { class: 'statusbar' }, this.statusText, this.statusRight),
     );
     this.applyLayout();
+    window.addEventListener('resize', () => this.applyLayout());
 
     ws.on('status', (e) => {
       const { message, level } = e.detail as { message: string; level: 'info' | 'error' | 'success' };
@@ -139,17 +140,34 @@ export class App {
   private loadLayout(): Layout {
     const def: Layout = { left: 270, right: 320, bottom: 250 };
     try {
-      return { ...def, ...JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? '{}') };
+      const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? '{}') as Partial<Record<keyof Layout, unknown>> | null;
+      const pick = (k: keyof Layout) => {
+        const v = saved?.[k];
+        return typeof v === 'number' && Number.isFinite(v) ? v : def[k];
+      };
+      return { left: pick('left'), right: pick('right'), bottom: pick('bottom') };
     } catch {
       return def;
     }
   }
 
+  /** Apply the saved panel sizes, shrunk as needed so the stage stays usable in a small window. */
   private applyLayout() {
+    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+    let left = clamp(this.layout.left, 170, 600);
+    let right = clamp(this.layout.right, 220, 700);
+    const room = Math.max(0, window.innerWidth - 10 - 200); // two splitters, ~200px of stage
+    if (left + right > room) {
+      const k = room / (left + right);
+      left = Math.floor(left * k);
+      right = Math.floor(right * k);
+    }
+    // Menu bar, tabs, splitter and status bar take ~100px; keep ~160px of stage above the timeline.
+    const bottom = Math.max(120, Math.min(window.innerHeight - 260, this.layout.bottom));
     const s = this.root.style;
-    s.setProperty('--left-w', `${this.layout.left}px`);
-    s.setProperty('--right-w', `${this.layout.right}px`);
-    s.setProperty('--bottom-h', `${this.layout.bottom}px`);
+    s.setProperty('--left-w', `${left}px`);
+    s.setProperty('--right-w', `${right}px`);
+    s.setProperty('--bottom-h', `${bottom}px`);
   }
 
   private splitter(which: 'left' | 'right' | 'bottom'): HTMLElement {
@@ -163,7 +181,7 @@ export class App {
       const move = (ev: PointerEvent) => {
         if (which === 'left') this.layout.left = Math.min(600, Math.max(170, start.left + ev.clientX - sx));
         if (which === 'right') this.layout.right = Math.min(700, Math.max(220, start.right - (ev.clientX - sx)));
-        if (which === 'bottom') this.layout.bottom = Math.min(window.innerHeight - 200, Math.max(120, start.bottom - (ev.clientY - sy)));
+        if (which === 'bottom') this.layout.bottom = Math.max(120, Math.min(window.innerHeight - 260, start.bottom - (ev.clientY - sy)));
         this.applyLayout();
       };
       const up = () => {

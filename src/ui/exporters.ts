@@ -293,6 +293,7 @@ class NullRenderer implements Renderer {
   drawImage(): void {}
   fillRect(): void {}
   end(): void {}
+  dispose(): void {}
 }
 
 /** What a frame/video export renders: a reanim's active range or a whole scene. */
@@ -509,8 +510,7 @@ export async function exportFrames(ws: Workspace): Promise<void> {
     { scale: 1, padding: 8 },
   );
   if (!setup) return;
-  const canvas = document.createElement('canvas');
-  const r = createRenderer(canvas);
+  const r = createRenderer(document.createElement('canvas'));
   r.resize(setup.width, setup.height, 1);
   const pngs: Uint8Array[] = [];
   const cols = Math.ceil(Math.sqrt(target.frames.length));
@@ -523,10 +523,11 @@ export async function exportFrames(ws: Workspace): Promise<void> {
   try {
     for (let k = 0; k < target.frames.length; k++) {
       renderFrameTo(target, r, setup, target.frames[k]);
-      if (sheet) sheet.getContext('2d')!.drawImage(canvas, (k % cols) * setup.width, Math.floor(k / cols) * setup.height);
-      else pngs.push(await canvasToPng(canvas));
+      if (sheet) sheet.getContext('2d')!.drawImage(r.canvas, (k % cols) * setup.width, Math.floor(k / cols) * setup.height);
+      else pngs.push(await canvasToPng(r.canvas));
     }
   } finally {
+    r.dispose();
     ws.invalidatePreviews();
   }
   if (sheet) {
@@ -559,54 +560,66 @@ export async function exportVideo(ws: Workspace): Promise<void> {
     { scale: target.isScene ? 1 : 2, padding: 16 },
   );
   if (!setup) return;
-  const glCanvas = document.createElement('canvas');
-  const r = createRenderer(glCanvas);
+  const r = createRenderer(document.createElement('canvas'));
   r.resize(setup.width, setup.height, 1);
   const out = document.createElement('canvas');
   out.width = setup.width % 2 ? setup.width + 1 : setup.width;
   out.height = setup.height % 2 ? setup.height + 1 : setup.height;
   const ctx = out.getContext('2d')!;
   const stream = out.captureStream(60);
-  if (withSound) for (const t of ws.audio.startRecording().getAudioTracks()) stream.addTrack(t);
-  const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m)) ?? '';
-  const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8_000_000 } : undefined);
-  const chunks: Blob[] = [];
-  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  const done = new Promise<void>((resolve) => (rec.onstop = () => resolve()));
-  doc.ui.frame = target.frames[0];
   const savedLoop = doc.kind === 'scene' ? doc.ui.loopPlayback : undefined;
-  if (doc.kind === 'scene') doc.ui.loopPlayback = loops > 1;
-  ws.invalidatePreviews();
-  rec.start(250);
-  ws.play();
-  ws.status('Recording video…');
-  let loopCount = 0;
-  let last = ws.playhead;
-  await new Promise<void>((resolve) => {
-    const step = () => {
-      if (ws.playhead < last - 0.5) loopCount++;
-      last = ws.playhead;
-      if (loopCount >= loops || ws.active !== doc) {
-        setTimeout(resolve, 100);
-        return;
-      }
-      renderFrameTo(target, r, setup, ws.playing ? ws.playhead : target.playingFrame());
-      ctx.clearRect(0, 0, out.width, out.height);
-      ctx.drawImage(glCanvas, 0, 0);
-      if (!ws.playing) {
-        setTimeout(resolve, 200);
-        return;
-      }
+  const chunks: Blob[] = [];
+  try {
+    if (withSound) for (const t of ws.audio.startRecording().getAudioTracks()) stream.addTrack(t);
+    const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m)) ?? '';
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8_000_000 } : undefined);
+    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    const done = new Promise<void>((resolve) => (rec.onstop = () => resolve()));
+    doc.ui.frame = target.frames[0];
+    if (doc.kind === 'scene') doc.ui.loopPlayback = loops > 1;
+    ws.invalidatePreviews();
+    rec.start(250);
+    ws.play();
+    ws.status('Recording video…');
+    let loopCount = 0;
+    let last = ws.playhead;
+    await new Promise<void>((resolve) => {
+      const step = () => {
+        if (ws.playhead < last - 0.5) loopCount++;
+        last = ws.playhead;
+        if (loopCount >= loops || ws.active !== doc) {
+          setTimeout(resolve, 100);
+          return;
+        }
+        renderFrameTo(target, r, setup, ws.playing ? ws.playhead : target.playingFrame());
+        ctx.clearRect(0, 0, out.width, out.height);
+        ctx.drawImage(r.canvas, 0, 0);
+        if (!ws.playing) {
+          setTimeout(resolve, 200);
+          return;
+        }
+        requestAnimationFrame(step);
+      };
       requestAnimationFrame(step);
-    };
-    requestAnimationFrame(step);
-  });
-  ws.pause();
-  if (doc.kind === 'scene' && savedLoop !== undefined) doc.ui.loopPlayback = savedLoop;
-  rec.stop();
-  await done;
-  ws.audio.stopRecording();
+    });
+    ws.pause();
+    rec.stop();
+    await done;
+  } catch (e) {
+    ws.pause();
+    ws.status(`Video export failed: ${e instanceof Error ? e.message : String(e)}`, 'error');
+    return;
+  } finally {
+    if (doc.kind === 'scene' && savedLoop !== undefined) doc.ui.loopPlayback = savedLoop;
+    ws.audio.stopRecording();
+    for (const t of stream.getTracks()) t.stop();
+    r.dispose();
+  }
   const blob = new Blob(chunks, { type: 'video/webm' });
+  if (blob.size === 0) {
+    ws.status('Video export failed: the browser recorded no data. Try again without "Record sound cues".', 'error');
+    return;
+  }
   downloadBlob(blob, `${target.label}.webm`);
   ws.status(`Exported video (${(blob.size / 1024).toFixed(0)} KB).`, 'success');
 }

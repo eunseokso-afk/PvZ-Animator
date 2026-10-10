@@ -13,9 +13,10 @@
       .boot h1 { font-size: 22px; color: #c8f0a8; margin: 0 0 8px; }
       .boot-help { opacity: 0; animation: boot-show 0.3s 2.5s forwards; color: #a9b0bf; }
       .boot-help code { background: #23262e; padding: 1px 5px; border-radius: 4px; }
-      .boot-error { color: #ff9aa0; white-space: pre-wrap; font: 12px/1.5 ui-monospace, Consolas, monospace; background: #241417; border: 1px solid #5a2a30; border-radius: 6px; padding: 10px 12px; }
+      .boot-error { color: #ff9aa0; white-space: pre-wrap; overflow: auto; max-height: 50vh; font: 12px/1.5 ui-monospace, Consolas, monospace; background: #241417; border: 1px solid #5a2a30; border-radius: 6px; padding: 10px 12px; }
       @keyframes boot-show { to { opacity: 1; } }
     </style>
+    <noscript><style>#app { display: none; }</style></noscript>
   </head>
   <body>
     <div id="app">

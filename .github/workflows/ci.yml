@@ -17,3 +17,5 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: index.html is up to date
+        run: git diff --exit-code -- index.html || (echo "::error::index.html is stale - run npm run build and commit it" && exit 1)
