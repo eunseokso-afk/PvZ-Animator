@@ -17,7 +17,10 @@ export interface ImageResource {
   rows: number;
   cols: number;
   alphaImage?: string;
+  /** One cel-sized alpha image applied to every cel. */
   alphaGrid?: string;
+  /** 0xRRGGBB colour given to alpha-only images (default white). */
+  alphaColor?: number;
   group: string;
 }
 
@@ -44,14 +47,18 @@ function joinPath(dir: string, p: string): string {
 }
 
 export function parseResourcesXml(src: string, into: ResourceManifest = emptyManifest()): ResourceManifest {
+  // Like ResourceManager, <SetDefaults> only changes the attributes it gives,
+  // and the defaults carry over from one <Resources> group to the next.
+  let defPath = '';
+  let defPrefix = '';
   const walkGroup = (group: XmlElement, groupId: string) => {
-    let defPath = '';
-    let defPrefix = '';
     for (const el of elements(group.children)) {
       const tag = el.tag.toLowerCase();
       if (tag === 'setdefaults') {
-        defPath = attr(el, 'path') ?? '';
-        defPrefix = attr(el, 'idprefix') ?? '';
+        const p = attr(el, 'path');
+        if (p !== undefined) defPath = p.replace(/[\\/]+$/, '');
+        const ip = attr(el, 'idprefix');
+        if (ip !== undefined) defPrefix = ip;
         continue;
       }
       const id = attr(el, 'id');
@@ -65,6 +72,7 @@ export function parseResourcesXml(src: string, into: ResourceManifest = emptyMan
       if (tag === 'image') {
         const alphaImage = attr(el, 'alphaimage');
         const alphaGrid = attr(el, 'alphagrid');
+        const alphaColor = parseInt(attr(el, 'alphacolor') ?? '', 16);
         into.images.set(fullId, {
           id: fullId,
           path: fullPath,
@@ -72,6 +80,7 @@ export function parseResourcesXml(src: string, into: ResourceManifest = emptyMan
           cols: Math.max(1, parseInt(attr(el, 'cols') ?? '1', 10) || 1),
           alphaImage: alphaImage ? joinPath(defPath, alphaImage) : undefined,
           alphaGrid: alphaGrid ? joinPath(defPath, alphaGrid) : undefined,
+          alphaColor: Number.isFinite(alphaColor) ? alphaColor & 0xffffff : undefined,
           group: groupId,
         });
       } else if (tag === 'sound') {

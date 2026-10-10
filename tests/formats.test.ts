@@ -249,6 +249,20 @@ describe('resources.xml', () => {
     expect(m.images.get('IMAGE_DIRTSMALL')).toMatchObject({ path: 'particles/dirt_small', cols: 2, rows: 2 });
     expect(m.sounds.get('SOUND_PLANT')?.path).toBe('sounds/plant');
   });
+
+  it('keeps defaults that SetDefaults leaves out, across groups, and reads alpha attributes', () => {
+    const m = parseResourcesXml(`<ResourceManifest>
+  <Resources id="A"><SetDefaults path="reanim" idprefix="IMAGE_REANIM_"/><Image id="X" path="x"/></Resources>
+  <Resources id="B">
+    <Image id="Y" path="y" alphagrid="y_grid" alphacolor="FF0000"/>
+    <SetDefaults path="particles/"/>
+    <Image id="Z" path="z" cols="2"/>
+  </Resources>
+</ResourceManifest>`);
+    expect(m.images.get('IMAGE_REANIM_Y')).toMatchObject({ path: 'reanim/y', alphaGrid: 'reanim/y_grid', alphaColor: 0xff0000 });
+    expect(m.images.get('IMAGE_REANIM_Z')).toMatchObject({ path: 'particles/z', cols: 2 });
+    expect(m.images.get('IMAGE_REANIM_X')?.alphaColor).toBeUndefined();
+  });
 });
 
 describe('au', () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { AssetLibrary, composeAlpha, whiteFromAlpha } from '../src/engine/assets';
+import { AssetLibrary, composeAlpha, composeAlphaGrid, whiteFromAlpha } from '../src/engine/assets';
 import { premultiplyInPlace } from '../src/engine/renderer';
 import { memoryFile } from '../src/engine/vfs';
 
@@ -63,5 +63,15 @@ describe('pixel helpers', () => {
     const d = new Uint8Array([50, 50, 50, 255, 0, 0, 0, 255]);
     whiteFromAlpha(d);
     expect(Array.from(d)).toEqual([255, 255, 255, 50, 255, 255, 255, 0]);
+    const red = new Uint8Array([50, 50, 50, 255]);
+    whiteFromAlpha(red, 0xff0000);
+    expect(Array.from(red)).toEqual([255, 0, 0, 50]);
+  });
+
+  it('applies a one-cel alpha grid to every cel', () => {
+    // 4x1 image with 2 columns of 2x1 cels; the mask is one 2x1 cel.
+    const color = new Uint8Array(4 * 4).fill(255);
+    composeAlphaGrid(color, 4, new Uint8Array([0, 0, 10, 255, 0, 0, 20, 255]), 2, 1, 1, 2);
+    expect([3, 7, 11, 15].map((i) => color[i])).toEqual([10, 20, 10, 20]);
   });
 });

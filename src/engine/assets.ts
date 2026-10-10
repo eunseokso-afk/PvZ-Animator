@@ -281,7 +281,7 @@ export class AssetLibrary extends EventTarget {
     const { file, res } = found;
     let source: HTMLCanvasElement | ImageBitmap;
     if (found.alphaOnly) {
-      source = alphaOnlyImage(await decodeImageFile(file));
+      source = alphaOnlyImage(await decodeImageFile(file), res?.alphaColor);
     } else {
       source = await decodeImageFile(file);
       const alphaFile = this.findAlphaImage(file, res);
@@ -289,10 +289,25 @@ export class AssetLibrary extends EventTarget {
         try {
           const mask = await decodeImageFile(alphaFile);
           // Like the game, ignore masks whose size does not match the image.
-          if (mask.width === source.width && mask.height === source.height) source = applyAlphaMask(source, mask);
+          if (mask.width === source.width && mask.height === source.height) source = applyAlphaMask(source, mask, rawColor(file));
           else console.warn(`Alpha image ${alphaFile.path} is ${mask.width}x${mask.height}, but ${file.path} is ${source.width}x${source.height}; ignoring it.`);
         } catch (e) {
           console.warn('Alpha mask failed for', file.path, e);
+        }
+      }
+    }
+    if (res?.alphaGrid) {
+      const gridFile = this.vfs.findWithExt(res.alphaGrid, IMAGE_LOOKUP_EXTS);
+      if (gridFile) {
+        try {
+          const grid = await decodeImageFile(gridFile);
+          const celW = Math.floor(source.width / res.cols);
+          const celH = Math.floor(source.height / res.rows);
+          // The game requires the grid alpha to be exactly one cel in size.
+          if (grid.width === celW && grid.height === celH) source = applyAlphaMask(source, grid, rawColor(file), res.rows, res.cols);
+          else console.warn(`Alpha grid ${gridFile.path} is ${grid.width}x${grid.height}, but a cel of ${file.path} is ${celW}x${celH}; ignoring it.`);
+        } catch (e) {
+          console.warn('Alpha grid failed for', file.path, e);
         }
       }
     }
@@ -439,7 +454,8 @@ export async function decodeImageFile(file: VFile): Promise<HTMLCanvasElement | 
   const blob = new Blob([bytes as BlobPart], { type });
   if (typeof createImageBitmap === 'function') {
     try {
-      return await createImageBitmap(blob, { premultiplyAlpha: 'none' });
+      // The game's image loaders ignore gamma and colour profiles, so keep the raw values.
+      return await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
     } catch {
       // fall through to <img>
     }
@@ -470,21 +486,82 @@ function pixelsOf(src: Drawable): { canvas: HTMLCanvasElement; ctx: CanvasRender
   return { canvas, ctx, data: ctx.getImageData(0, 0, canvas.width, canvas.height) };
 }
 
-/** Use a grayscale image's blue channel as the alpha of a color image (ImageLib's alpha compose). */
-export function applyAlphaMask(color: Drawable, alpha: Drawable): HTMLCanvasElement {
+/** Whether a colour image may carry its own alpha, so its colours must be read without premultiplying. */
+function rawColor(file: VFile): boolean {
+  return !/\.jpe?g$/i.test(file.path);
+}
+
+let rawGl: WebGL2RenderingContext | null | undefined;
+
+/**
+ * Straight-alpha RGBA bytes of an ImageBitmap decoded with premultiplyAlpha 'none'.
+ * A 2D canvas stores premultiplied pixels, which turns colours under alpha 0 to
+ * black; a WebGL texture upload keeps them, as ImageLib does. Null if unavailable.
+ */
+function straightPixels(src: Drawable): Uint8Array | null {
+  if (typeof ImageBitmap === 'undefined' || !(src instanceof ImageBitmap)) return null;
+  if (rawGl === undefined) rawGl = document.createElement('canvas').getContext('webgl2');
+  const gl = rawGl;
+  if (!gl || gl.isContextLost()) return null;
+  const tex = gl.createTexture();
+  const fb = gl.createFramebuffer();
+  try {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) return null;
+    const out = new Uint8Array(src.width * src.height * 4);
+    gl.readPixels(0, 0, src.width, src.height, gl.RGBA, gl.UNSIGNED_BYTE, out);
+    return gl.getError() === gl.NO_ERROR ? out : null;
+  } catch {
+    return null;
+  } finally {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb);
+    gl.deleteTexture(tex);
+  }
+}
+
+/**
+ * Use a grayscale image's blue channel as the alpha of a color image (ImageLib's
+ * alpha compose). With `rows`/`cols`, `alpha` is one cel and is applied to every
+ * cel (resources.xml "alphagrid"). `raw` keeps colours hidden under alpha 0.
+ */
+export function applyAlphaMask(color: Drawable, alpha: Drawable, raw = false, rows = 1, cols = 1): HTMLCanvasElement {
   const mask = pixelsOf(alpha).data.data;
   const out = pixelsOf(color);
-  composeAlpha(out.data.data, mask);
+  const d = out.data.data;
+  if (raw) {
+    const bytes = straightPixels(color);
+    if (bytes && bytes.length === d.length) d.set(bytes);
+  }
+  if (rows === 1 && cols === 1) composeAlpha(d, mask);
+  else composeAlphaGrid(d, out.canvas.width, mask, alpha.width, alpha.height, rows, cols);
   out.ctx.putImageData(out.data, 0, 0);
   return out.canvas;
 }
 
-/** An alpha image with no color image becomes white with that alpha, as in the game. */
-export function alphaOnlyImage(alpha: Drawable): HTMLCanvasElement {
+/** An alpha image with no color image becomes `color` (white unless resources.xml says) with that alpha, as in the game. */
+export function alphaOnlyImage(alpha: Drawable, color = 0xffffff): HTMLCanvasElement {
   const out = pixelsOf(alpha);
-  whiteFromAlpha(out.data.data);
+  whiteFromAlpha(out.data.data, color);
   out.ctx.putImageData(out.data, 0, 0);
   return out.canvas;
+}
+
+/** Straight-alpha RGBA of width `w`: alpha of every cel := the cel-sized mask's blue channel. */
+export function composeAlphaGrid(color: Uint8ClampedArray | Uint8Array, w: number, mask: Uint8ClampedArray | Uint8Array, celW: number, celH: number, rows: number, cols: number): void {
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      for (let y = 0; y < celH; y++) {
+        for (let x = 0; x < celW; x++) color[((r * celH + y) * w + c * celW + x) * 4 + 3] = mask[(y * celW + x) * 4 + 2];
+      }
+    }
+  }
 }
 
 /** Straight-alpha RGBA: alpha := mask blue channel. */
@@ -492,11 +569,16 @@ export function composeAlpha(color: Uint8ClampedArray | Uint8Array, mask: Uint8C
   for (let i = 0; i < color.length && i < mask.length; i += 4) color[i + 3] = mask[i + 2];
 }
 
-/** Straight-alpha RGBA: rgb := white, alpha := blue channel. */
-export function whiteFromAlpha(d: Uint8ClampedArray | Uint8Array): void {
+/** Straight-alpha RGBA: rgb := `color` (0xRRGGBB, white by default), alpha := blue channel. */
+export function whiteFromAlpha(d: Uint8ClampedArray | Uint8Array, color = 0xffffff): void {
+  const r = (color >> 16) & 255;
+  const g = (color >> 8) & 255;
+  const b = color & 255;
   for (let i = 0; i < d.length; i += 4) {
     d[i + 3] = d[i + 2];
-    d[i] = d[i + 1] = d[i + 2] = 255;
+    d[i] = r;
+    d[i + 1] = g;
+    d[i + 2] = b;
   }
 }
 
