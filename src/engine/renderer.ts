@@ -147,9 +147,12 @@ class WebGLRenderer implements Renderer {
     const gl = this.gl;
     t = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, t);
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img.source);
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    // Upload explicitly premultiplied bytes. UNPACK_PREMULTIPLY_ALPHA_WEBGL is ignored for
+    // ImageBitmap sources, and game art often hides white or black in fully transparent
+    // pixels, which would otherwise show up as solid boxes with our premultiplied blending.
+    const w = Math.max(1, img.source.width);
+    const h = Math.max(1, img.source.height);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultipliedPixels(img.source));
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -276,6 +279,39 @@ class Canvas2DRenderer implements Renderer {
     this.ctx.globalAlpha = 1;
     this.ctx.globalCompositeOperation = 'source-over';
   }
+}
+
+/** Multiply color by alpha in place (straight-alpha RGBA bytes in, premultiplied out). */
+export function premultiplyInPlace(d: Uint8Array | Uint8ClampedArray): void {
+  for (let i = 0; i < d.length; i += 4) {
+    const a = d[i + 3];
+    if (a === 255) continue;
+    if (a === 0) {
+      d[i] = d[i + 1] = d[i + 2] = 0;
+      continue;
+    }
+    d[i] = Math.round((d[i] * a) / 255);
+    d[i + 1] = Math.round((d[i + 1] * a) / 255);
+    d[i + 2] = Math.round((d[i + 2] * a) / 255);
+  }
+}
+
+let scratch: HTMLCanvasElement | null = null;
+
+/** Premultiplied RGBA bytes of an image, ready for texImage2D. */
+export function premultipliedPixels(src: CanvasImageSource & { width: number; height: number }): Uint8Array {
+  const w = Math.max(1, src.width);
+  const h = Math.max(1, src.height);
+  scratch ??= document.createElement('canvas');
+  scratch.width = w;
+  scratch.height = h;
+  const ctx = scratch.getContext('2d', { willReadFrequently: true })!;
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(src, 0, 0);
+  const data = ctx.getImageData(0, 0, w, h).data;
+  premultiplyInPlace(data);
+  scratch.width = scratch.height = 1; // release the backing store
+  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 }
 
 const textCache = new Map<string, LoadedImage>();

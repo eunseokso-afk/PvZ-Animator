@@ -44,6 +44,16 @@ const MIME: Record<string, string> = {
 
 export const RESOURCES_PATH = 'properties/resources.xml';
 
+/** Extension search order for paths without one, as in PopCap's ImageLib::GetImage (jpg, then png, then gif). */
+const IMAGE_LOOKUP_EXTS = ['jpg', 'png', 'gif', 'jpeg', 'bmp', 'webp'];
+
+export interface ResolvedImage {
+  file: VFile;
+  res?: ImageResource;
+  /** Only a "_name" alpha image exists: the game draws it as white with that alpha. */
+  alphaOnly?: boolean;
+}
+
 /** Directory search rules from the game's definition loader (gDefLoadResPaths). */
 const ID_PREFIX_RULES: [string, string][] = [
   ['IMAGE_REANIM_', 'reanim/'],
@@ -184,23 +194,38 @@ export class AssetLibrary extends EventTarget {
   // ------------------------------------------------------------------ images
 
   /** Resolve an image id or path to a file plus its cel layout. */
-  resolveImage(ref: string): { file: VFile; res?: ImageResource } | null {
+  resolveImage(ref: string): ResolvedImage | null {
     if (!ref) return null;
     const upper = ref.toUpperCase();
     const res = this.manifest.images.get(upper);
     if (res && !res.path.startsWith('!')) {
-      const file = this.vfs.findWithExt(res.path, IMAGE_EXTS);
-      if (file) return { file, res };
+      const found = this.findImageAt(res.path);
+      if (found) return { ...found, res };
     }
     for (const [prefix, dir] of ID_PREFIX_RULES) {
       if (upper.startsWith(prefix) && upper.length > prefix.length) {
-        const file = this.vfs.findWithExt(dir + ref.slice(prefix.length), IMAGE_EXTS);
-        if (file) return { file, res: this.resourceForPath(file.path) };
+        const found = this.findImageAt(dir + ref.slice(prefix.length));
+        if (found) return { ...found, res: this.resourceForPath(found.file.path) };
       }
     }
-    const file = this.vfs.findWithExt(ref, IMAGE_EXTS);
-    if (file) return { file, res: this.resourceForPath(file.path) };
-    return null;
+    const found = this.findImageAt(ref);
+    return found ? { ...found, res: this.resourceForPath(found.file.path) } : null;
+  }
+
+  /** An image file at a path (extension optional), or failing that an alpha-only "_name" image. */
+  private findImageAt(path: string): { file: VFile; alphaOnly?: boolean } | null {
+    const file = this.vfs.findWithExt(path, IMAGE_LOOKUP_EXTS);
+    if (file) return { file };
+    const alpha = this.alphaImageNear(stripExt(path));
+    return alpha ? { file: alpha, alphaOnly: true } : null;
+  }
+
+  /** PopCap's alpha-image naming: "dir/_name" first, then "dir/name_". */
+  private alphaImageNear(pathNoExt: string): VFile | undefined {
+    const p = normPath(pathNoExt);
+    const dir = dirname(p);
+    const prefix = dir ? dir + '/' : '';
+    return this.vfs.findWithExt(`${prefix}_${basename(p)}`, IMAGE_LOOKUP_EXTS) ?? this.vfs.findWithExt(`${p}_`, IMAGE_LOOKUP_EXTS);
   }
 
   private resourceForPath(path: string): ImageResource | undefined {
@@ -254,13 +279,21 @@ export class AssetLibrary extends EventTarget {
     const found = this.resolveImage(ref);
     if (!found) return null;
     const { file, res } = found;
-    let source: HTMLCanvasElement | ImageBitmap = await decodeImageFile(file);
-    const alphaFile = this.findAlphaImage(file, res);
-    if (alphaFile) {
-      try {
-        source = applyAlphaMask(source, await decodeImageFile(alphaFile));
-      } catch (e) {
-        console.warn('Alpha mask failed for', file.path, e);
+    let source: HTMLCanvasElement | ImageBitmap;
+    if (found.alphaOnly) {
+      source = alphaOnlyImage(await decodeImageFile(file));
+    } else {
+      source = await decodeImageFile(file);
+      const alphaFile = this.findAlphaImage(file, res);
+      if (alphaFile && alphaFile !== file) {
+        try {
+          const mask = await decodeImageFile(alphaFile);
+          // Like the game, ignore masks whose size does not match the image.
+          if (mask.width === source.width && mask.height === source.height) source = applyAlphaMask(source, mask);
+          else console.warn(`Alpha image ${alphaFile.path} is ${mask.width}x${mask.height}, but ${file.path} is ${source.width}x${source.height}; ignoring it.`);
+        } catch (e) {
+          console.warn('Alpha mask failed for', file.path, e);
+        }
       }
     }
     const rows = res?.rows ?? 1;
@@ -278,18 +311,16 @@ export class AssetLibrary extends EventTarget {
     };
   }
 
-  /** PopCap looks for "_name" or "name_" grayscale alpha images next to JPEGs. */
-  private findAlphaImage(file: VFile, res?: ImageResource): VFile | undefined {
+  /**
+   * The separate alpha image for an image file: resources.xml "alphaimage", else
+   * "_name" / "name_" next to it. The game checks this for every format, not just JPEG.
+   */
+  findAlphaImage(file: VFile, res?: ImageResource): VFile | undefined {
     if (res?.alphaImage) {
-      const f = this.vfs.findWithExt(res.alphaImage, IMAGE_EXTS);
+      const f = this.vfs.findWithExt(res.alphaImage, IMAGE_LOOKUP_EXTS);
       if (f) return f;
     }
-    const ext = extname(file.path);
-    if (ext !== 'jpg' && ext !== 'jpeg') return undefined;
-    const dir = dirname(file.path);
-    const base = stripExt(basename(file.path));
-    const prefix = dir ? dir + '/' : '';
-    return this.vfs.findWithExt(`${prefix}_${base}`, IMAGE_EXTS) ?? this.vfs.findWithExt(`${prefix}${base}_`, IMAGE_EXTS);
+    return this.alphaImageNear(stripExt(file.path));
   }
 
   // ------------------------------------------------------------------ sounds
@@ -414,23 +445,45 @@ export async function decodeImageFile(file: VFile): Promise<HTMLCanvasElement | 
   }
 }
 
-/** Combine a color image with a grayscale alpha image (red channel = alpha). */
-export function applyAlphaMask(color: CanvasImageSource & { width: number; height: number }, alpha: CanvasImageSource & { width: number; height: number }): HTMLCanvasElement {
-  const w = color.width;
-  const h = color.height;
-  const c = document.createElement('canvas');
-  c.width = w;
-  c.height = h;
-  const ctx = c.getContext('2d', { willReadFrequently: true })!;
-  ctx.drawImage(alpha, 0, 0, w, h);
-  const a = ctx.getImageData(0, 0, w, h).data;
-  ctx.clearRect(0, 0, w, h);
-  ctx.drawImage(color, 0, 0);
-  const img = ctx.getImageData(0, 0, w, h);
-  const d = img.data;
-  for (let i = 0; i < d.length; i += 4) d[i + 3] = a[i];
-  ctx.putImageData(img, 0, 0);
-  return c;
+type Drawable = CanvasImageSource & { width: number; height: number };
+
+function pixelsOf(src: Drawable): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D; data: ImageData } {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, src.width);
+  canvas.height = Math.max(1, src.height);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  ctx.drawImage(src, 0, 0);
+  return { canvas, ctx, data: ctx.getImageData(0, 0, canvas.width, canvas.height) };
+}
+
+/** Use a grayscale image's blue channel as the alpha of a color image (ImageLib's alpha compose). */
+export function applyAlphaMask(color: Drawable, alpha: Drawable): HTMLCanvasElement {
+  const mask = pixelsOf(alpha).data.data;
+  const out = pixelsOf(color);
+  composeAlpha(out.data.data, mask);
+  out.ctx.putImageData(out.data, 0, 0);
+  return out.canvas;
+}
+
+/** An alpha image with no color image becomes white with that alpha, as in the game. */
+export function alphaOnlyImage(alpha: Drawable): HTMLCanvasElement {
+  const out = pixelsOf(alpha);
+  whiteFromAlpha(out.data.data);
+  out.ctx.putImageData(out.data, 0, 0);
+  return out.canvas;
+}
+
+/** Straight-alpha RGBA: alpha := mask blue channel. */
+export function composeAlpha(color: Uint8ClampedArray | Uint8Array, mask: Uint8ClampedArray | Uint8Array): void {
+  for (let i = 0; i < color.length && i < mask.length; i += 4) color[i + 3] = mask[i + 2];
+}
+
+/** Straight-alpha RGBA: rgb := white, alpha := blue channel. */
+export function whiteFromAlpha(d: Uint8ClampedArray | Uint8Array): void {
+  for (let i = 0; i < d.length; i += 4) {
+    d[i + 3] = d[i + 2];
+    d[i] = d[i + 1] = d[i + 2] = 255;
+  }
 }
 
 /** Alpha value (0..255) at a pixel, computing the mask lazily. */
