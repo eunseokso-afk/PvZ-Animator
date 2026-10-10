@@ -119,7 +119,7 @@ export class AssetBrowser {
 
   private scenesSig(): string {
     const ws = this.ws;
-    return ws.scenes.map((s) => `${s.id}:${s.name}:${s.dirty}:${s.state.layers.length}:${ws.active === s}`).join('|');
+    return ws.scenes.map((s) => `${s.id}:${s.name}:${s.dirty}:${s.state.layers.length}:${s.state.width}x${s.state.height}:${s.state.length}@${s.state.fps}:${ws.active === s}`).join('|');
   }
 
   refresh(force = false): void {

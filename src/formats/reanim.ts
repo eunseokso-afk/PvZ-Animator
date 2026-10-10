@@ -249,6 +249,7 @@ export function getAnimRanges(tracks: TrackShape[]): AnimRange[] {
 
 /** Tracks that never draw anything themselves: anim_ range markers, _ground, attachers etc. */
 export function isMarkerTrack(track: { name: string; transforms: ReanimTransform[] }): boolean {
+  if (track.name.toLowerCase() === 'fullscreen') return false;
   return !track.transforms.some((t) => t.i || (t.text && t.font));
 }
 

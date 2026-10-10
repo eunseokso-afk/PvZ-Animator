@@ -134,6 +134,11 @@ export abstract class DocumentBase<S> {
     this.afterRestore();
   }
 
+  /** Record a change that is not part of the undo history (e.g. a rename), so the document counts as edited. */
+  touchVersion(): void {
+    this.version = versionCounter++;
+  }
+
   clearHistory(): void {
     this.undoStack = [];
     this.redoStack = [];

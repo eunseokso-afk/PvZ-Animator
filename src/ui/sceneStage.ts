@@ -20,7 +20,7 @@ const ROT_DIST = 26;
 
 type Drag =
   | { kind: 'move'; layer: number; frame: number; sx: number; sy: number; x0: number; y0: number; began: boolean }
-  | { kind: 'rotate'; layer: number; frame: number; pivot: [number, number]; startAngle: number; rot0: number; local: [number, number] }
+  | { kind: 'rotate'; layer: number; frame: number; pivot: [number, number]; startAngle: number; rot0: number; local: [number, number]; sx: number; sy: number; began: boolean }
   | {
       kind: 'scale';
       layer: number;
@@ -31,6 +31,9 @@ type Drag =
       inv: Mat;
       sx0: number;
       sy0: number;
+      sx: number;
+      sy: number;
+      began: boolean;
     };
 
 export interface StageHost {
@@ -143,6 +146,11 @@ export class SceneStage {
     if (!sel || this.ws.playing) return;
     const pts = this.corners(sel);
     if (!pts) return;
+    if (doc.isLocked(sel.layerIndex)) {
+      // Locked: show what is selected, but offer no handles.
+      outline(pts, 'rgba(160, 160, 160, 0.8)', 1);
+      return;
+    }
     outline(pts, '#ffd34d', 1.5);
     const rot = this.rotateHandle(sel)!;
     const topMid: [number, number] = [(pts[0][0] + pts[1][0]) / 2, (pts[0][1] + pts[1][1]) / 2];
@@ -250,13 +258,10 @@ export class SceneStage {
       const local: [number, number] = [(x0 + x1) / 2, (y0 + y1) / 2];
       const m0 = poseMatrix(pose);
       const pivot = apply(m0, local[0], local[1]);
-      doc.checkpoint(handle.kind === 'rotate' ? 'Rotate instance' : 'Scale instance');
-      doc.touch(() => {
-        doc.ensureKey(sel.layerIndex, frame);
-      });
+      // The undo step and the key are made on the first real movement, so a click changes nothing.
       if (handle.kind === 'rotate') {
         const [wx, wy] = this.host.toStage(doc, x, y);
-        this.drag = { kind: 'rotate', layer: sel.layerIndex, frame, pivot, startAngle: Math.atan2(wy - pivot[1], wx - pivot[0]), rot0: pose.rotation, local };
+        this.drag = { kind: 'rotate', layer: sel.layerIndex, frame, pivot, startAngle: Math.atan2(wy - pivot[1], wx - pivot[0]), rot0: pose.rotation, local, sx: x, sy: y, began: false };
       } else {
         const cornerLocal: [number, number][] = [
           [x0, y0],
@@ -274,6 +279,9 @@ export class SceneStage {
           inv: invert(m0) ?? [1, 0, 0, 1, 0, 0],
           sx0: pose.scaleX,
           sy0: pose.scaleY,
+          sx: x,
+          sy: y,
+          began: false,
         };
       }
       return true;
@@ -296,6 +304,12 @@ export class SceneStage {
     if (!drag) return;
     const layer = doc.state.layers[drag.layer];
     if (!layer) return;
+    if (drag.kind !== 'move' && !drag.began) {
+      if (Math.abs(x - drag.sx) + Math.abs(y - drag.sy) < 3) return;
+      drag.began = true;
+      doc.checkpoint(drag.kind === 'rotate' ? 'Rotate instance' : 'Scale instance');
+      doc.touch(() => doc.ensureKey(drag.layer, drag.frame));
+    }
     if (drag.kind === 'move') {
       let dx = (x - drag.sx) / doc.view.zoom;
       let dy = (y - drag.sy) / doc.view.zoom;
@@ -335,6 +349,21 @@ export class SceneStage {
     this.ws.emit('change');
   }
 
+  /** Flip a layer at the current frame around its visible centre, like Animate (not around the prefab origin). */
+  flip(doc: SceneDocument, li: number, flipX: boolean): void {
+    const layer = doc.state.layers[li];
+    const pose = layer && evalLayer(layer, doc.ui.frame);
+    if (!pose || pose.flipX === flipX) return;
+    const d = this.drawn.find((x) => x.layerIndex === li);
+    let patch: Partial<LayerKey> = { flipX };
+    if (d?.local) {
+      const local: [number, number] = [(d.local[0] + d.local[2]) / 2, (d.local[1] + d.local[3]) / 2];
+      const pivot = apply(poseMatrix(pose), local[0], local[1]);
+      patch = { ...this.keepPivot({ ...pose, flipX }, local, pivot), flipX };
+    }
+    doc.setKey(li, doc.ui.frame, patch, 'Flip instance');
+  }
+
   /** x/y that keep the local point `local` at stage position `pivot`. */
   private keepPivot(p: { rotation: number; scaleX: number; scaleY: number; flipX: boolean }, local: [number, number], pivot: [number, number]): Pick<LayerKey, 'x' | 'y'> {
     const m = poseMatrix({ ...p, x: 0, y: 0 });
@@ -362,6 +391,10 @@ export class SceneStage {
     const li = doc.ui.layer;
     const layer = doc.state.layers[li];
     if (!layer) return;
+    if (doc.isLocked(li)) {
+      this.ws.status(`Layer "${layer.name}" is locked.`);
+      return;
+    }
     const pose = evalLayer(layer, doc.ui.frame);
     if (!pose) return;
     doc.setKey(li, doc.ui.frame, { x: pose.x + dx, y: pose.y + dy }, 'Nudge instance');
@@ -435,12 +468,13 @@ export class SceneStage {
     const n = doc.state.layers.length;
     const emit = () => ws.emit('change');
     const pose = evalLayer(layer, doc.ui.frame);
+    const locked = doc.isLocked(li);
     return [
       ...(layer.kind === 'reanim' ? [{ label: 'Edit prefab', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc) }] : []),
       ...(layer.kind === 'particle' ? [{ label: 'Edit effect', action: () => void ws.openAsset(layer.source) }] : []),
-      { label: 'Flip horizontally', disabled: !pose, action: () => (doc.setKey(li, doc.ui.frame, { flipX: !pose!.flipX }, 'Flip instance'), emit()) },
+      { label: 'Flip horizontally', disabled: !pose || locked, action: () => (this.flip(doc, li, !pose!.flipX), emit()) },
       { label: 'Duplicate', shortcut: 'Ctrl+D', action: () => ((doc.ui.layer = doc.duplicateLayer(li)), emit()) },
-      { label: 'Delete layer', shortcut: 'Del', action: () => (doc.removeLayer(li), emit()) },
+      { label: 'Delete layer', shortcut: 'Del', disabled: locked, action: () => (doc.removeLayer(li), emit()) },
       { separator: true },
       { label: 'Bring to front', disabled: li >= n - 1, action: () => (doc.moveLayer(li, n - 1), emit()) },
       { label: 'Bring forward', shortcut: ']', disabled: li >= n - 1, action: () => (doc.moveLayer(li, li + 1), emit()) },

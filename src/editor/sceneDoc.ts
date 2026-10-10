@@ -163,7 +163,8 @@ export function evalLayer(layer: SceneLayer, frame: number): LayerPose | null {
     keyIndex: i,
     segmentStart: k.frame,
   };
-  if (next && k.ease !== 'hold' && next.frame > k.frame && frame > k.frame) {
+  // Like Animate, a blank (hidden) keyframe ends the tween instead of being tweened towards.
+  if (next && next.visible && k.ease !== 'hold' && next.frame > k.frame && frame > k.frame) {
     const t = warpTime((frame - k.frame) / (next.frame - k.frame), EASE_CURVE.get(k.ease) ?? Curve.Linear);
     for (const p of TWEENED_PROPS) pose[p] = k[p] + (next[p] - k[p]) * t;
     for (let c = 0; c < 3; c++) pose.tint[c] = k.tint[c] + (next.tint[c] - k.tint[c]) * t;
@@ -182,6 +183,23 @@ export function poseMatrix(p: { x: number; y: number; rotation: number; scaleX: 
   const sx = p.scaleX * (p.flipX ? -1 : 1);
   const sy = p.scaleY;
   return [c * sx, s * sx, -s * sy, c * sy, p.x, p.y];
+}
+
+/** Shift a layer's keys at or after `at` by `count` frames, dropping keys in a removed span. */
+function shiftKeys(l: SceneLayer, at: number, count: number, length: number): void {
+  if (count < 0) {
+    const end = at - count;
+    const kept = l.keys.filter((k) => k.frame < at || k.frame >= end);
+    if (!kept.length) {
+      // Every key was in the removed span: keep the first one where the span began.
+      const first = l.keys[0];
+      first.frame = Math.max(0, Math.min(at, length - 1));
+      l.keys = [first];
+      return;
+    }
+    l.keys = kept;
+  }
+  for (const k of l.keys) if (k.frame >= at) k.frame = Math.max(0, k.frame + count);
 }
 
 export interface SceneUiState {
@@ -214,12 +232,25 @@ export class SceneDocument extends DocumentBase<SceneState> {
     return new SceneDocument(name, `scenes/${name}`, state, true);
   }
 
+  /** Which layer was selected when each undo snapshot was taken, so undo/redo can reselect it. */
+  private selectionOf = new WeakMap<SceneState, number>();
+
   protected snapshot(): SceneState {
-    return cloneSceneState(this.state);
+    const copy = cloneSceneState(this.state);
+    const uid = this.selectedLayer?.uid;
+    if (uid !== undefined) this.selectionOf.set(copy, uid);
+    return copy;
   }
 
   protected afterRestore(): void {
     this.revision++;
+    const uid = this.selectionOf.get(this.state);
+    if (uid !== undefined) {
+      // The restored snapshot becomes the live state; forget its selection so later edits don't reapply it.
+      this.selectionOf.delete(this.state);
+      const i = this.state.layers.findIndex((l) => l.uid === uid);
+      if (i >= 0) this.ui.layer = i;
+    }
     if (this.ui.layer >= this.state.layers.length) this.ui.layer = this.state.layers.length - 1;
     if (this.ui.frame >= this.state.length) this.ui.frame = this.ui.frameEnd = this.state.length - 1;
     if (this.ui.cue && !this.state.soundCues.some((c) => c.uid === this.ui.cue!.uid)) this.ui.cue = null;
@@ -235,6 +266,12 @@ export class SceneDocument extends DocumentBase<SceneState> {
 
   get selectedLayer(): SceneLayer | undefined {
     return this.state.layers[this.ui.layer];
+  }
+
+  /** Whether a layer is locked against edits in the editor. */
+  isLocked(layerIndex: number): boolean {
+    const layer = this.state.layers[layerIndex];
+    return !!layer && this.ui.locked.has(layer.uid);
   }
 
   /** Record an undo step and mark the scene changed. */
@@ -330,19 +367,25 @@ export class SceneDocument extends DocumentBase<SceneState> {
     else this.touch(apply);
   }
 
-  removeKey(layerIndex: number, frame: number): void {
+  /**
+   * Remove the key at `frame`. The first key is where the layer starts and holds its
+   * animation settings, so it is never removed (move it instead); returns false then.
+   */
+  removeKey(layerIndex: number, frame: number): boolean {
     const layer = this.state.layers[layerIndex];
-    if (!layer || layer.keys.length <= 1) return;
+    if (!layer) return false;
     const i = layer.keys.findIndex((k) => k.frame === frame);
-    if (i < 0) return;
+    if (i <= 0) return false;
     this.edit('Remove keyframe', (s) => s.layers[layerIndex].keys.splice(i, 1));
+    return true;
   }
 
-  toggleKey(layerIndex: number, frame: number): void {
+  toggleKey(layerIndex: number, frame: number): boolean {
     const layer = this.state.layers[layerIndex];
-    if (!layer) return;
-    if (layer.keys.some((k) => k.frame === frame)) this.removeKey(layerIndex, frame);
-    else this.edit('Add keyframe', () => this.ensureKey(layerIndex, frame));
+    if (!layer) return false;
+    if (layer.keys.some((k) => k.frame === frame)) return this.removeKey(layerIndex, frame);
+    this.edit('Add keyframe', () => this.ensureKey(layerIndex, frame));
+    return true;
   }
 
   moveKey(layerIndex: number, from: number, to: number): boolean {
@@ -366,31 +409,54 @@ export class SceneDocument extends DocumentBase<SceneState> {
     this.edit('Set easing', (s) => (s.layers[layerIndex].keys[i].ease = ease));
   }
 
-  setLength(length: number): void {
+  /** Change the scene length. Keys and sound cues past a new, shorter end are trimmed (undoable); returns how many. */
+  setLength(length: number): { keys: number; cues: number } {
     length = Math.max(1, Math.round(length));
-    if (length === this.state.length) return;
-    this.edit('Change scene length', (s) => (s.length = length));
+    const dropped = { keys: 0, cues: 0 };
+    if (length === this.state.length) return dropped;
+    this.edit('Change scene length', (s) => {
+      s.length = length;
+      for (const l of s.layers) {
+        const kept = l.keys.filter((k) => k.frame < length);
+        if (!kept.length) {
+          // The layer starts after the new end: keep it, starting on the last frame.
+          const first = l.keys[0];
+          first.frame = length - 1;
+          kept.push(first);
+        }
+        dropped.keys += l.keys.length - kept.length;
+        l.keys = kept;
+      }
+      const cues = s.soundCues.filter((c) => c.frame < length);
+      dropped.cues = s.soundCues.length - cues.length;
+      s.soundCues = cues;
+    });
     if (this.ui.frame >= length) this.ui.frame = this.ui.frameEnd = length - 1;
+    return dropped;
   }
 
-  /** Insert or remove frames at `at` on every layer (Animate F5 / Shift+F5). */
+  /** Insert or remove frames at `at` on every layer and the sound cues, changing the scene length. */
   shiftFrames(at: number, count: number): void {
     if (count === 0) return;
-    this.edit(count > 0 ? 'Insert frames' : 'Remove frames', (s) => {
-      if (count < 0) {
-        const end = at - count;
-        for (const l of s.layers) {
-          // Keep the first key of a layer that would otherwise lose all its keys.
-          const kept = l.keys.filter((k) => k.frame < at || k.frame >= end);
-          l.keys = kept.length ? kept : [l.keys[0]];
-        }
-        s.soundCues = s.soundCues.filter((c) => c.frame < at || c.frame >= end);
-      }
-      for (const l of s.layers) for (const k of l.keys) if (k.frame >= at) k.frame = Math.max(0, k.frame + count);
-      for (const c of s.soundCues) if (c.frame >= at) c.frame = Math.max(0, c.frame + count);
+    this.edit(count > 0 ? 'Insert frames (all layers)' : 'Remove frames (all layers)', (s) => {
       s.length = Math.max(1, s.length + count);
+      for (const l of s.layers) shiftKeys(l, at, count, s.length);
+      if (count < 0) s.soundCues = s.soundCues.filter((c) => c.frame < at || c.frame >= at - count);
+      for (const c of s.soundCues) if (c.frame >= at) c.frame = Math.max(0, c.frame + count);
     });
     if (this.ui.frame >= this.state.length) this.ui.frame = this.ui.frameEnd = this.state.length - 1;
+  }
+
+  /**
+   * Animate F5 / Shift+F5 on one layer: insert or remove frames at `at` in that layer
+   * only. Inserting lengthens the scene so the layer's later keys keep their place.
+   */
+  shiftLayerFrames(layerIndex: number, at: number, count: number): void {
+    if (count === 0 || !this.state.layers[layerIndex]) return;
+    this.edit(count > 0 ? 'Insert frames' : 'Remove frames', (s) => {
+      if (count > 0) s.length += count;
+      shiftKeys(s.layers[layerIndex], at, count, s.length);
+    });
   }
 
   addSoundCue(frame: number, sound: string, volume = 1): SoundCue {

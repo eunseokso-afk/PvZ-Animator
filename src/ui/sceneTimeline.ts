@@ -38,6 +38,12 @@ export interface SceneTimelineHooks {
   renameLayer(doc: SceneDocument, layer: number): void;
   previewSound(path: string): void;
   bake(doc: SceneDocument): void;
+  /** Add a library asset dropped on the timeline as a new layer starting at `frame`. */
+  dropAsset(doc: SceneDocument, asset: { kind: string; path: string }, frame: number): void;
+  /** Insert (count > 0) or remove frames: on one layer, or on all layers when `layer` is -1. */
+  shiftFrames(doc: SceneDocument, layer: number, at: number, count: number): void;
+  /** True (and tells the user) if the layer is locked. */
+  locked(doc: SceneDocument, layer: number): boolean;
 }
 
 export class SceneTimeline {
@@ -51,6 +57,8 @@ export class SceneTimeline {
   private scrollX = 0;
   private scrollY = 0;
   private cellW = 10;
+  /** The first view of a scene was set up while the panel had no size yet; fit cells on the next resize. */
+  private pendingFit = false;
   private rows: Row[] = [];
   private drag: Drag | null = null;
   private views = new Map<number, { cellW: number; scrollX: number; scrollY: number }>();
@@ -129,7 +137,11 @@ export class SceneTimeline {
       onChange: (v, final) => {
         const doc = this.doc;
         if (doc && final) {
-          doc.setLength(v);
+          const dropped = doc.setLength(v);
+          if (dropped.keys || dropped.cues) {
+            const parts = [dropped.keys && `${dropped.keys} keyframe${dropped.keys > 1 ? 's' : ''}`, dropped.cues && `${dropped.cues} sound cue${dropped.cues > 1 ? 's' : ''}`].filter(Boolean);
+            ws.status(`Removed ${parts.join(' and ')} past the new end (Ctrl+Z to undo).`);
+          }
           ws.emit('change');
         }
       },
@@ -200,7 +212,15 @@ export class SceneTimeline {
     this.canvas.height = Math.round(this.cssH * this.dpr);
     this.canvas.style.width = `${this.cssW}px`;
     this.canvas.style.height = `${this.cssH}px`;
+    if (this.pendingFit && this.doc && this.cssW >= 100) {
+      this.pendingFit = false;
+      this.cellW = this.fitCellW(this.doc);
+    }
     this.draw();
+  }
+
+  private fitCellW(doc: SceneDocument): number {
+    return clamp(Math.floor((this.cssW - NAME_W - 40) / Math.max(1, doc.state.length)), 6, 24);
   }
 
   private switchView(doc: SceneDocument) {
@@ -210,7 +230,8 @@ export class SceneTimeline {
     const v = this.views.get(doc.id);
     if (v) ({ cellW: this.cellW, scrollX: this.scrollX, scrollY: this.scrollY } = v);
     else {
-      this.cellW = clamp(Math.floor((this.cssW - NAME_W - 40) / Math.max(1, doc.state.length)), 6, 24);
+      this.cellW = this.fitCellW(doc);
+      this.pendingFit = this.cssW < 100;
       this.scrollX = this.scrollY = 0;
     }
   }
@@ -292,8 +313,10 @@ export class SceneTimeline {
     if (drag?.kind === 'reorder' && drag.moved) {
       const ri = this.rows.findIndex((r) => r.kind === 'layer' && r.index === drag.target);
       if (ri >= 0) {
+        // Moving down the list lands below the target row, moving up lands above it.
+        const below = drag.target < drag.layer;
         ctx.fillStyle = C.sel;
-        ctx.fillRect(0, RULER_H + ri * ROW_H - this.scrollY - 1, this.cssW, 2);
+        ctx.fillRect(0, RULER_H + (ri + (below ? 1 : 0)) * ROW_H - this.scrollY - 1, this.cssW, 2);
       }
     }
     ctx.restore();
@@ -571,6 +594,8 @@ export class SceneTimeline {
         const cue = doc.addSoundCue(frame, asset.path);
         doc.ui.cue = { kind: 'sound', uid: cue.uid };
         this.ws.emit('change');
+      } else {
+        this.hooks.dropAsset(doc, asset, frame);
       }
     });
   }
@@ -641,9 +666,9 @@ export class SceneTimeline {
       return;
     }
     if (e.shiftKey && doc.ui.layer === li) return this.ws.setFrame(frame, true);
-    const wasSelected = doc.ui.layer === li;
     doc.ui.layer = li;
-    if (wasSelected && layer.keys.some((k) => k.frame === frame)) this.drag = { kind: 'moveKey', layer: li, from: frame, to: frame };
+    // A press on a key dot drags the key, whether or not its layer was selected.
+    if (!e.shiftKey && !doc.isLocked(li) && layer.keys.some((k) => k.frame === frame)) this.drag = { kind: 'moveKey', layer: li, from: frame, to: frame };
     else this.drag = { kind: 'select', from: frame };
     this.ws.setFrame(frame);
   }
@@ -704,8 +729,8 @@ export class SceneTimeline {
     if (row?.kind === 'layer') {
       if (x < NAME_W) {
         if (x >= 40) this.hooks.renameLayer(doc, row.index);
-      } else {
-        doc.toggleKey(row.index, frame);
+      } else if (!this.hooks.locked(doc, row.index)) {
+        if (!doc.toggleKey(row.index, frame)) this.ws.status('The first keyframe is where the layer starts, so it stays. Drag it to start the layer later.');
         this.ws.emit('change');
       }
     } else if (row?.kind === 'sound' && x >= NAME_W && this.hitCue(doc, x) === null) {
@@ -740,22 +765,26 @@ export class SceneTimeline {
     const isKey = layer.keys.some((k) => k.frame === frame);
     const ki = keyIndexAt(layer, frame);
     const key = layer.keys[ki];
+    const locked = doc.isLocked(li);
     return [
-      { label: 'Insert keyframe', shortcut: 'F6', disabled: isKey, action: () => (doc.toggleKey(li, frame), emit()) },
-      { label: 'Insert blank keyframe (hide)', shortcut: 'F7', action: () => (doc.setKey(li, frame, { visible: false }, 'Insert blank keyframe'), emit()) },
-      { label: 'Show from here', disabled: !key || key.visible, action: () => (doc.setKey(li, frame, { visible: true }, 'Show layer'), emit()) },
-      { label: 'Clear keyframe', shortcut: 'Shift+F6', disabled: !isKey || layer.keys.length <= 1, action: () => (doc.removeKey(li, frame), emit()) },
+      { label: 'Insert keyframe', shortcut: 'F6', disabled: isKey || locked, action: () => (doc.toggleKey(li, frame), emit()) },
+      { label: 'Insert blank keyframe (hide)', shortcut: 'F7', disabled: locked, action: () => (doc.setKey(li, frame, { visible: false }, 'Insert blank keyframe'), emit()) },
+      { label: 'Show from here', disabled: !key || key.visible || locked, action: () => (doc.setKey(li, frame, { visible: true }, 'Show layer'), emit()) },
+      // The first key is where the layer starts; it can be dragged but not cleared.
+      { label: 'Clear keyframe', shortcut: 'Shift+F6', disabled: !isKey || ki === 0 || locked, action: () => (doc.removeKey(li, frame), emit()) },
       {
         label: 'Easing',
-        disabled: !key,
+        disabled: !key || locked,
         submenu: EASES.map((ea) => ({ label: ea.label, checked: key?.ease === ea.id, action: () => (doc.setEase(li, frame, ea.id), emit()) })),
       },
       ...(layer.kind !== 'image'
-        ? [{ label: layer.kind === 'particle' ? 'Restart effect here' : 'Restart animation here', checked: isKey && key?.restart, action: () => (doc.setKey(li, frame, { restart: !(isKey && key?.restart) }, 'Toggle restart'), emit()) }]
+        ? [{ label: layer.kind === 'particle' ? 'Restart effect here' : 'Restart animation here', checked: isKey && key?.restart, disabled: locked, action: () => (doc.setKey(li, frame, { restart: !(isKey && key?.restart) }, 'Toggle restart'), emit()) }]
         : []),
       { separator: true },
-      { label: 'Insert frame', shortcut: 'F5', action: () => (doc.shiftFrames(frame + 1, 1), emit()) },
-      { label: 'Remove frame', shortcut: 'Shift+F5', disabled: doc.state.length <= 1, action: () => (doc.shiftFrames(frame, -1), emit()) },
+      { label: 'Insert frame', shortcut: 'F5', disabled: locked, action: () => this.hooks.shiftFrames(doc, li, frame + 1, 1) },
+      { label: 'Remove frame', shortcut: 'Shift+F5', disabled: locked, action: () => this.hooks.shiftFrames(doc, li, frame, -1) },
+      { label: 'Insert frame (all layers)', shortcut: 'Ctrl+F5', action: () => this.hooks.shiftFrames(doc, -1, frame + 1, 1) },
+      { label: 'Remove frame (all layers)', shortcut: 'Ctrl+Shift+F5', disabled: doc.state.length <= 1, action: () => this.hooks.shiftFrames(doc, -1, frame, -1) },
     ];
   }
 }

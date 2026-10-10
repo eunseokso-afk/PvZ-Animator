@@ -17,9 +17,20 @@ export class ReanimInspector {
   linkRotation = true;
   linkScale = false;
 
+  /** A scrub or slider drag is in progress: update values in place, never rebuild under the pointer. */
+  private gesture = false;
+  private alphaSlider: HTMLInputElement | null = null;
+
   constructor(private ws: Workspace) {
     this.el = h('div', { class: 'inspector' });
     const refresh = rafThrottle(() => this.refresh());
+    window.addEventListener('pointerup', () =>
+      setTimeout(() => {
+        if (!this.gesture) return;
+        this.gesture = false;
+        refresh();
+      }, 0),
+    );
     ws.on('change', refresh);
     ws.on('docs', refresh);
     ws.on('frame', refresh);
@@ -38,12 +49,14 @@ export class ReanimInspector {
     const cue = doc.ui.cue;
     const t = track?.transforms[frame];
     const sig = [doc.id, this.ws.playing ? 'playing' : frame, doc.ui.track, track?.uid, track?.name, cue?.kind, cue?.uid, t?.i, t?.text, t?.font, track?.keys[frame], track?.ease[frame], t ? t.f >= 0 : '', this.linkRotation, this.linkScale, doc.frameCount, doc.fps, doc.path, doc.state.tracks.length, doc.ui.track >= 0 && hasClipboard(this.ws)].join('|');
-    if (sig === this.lastSig) {
+    // A scrub that turns the frame into a key changes the signature; rebuild only once it ends.
+    if (sig === this.lastSig || this.gesture) {
       this.updateValues(doc);
       return;
     }
     this.lastSig = sig;
     this.fields.clear();
+    this.alphaSlider = null;
     this.el.replaceChildren(this.docSection(doc), cue ? this.cueSection(doc) : track ? this.trackSection(doc) : this.hint());
   }
 
@@ -53,6 +66,7 @@ export class ReanimInspector {
     const t = track.transforms[this.ws.frameTime(doc).before];
     if (!t) return;
     for (const [k, f] of this.fields) f.set(t[k as keyof ReanimTransform] as number);
+    if (this.alphaSlider && !this.gesture) this.alphaSlider.value = String(t.a);
   }
 
   private hint() {
@@ -113,8 +127,10 @@ export class ReanimInspector {
         title,
         onBegin: () => {
           begun = true;
+          this.gesture = true;
         },
         onChange: (v, final) => {
+          if (final) this.gesture = false;
           set(patchFn ? patchFn(v) : { [key]: v }, `Change ${label}`, final, begun);
           begun = false;
         },
@@ -202,16 +218,21 @@ export class ReanimInspector {
       step: 0.01,
       value: t.a,
       class: 'alpha-slider',
-      onpointerdown: () => (sliderBegun = false),
+      onpointerdown: () => {
+        sliderBegun = false;
+        this.gesture = true;
+      },
       oninput: () => {
         set({ a: parseFloat(alphaSlider.value) }, 'Change alpha', false, !sliderBegun);
         sliderBegun = true;
       },
       onchange: () => {
         sliderBegun = false;
+        this.gesture = false;
         ws.emit('change');
       },
     });
+    this.alphaSlider = alphaSlider;
 
     const textFields =
       t.text || t.font

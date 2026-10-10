@@ -15,13 +15,22 @@ export interface Renderer {
   readonly canvas: HTMLCanvasElement;
   readonly kind: 'webgl2' | 'canvas2d';
   resize(cssWidth: number, cssHeight: number, dpr: number): void;
-  begin(clear?: RGBA): void;
+  /**
+   * Start a frame. `underlay` is what shows behind the canvas (the viewport background);
+   * the 2D fallback draws it in so additive blending has something to add to.
+   */
+  begin(clear?: RGBA, underlay?: CanvasImageSource): void;
   /** `m` maps source-rect pixel coords (0..sw, 0..sh) to canvas CSS pixels. */
   drawImage(img: LoadedImage, sx: number, sy: number, sw: number, sh: number, m: Readonly<Mat>, color: RGBA, blend: Blend): void;
   fillRect(m: Readonly<Mat>, w: number, h: number, color: RGBA, blend: Blend): void;
   end(): void;
   /** Free the GPU context now instead of waiting for garbage collection. */
   dispose(): void;
+  /**
+   * The rendered pixels as straight-alpha ImageData (for PNG export). Additive light
+   * drawn over transparency is kept visible by raising alpha to the brightest channel.
+   */
+  readPixels(): ImageData;
 }
 
 /**
@@ -167,6 +176,7 @@ class WebGLRenderer implements Renderer {
   }
 
   begin(clear: RGBA = [0, 0, 0, 0]): void {
+    // (The browser composites this canvas over the underlay; additive quads write alpha 0.)
     this.quads = 0;
     if (this.lost) return;
     const gl = this.gl;
@@ -268,6 +278,34 @@ class WebGLRenderer implements Renderer {
     this.lost = true;
     this.gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
+
+  readPixels(): ImageData {
+    const gl = this.gl;
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const raw = new Uint8Array(w * h * 4);
+    if (!this.lost) gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, raw);
+    const out = new ImageData(w, h);
+    const d = out.data;
+    for (let y = 0; y < h; y++) {
+      // GL rows run bottom-up.
+      const src = (h - 1 - y) * w * 4;
+      const dst = y * w * 4;
+      for (let x = 0; x < w * 4; x += 4) {
+        const r = raw[src + x];
+        const g = raw[src + x + 1];
+        const b = raw[src + x + 2];
+        // Additive sprites add colour with alpha 0; over transparency, show that light.
+        const a = Math.max(raw[src + x + 3], r, g, b);
+        if (a === 0) continue;
+        d[dst + x] = Math.min(255, Math.round((r * 255) / a));
+        d[dst + x + 1] = Math.min(255, Math.round((g * 255) / a));
+        d[dst + x + 2] = Math.min(255, Math.round((b * 255) / a));
+        d[dst + x + 3] = a;
+      }
+    }
+    return out;
+  }
 }
 
 class Canvas2DRenderer implements Renderer {
@@ -291,12 +329,15 @@ class Canvas2DRenderer implements Renderer {
     }
   }
 
-  begin(clear: RGBA = [0, 0, 0, 0]): void {
+  begin(clear: RGBA = [0, 0, 0, 0], underlay?: CanvasImageSource): void {
     const ctx = this.ctx;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
     ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    // A 2D canvas cannot hold "added light with alpha 0" like WebGL does, so draw the
+    // background in here for 'lighter' (additive) sprites to add to.
+    if (underlay) ctx.drawImage(underlay, 0, 0, this.canvas.width, this.canvas.height);
     if (clear[3] > 0) {
       ctx.fillStyle = `rgba(${clear[0] * 255},${clear[1] * 255},${clear[2] * 255},${clear[3]})`;
       ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
@@ -313,7 +354,7 @@ class Canvas2DRenderer implements Renderer {
   drawImage(img: LoadedImage, sx: number, sy: number, sw: number, sh: number, m: Readonly<Mat>, color: RGBA, blend: Blend): void {
     if (color[3] <= 0 || sw <= 0 || sh <= 0) return;
     this.setup(m, color, blend);
-    if (color[0] >= 0.999 && color[1] >= 0.999 && color[2] >= 0.999) this.ctx.drawImage(img.source, sx, sy, sw, sh, 0, 0, sw, sh);
+    if (color[0] >= 0.999 && color[1] >= 0.999 && color[2] >= 0.999) this.ctx.drawImage(filterable(img.source), sx, sy, sw, sh, 0, 0, sw, sh);
     else this.ctx.drawImage(this.tinted(img, sx, sy, sw, sh, color), 0, 0, sw, sh, 0, 0, sw, sh);
   }
 
@@ -358,6 +399,31 @@ class Canvas2DRenderer implements Renderer {
   dispose(): void {
     this.tintCanvas = null;
   }
+
+  readPixels(): ImageData {
+    return this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+  }
+}
+
+const filterableCopies = new WeakMap<object, HTMLCanvasElement>();
+
+/**
+ * An image that 2D drawImage can scale or rotate correctly. Images are decoded as
+ * straight-alpha ImageBitmaps (to match the game's alpha rules), and Chromium filters
+ * those without premultiplying, which turns colour hidden in transparent pixels into
+ * light or dark rims. A 1:1 copy into a canvas (which stores premultiplied pixels) fixes it.
+ */
+export function filterable(src: CanvasImageSource & { width: number; height: number }): CanvasImageSource {
+  if (typeof ImageBitmap === 'undefined' || !(src instanceof ImageBitmap)) return src;
+  let copy = filterableCopies.get(src);
+  if (!copy) {
+    copy = document.createElement('canvas');
+    copy.width = Math.max(1, src.width);
+    copy.height = Math.max(1, src.height);
+    copy.getContext('2d')!.drawImage(src, 0, 0);
+    filterableCopies.set(src, copy);
+  }
+  return copy;
 }
 
 /** Multiply color by alpha in place (straight-alpha RGBA bytes in, premultiplied out). */

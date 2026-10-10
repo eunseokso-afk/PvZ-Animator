@@ -21,11 +21,25 @@ export class SceneInspector {
   readonly el: HTMLElement;
   private sig = '';
   private fields = new Map<string, NumberField>();
+  private alphaSlider: HTMLInputElement | null = null;
+  /** A scrub or slider drag is in progress: update values in place, never rebuild under the pointer. */
+  private gesture = false;
   uniformScale = true;
 
-  constructor(private ws: Workspace) {
+  constructor(
+    private ws: Workspace,
+    private hooks: { flip(doc: SceneDocument, layerIndex: number, flipX: boolean): void },
+  ) {
     this.el = h('div', { class: 'inspector' });
     const refresh = rafThrottle(() => this.refresh());
+    // Safety net: a gesture always ends with the pointer going up somewhere.
+    window.addEventListener('pointerup', () =>
+      setTimeout(() => {
+        if (!this.gesture) return;
+        this.gesture = false;
+        refresh();
+      }, 0),
+    );
     ws.on('change', refresh);
     ws.on('docs', refresh);
     ws.on('frame', refresh);
@@ -64,12 +78,13 @@ export class SceneInspector {
       this.uniformScale,
       s.soundCues.find((c) => c.uid === doc.ui.cue?.uid)?.sound,
     ].join('|');
-    if (sig === this.sig && !force) {
+    if ((sig === this.sig && !force) || this.gesture) {
       this.updateValues(doc);
       return;
     }
     this.sig = sig;
     this.fields.clear();
+    this.alphaSlider = null;
     const scroll = this.el.scrollTop;
     this.el.replaceChildren(this.sceneSection(doc), doc.ui.cue ? this.cueSection(doc) : layer ? this.layerSection(doc) : this.hint());
     this.el.scrollTop = scroll;
@@ -81,6 +96,7 @@ export class SceneInspector {
     const pose = evalLayer(layer, this.ws.sceneFrame(doc));
     if (!pose) return;
     for (const [k, f] of this.fields) f.set(pose[k as 'x'] as number);
+    if (this.alphaSlider && !this.gesture) this.alphaSlider.value = String(pose.alpha);
   }
 
   private hint() {
@@ -104,16 +120,19 @@ export class SceneInspector {
       onchange: () => {
         const name = nameInput.value.trim();
         if (!name) return;
+        if (name === doc.name) return;
         doc.name = name;
         doc.path = `scenes/${name}`;
+        doc.touchVersion();
         ws.emit('docs');
       },
     });
-    const edit = (label: string, fn: () => void) => {
+    // Always edit the live state: undo/redo swap doc.state for a snapshot, so `s` may be stale.
+    const edit = (label: string, fn: (st: typeof s) => void) => {
       doc.edit(label, fn);
       ws.emit('change');
     };
-    const color = h('input', { type: 'color', value: s.background, onchange: () => edit('Change background', () => (s.background = color.value)) });
+    const color = h('input', { type: 'color', value: s.background, onchange: () => edit('Change background', (st) => (st.background = color.value)) });
     const presets: [string, number, number][] = [
       ['800×600 (PvZ)', 800, 600],
       ['1280×720', 1280, 720],
@@ -128,8 +147,8 @@ export class SceneInspector {
       h(
         'div',
         { class: 'insp-grid2' },
-        numberField({ label: 'W', value: s.width, precision: 0, min: 16, max: 8192, title: 'Stage width (px)', onChange: (v, final) => final && edit('Resize stage', () => (s.width = Math.round(v))) }).el,
-        numberField({ label: 'H', value: s.height, precision: 0, min: 16, max: 8192, title: 'Stage height (px)', onChange: (v, final) => final && edit('Resize stage', () => (s.height = Math.round(v))) }).el,
+        numberField({ label: 'W', value: s.width, precision: 0, min: 16, max: 8192, title: 'Stage width (px)', onChange: (v, final) => final && edit('Resize stage', (st) => (st.width = Math.round(v))) }).el,
+        numberField({ label: 'H', value: s.height, precision: 0, min: 16, max: 8192, title: 'Stage height (px)', onChange: (v, final) => final && edit('Resize stage', (st) => (st.height = Math.round(v))) }).el,
       ),
       h(
         'div',
@@ -140,9 +159,9 @@ export class SceneInspector {
           (v) => {
             if (!v) return;
             const [w, hh] = v.split('x').map(Number);
-            edit('Resize stage', () => {
-              s.width = w;
-              s.height = hh;
+            edit('Resize stage', (st) => {
+              st.width = w;
+              st.height = hh;
             });
           },
         ),
@@ -164,13 +183,13 @@ export class SceneInspector {
               {
                 class: 'btn small',
                 onclick: async () => {
-                  const r = await pickImage(ws, 'Stage background image (stretched to the stage)', 'reanim', s.backgroundImage);
-                  if (r) edit('Change background image', () => (s.backgroundImage = r.id));
+                  const r = await pickImage(ws, 'Stage background image (stretched to the stage)', 'reanim', doc.state.backgroundImage);
+                  if (r) edit('Change background image', (st) => (st.backgroundImage = r.id));
                 },
               },
               'Choose…',
             ),
-            s.backgroundImage ? h('button', { class: 'btn small', onclick: () => edit('Remove background image', () => (s.backgroundImage = '')) }, 'Clear') : null,
+            s.backgroundImage ? h('button', { class: 'btn small', onclick: () => edit('Remove background image', (st) => (st.backgroundImage = '')) }, 'Clear') : null,
           ),
         ),
       ),
@@ -187,7 +206,13 @@ export class SceneInspector {
     const ki = keyIndexAt(layer, frame);
     const key = layer.keys[ki];
     const isKey = key?.frame === frame;
+    const locked = doc.isLocked(li);
     const set = (patch: Partial<LayerKey>, label: string, final = true, begin = true) => {
+      if (locked) {
+        ws.status(`Layer "${layer.name}" is locked. Unlock it in the timeline to edit it.`);
+        this.refresh(true);
+        return;
+      }
       if (ws.playing) ws.pause();
       doc.setKey(li, doc.ui.frame, patch, begin ? label : undefined);
       ws.emit(final ? 'change' : 'frame');
@@ -202,8 +227,12 @@ export class SceneInspector {
         min,
         max,
         title,
-        onBegin: () => (begun = true),
+        onBegin: () => {
+          begun = true;
+          this.gesture = true;
+        },
         onChange: (v, final) => {
+          if (final) this.gesture = false;
           const patch: Partial<LayerKey> = { [prop]: v };
           if (this.uniformScale && (prop === 'scaleX' || prop === 'scaleY')) {
             const cur = evalLayer(doc.state.layers[li], doc.ui.frame);
@@ -262,7 +291,7 @@ export class SceneInspector {
         : h(
             'div',
             { class: 'insp-image-info' },
-            h('div', { class: 'mono small' }, layer.source, ws.assets.vfs.has(layer.source) || ws.findDoc(layer.source) ? null : h('span', { class: 'warn' }, '  (not found)')),
+            h('div', { class: 'mono small' }, layer.source, ws.assets.vfs.has(layer.source) || ws.findDocFor(layer.source) ? null : h('span', { class: 'warn' }, '  (not found)')),
             h(
               'div',
               { class: 'insp-buttons' },
@@ -297,9 +326,13 @@ export class SceneInspector {
         'button',
         {
           class: 'btn small',
-          disabled: !pose || (isKey && layer.keys.length <= 1),
+          // The first key is where the layer starts; it can be moved but not removed.
+          disabled: locked || (isKey && ki === 0),
+          title: isKey && ki === 0 ? 'The first keyframe is where the layer starts' : undefined,
           onclick: () => {
-            doc.toggleKey(li, frame);
+            // Act on the current frame, not the one this panel was built for.
+            if (ws.playing) ws.pause();
+            doc.toggleKey(li, doc.ui.frame);
             ws.emit('change');
           },
         },
@@ -310,7 +343,9 @@ export class SceneInspector {
             EASES.map((e) => ({ value: e.id, label: e.label })),
             key.ease,
             (v) => {
-              doc.setEase(li, frame, v);
+              if (locked) return set({}, 'Set easing');
+              if (ws.playing) ws.pause();
+              doc.setEase(li, doc.ui.frame, v);
               ws.emit('change');
             },
             `Tween from key ${key.frame} to the next key`,
@@ -338,24 +373,36 @@ export class SceneInspector {
       step: 0.01,
       value: pose.alpha,
       class: 'alpha-slider',
-      onpointerdown: () => (alphaBegun = false),
+      onpointerdown: () => {
+        alphaBegun = false;
+        this.gesture = true;
+      },
       oninput: () => {
         set({ alpha: parseFloat(alpha.value) }, 'Change alpha', false, !alphaBegun);
         alphaBegun = true;
       },
-      onchange: () => ws.emit('change'),
+      onchange: () => {
+        this.gesture = false;
+        ws.emit('change');
+      },
     });
+    this.alphaSlider = alpha;
 
     const sections: (HTMLElement | null)[] = [
       h(
         'section',
         { class: 'insp-section' },
-        h('h3', null, layer.kind === 'reanim' ? '▶ Prefab instance' : layer.kind === 'particle' ? '✦ Particle effect' : '▣ Image'),
+        h('h3', null, layer.kind === 'reanim' ? '▶ Prefab instance' : layer.kind === 'particle' ? '✦ Particle effect' : '▣ Image', locked ? h('span', { class: 'dim small' }, '  🔒 locked') : null),
         h('label', { class: 'field-col' }, 'Layer name', nameInput),
         sourceRow,
         keyRow,
         h('div', { class: 'insp-grid2' }, num('x', 'X', 1, 1, 'Stage X (px)'), num('y', 'Y', 1, 1, 'Stage Y (px)')),
-        h('div', { class: 'insp-grid2' }, num('rotation', 'Rotation', 1, 2, 'Degrees, clockwise'), checkbox('Flip horizontally', pose.flipX, (v) => set({ flipX: v }, 'Flip'))),
+        h('div', { class: 'insp-grid2' }, num('rotation', 'Rotation', 1, 2, 'Degrees, clockwise'), checkbox('Flip horizontally', pose.flipX, (v) => {
+            if (locked) return set({}, 'Flip');
+            if (ws.playing) ws.pause();
+            this.hooks.flip(doc, li, v);
+            ws.emit('change');
+          })),
         h('div', { class: 'insp-grid2' }, num('scaleX', 'Scale X', 0.01, 3, 'Horizontal scale'), num('scaleY', 'Scale Y', 0.01, 3, 'Vertical scale')),
         checkbox('Uniform scale', this.uniformScale, (v) => {
           this.uniformScale = v;

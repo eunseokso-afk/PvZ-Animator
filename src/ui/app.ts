@@ -72,8 +72,15 @@ export class App {
       renameLayer: (doc, li) => void this.renameLayer(doc, li),
       previewSound: (p) => void previewSound(ws, p),
       bake: (doc) => void bakeSceneDialog(ws, doc),
+      dropAsset: (doc, asset, frame) => {
+        if (!['reanim', 'particle', 'image'].includes(asset.kind)) return void ws.status('Only prefabs, particle effects, images and sounds can be added to a scene.');
+        doc.ui.frame = doc.ui.frameEnd = frame;
+        void this.viewport.sceneStage.addAsset(doc, asset, doc.state.width / 2, doc.state.height / 2);
+      },
+      shiftFrames: (doc, li, at, count) => this.shiftSceneFrames(doc, li, at, count),
+      locked: (doc, li) => this.sceneLocked(doc, li),
     });
-    this.sceneInspector = new SceneInspector(ws);
+    this.sceneInspector = new SceneInspector(ws, { flip: (doc, li, v) => this.viewport.sceneStage.flip(doc, li, v) });
     this.browser = new AssetBrowser(ws, {
       openPak: () => void this.openPak(),
       openFolder: () => void this.openFolder(),
@@ -325,8 +332,10 @@ export class App {
         );
       }
       items.push(
-        { label: 'Insert frame', shortcut: 'F5', action: () => (sc.shiftFrames(sc.ui.frame + 1, 1), ws.emit('change')) },
-        { label: 'Remove frame', shortcut: 'Shift+F5', disabled: sc.state.length <= 1, action: () => (sc.shiftFrames(sc.ui.frame, -1), ws.emit('change')) },
+        { label: layer ? 'Insert frame (this layer)' : 'Insert frame', shortcut: 'F5', action: () => this.sceneFrames(true) },
+        { label: layer ? 'Remove frame (this layer)' : 'Remove frame', shortcut: 'Shift+F5', disabled: !layer && sc.state.length <= 1, action: () => this.sceneFrames(false) },
+        { label: 'Insert frame (all layers)', shortcut: 'Ctrl+F5', action: () => this.sceneFrames(true, true) },
+        { label: 'Remove frame (all layers)', shortcut: 'Ctrl+Shift+F5', disabled: sc.state.length <= 1, action: () => this.sceneFrames(false, true) },
         { label: 'Bake scene to .reanim…', shortcut: 'Ctrl+E', action: () => void bakeSceneDialog(ws, sc) },
       );
     }
@@ -720,16 +729,46 @@ export class App {
     }
   }
 
+  /** True (with a status message) if a scene layer is locked against edits. */
+  sceneLocked(doc: SceneDocument, li: number): boolean {
+    const layer = doc.state.layers[li];
+    if (!layer || !doc.ui.locked.has(layer.uid)) return false;
+    this.ws.status(`Layer "${layer.name}" is locked. Unlock it in the timeline to edit it.`);
+    return true;
+  }
+
   /** F6 / F7 / Shift+F6 on the selected layer at the current frame. */
   private sceneKey(action: 'insert' | 'blank' | 'clear' | 'toggle') {
     const doc = this.ws.scene;
     if (!doc || doc.ui.layer < 0) return;
     const li = doc.ui.layer;
+    if (this.sceneLocked(doc, li)) return;
     const f = doc.ui.frame;
-    const isKey = doc.state.layers[li].keys.some((k) => k.frame === f);
+    const keys = doc.state.layers[li].keys;
+    const isKey = keys.some((k) => k.frame === f);
     if (action === 'blank') doc.setKey(li, f, { visible: false }, 'Insert blank keyframe');
-    else if (action === 'clear' || (action === 'toggle' && isKey)) doc.removeKey(li, f);
-    else if (!isKey) doc.toggleKey(li, f);
+    else if (action === 'clear' || (action === 'toggle' && isKey)) {
+      if (isKey && !doc.removeKey(li, f)) this.ws.status('The first keyframe is where the layer starts, so it stays. Drag it on the timeline to start the layer later.');
+    } else if (!isKey) doc.toggleKey(li, f);
+    this.ws.emit('change');
+  }
+
+  /** F5 / Shift+F5: insert or remove a frame on the selected layer, or on every layer. */
+  private sceneFrames(insert: boolean, allLayers = false) {
+    const doc = this.ws.scene;
+    if (!doc) return;
+    this.shiftSceneFrames(doc, allLayers ? -1 : doc.ui.layer, insert ? doc.ui.frame + 1 : doc.ui.frame, insert ? 1 : -1);
+  }
+
+  /** Insert/remove frames on one layer, or on all layers (and the sound cues) when `li` is -1. */
+  private shiftSceneFrames(doc: SceneDocument, li: number, at: number, count: number) {
+    if (li >= 0 && doc.state.layers[li]) {
+      if (this.sceneLocked(doc, li)) return;
+      doc.shiftLayerFrames(li, at, count);
+    } else {
+      if (count < 0 && doc.state.length <= 1) return;
+      doc.shiftFrames(at, count);
+    }
     this.ws.emit('change');
   }
 
@@ -742,9 +781,10 @@ export class App {
           label: 'Rename…',
           action: async () => {
             const name = await promptText('Rename scene', 'Scene name', scene.name);
-            if (name?.trim()) {
+            if (name?.trim() && name.trim() !== scene.name) {
               scene.name = name.trim();
               scene.path = `scenes/${scene.name}`;
+              scene.touchVersion();
               ws.emit('docs');
             }
           },
@@ -1181,13 +1221,7 @@ export class App {
     if (key === 'F6') return handled(), this.sceneKey('insert');
     if (key === 'F7') return handled(), this.sceneKey('blank');
     if (key === 'k' || key === 'K') return handled(), this.sceneKey('toggle');
-    if (key === 'F5') {
-      handled();
-      if (e.shiftKey) doc.shiftFrames(doc.ui.frame, -1);
-      else doc.shiftFrames(doc.ui.frame + 1, 1);
-      ws.emit('change');
-      return;
-    }
+    if (key === 'F5') return handled(), this.sceneFrames(!e.shiftKey, e.ctrlKey || e.metaKey);
     if (key === 'F2' && li >= 0) return handled(), void this.renameLayer(doc, li);
     if ((key === ']' || key === '[') && li >= 0) return handled(), doc.moveLayer(li, li + (key === ']' ? 1 : -1)), ws.emit('change');
     if (key === 'h' && li >= 0) {
@@ -1200,7 +1234,7 @@ export class App {
     if (key === 'Delete' || key === 'Backspace') {
       handled();
       if (doc.ui.cue) doc.removeSoundCue(doc.ui.cue.uid);
-      else if (li >= 0) doc.removeLayer(li);
+      else if (li >= 0 && !this.sceneLocked(doc, li)) doc.removeLayer(li);
       ws.emit('change');
     }
   }
@@ -1208,7 +1242,29 @@ export class App {
   // ------------------------------------------------------------ help
 
   private async showShortcuts() {
-    const rows: [string, string][] = [
+    const sceneRows: [string, string][] = [
+      ['Space', 'Play / pause'],
+      ['← / →  or  , / .', 'Previous / next frame'],
+      ['Home / End', 'First / last frame'],
+      ['↑ / ↓', 'Select layer above / below'],
+      ['Alt + arrows', 'Nudge selected instance 1 px (Shift: 10 px)'],
+      ['F6 / K', 'Insert keyframe (K toggles)'],
+      ['F7', 'Insert blank keyframe (hide the layer from here)'],
+      ['Shift+F6', 'Clear keyframe'],
+      ['F5 / Shift+F5', 'Insert / remove a frame on the selected layer'],
+      ['Ctrl+F5 / Ctrl+Shift+F5', 'Insert / remove a frame on all layers'],
+      ['Del', 'Delete selected layer or sound cue'],
+      ['[ / ]', 'Send layer backward / forward'],
+      ['H', 'Hide layer in the editor'],
+      ['F2', 'Rename layer'],
+      ['Ctrl+D', 'Duplicate layer'],
+      ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],
+      ['Ctrl+S', 'Save project'],
+      ['Ctrl+E', 'Bake scene to .reanim'],
+      ['Mouse', 'Drag an instance to move it · corner handles scale (Shift: uniform) · top handle rotates (Shift snaps) · double-click edits the prefab · drag empty space to pan · wheel zooms'],
+      ['Timeline', 'Click a frame to select · drag a key to move it · double-click toggles a key · drag layer names to reorder · drop library items to add layers or sound cues'],
+    ];
+    const rows: [string, string][] = this.ws.scene ? sceneRows : [
       ['Space', 'Play / pause'],
       ['← / →  or  , / .', 'Previous / next frame'],
       ['Home / End', 'First / last frame of the animation'],

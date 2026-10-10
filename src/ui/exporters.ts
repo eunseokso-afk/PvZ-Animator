@@ -10,14 +10,14 @@ import { bakeScene, drawScene } from '../engine/sceneRuntime';
 import { basename, memoryFile, normPath, pathKey, type VFile } from '../engine/vfs';
 import { dateToFileTime, PAK_XOR_KEY, writePak, type PakWriteFile } from '../formats/pak';
 import { parseParticleXml, serializeParticleXml } from '../formats/particles';
-import { parseReanimXml, serializeReanimXml } from '../formats/reanim';
+import { parseAttacher, parseReanimXml, serializeReanimXml } from '../formats/reanim';
 import { writeZip } from '../formats/zip';
 import { ParticleDocument } from '../editor/particleDoc';
 import { nextUid, ReanimDocument, type Ease } from '../editor/reanimDoc';
 import { SceneDocument, type SceneState } from '../editor/sceneDoc';
 import type { EditorDocument, Workspace } from '../editor/workspace';
 import { downloadBlob, fileBytes, h } from './dom';
-import { checkbox, numberField, openDialog, select } from './widgets';
+import { alertDialog, checkbox, confirmDialog, numberField, openDialog, select } from './widgets';
 
 const enc = new TextEncoder();
 
@@ -294,6 +294,9 @@ class NullRenderer implements Renderer {
   fillRect(): void {}
   end(): void {}
   dispose(): void {}
+  readPixels(): ImageData {
+    return new ImageData(1, 1);
+  }
 }
 
 /** What a frame/video export renders: a reanim's active range or a whole scene. */
@@ -310,10 +313,28 @@ interface ExportTarget {
   playingFrame(): number;
 }
 
-async function preloadImages(ws: Workspace, tracks: { transforms: { i: string }[] }[]): Promise<void> {
+/** Load every image a reanim draws, following attacher__ tracks into the reanims they attach. */
+async function preloadImages(ws: Workspace, tracks: { name: string; transforms: { i: string; text: string }[] }[], depth = 0): Promise<void> {
   const ids = new Set<string>();
-  for (const t of tracks) for (const tr of t.transforms) if (tr.i) ids.add(tr.i);
+  const attached = new Set<string>();
+  for (const t of tracks) {
+    const attacher = depth < 3 && t.name.toLowerCase().startsWith('attacher__');
+    for (const tr of t.transforms) {
+      if (tr.i) ids.add(tr.i);
+      if (attacher && tr.text) attached.add(tr.text);
+    }
+  }
   await Promise.all([...ids].map((id) => ws.assets.loadImage(id)));
+  const paths = new Set<string>();
+  for (const text of attached) {
+    const info = parseAttacher(text);
+    const path = info && ws.assets.findReanimPath(info.reanimName);
+    if (path) paths.add(path);
+  }
+  for (const path of paths) {
+    const def = await ws.assets.reanimAsync(path);
+    if (def) await preloadImages(ws, def.tracks, depth + 1);
+  }
 }
 
 /** Load every prefab, image and particle definition a scene needs. */
@@ -341,7 +362,7 @@ function measure(ws: Workspace, doc: ReanimDocument, frames: number[]): { x: num
   const nr = new NullRenderer();
   for (const f of frames) {
     const infos: DrawTrackInfo[] = [];
-    drawReanim(nr, ws.assets, doc.state.tracks, { before: f, after: f, fraction: 0 }, [1, 0, 0, 1, 0, 0], { collect: infos, fps: doc.fps, hidden: (i) => doc.ui.hidden.has(doc.state.tracks[i].uid) });
+    drawReanim(nr, ws.assets, doc.state.tracks, { before: f, after: f, fraction: 0 }, [1, 0, 0, 1, 0, 0], { collect: infos, fps: ws.playbackFps(doc), rangeStart: doc.activeRange().start, hidden: (i) => doc.ui.hidden.has(doc.state.tracks[i].uid) });
     for (const info of infos) {
       for (const [cx, cy] of [
         [0, 0],
@@ -392,7 +413,7 @@ async function exportTarget(ws: Workspace): Promise<ExportTarget | null> {
     draw: (r, base, frame) => {
       const playing = ws.playing && ws.active === doc;
       const ft = playing ? ws.frameTime(doc) : { before: frame, after: frame, fraction: 0 };
-      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, fps: doc.fps });
+      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, fps: ws.playbackFps(doc), rangeStart: doc.activeRange().start });
       if (playing) {
         for (const l of ws.live) l.sys.draw(r, ws.assets, base);
       } else {
@@ -520,11 +541,17 @@ export async function exportFrames(ws: Workspace): Promise<void> {
     sheet.height = Math.ceil(target.frames.length / cols) * setup.height;
   }
   ws.invalidatePreviews();
+  // Frames go through readPixels so additive light survives a transparent background.
+  const frame = document.createElement('canvas');
+  frame.width = setup.width;
+  frame.height = setup.height;
+  const fctx = frame.getContext('2d')!;
   try {
     for (let k = 0; k < target.frames.length; k++) {
       renderFrameTo(target, r, setup, target.frames[k]);
-      if (sheet) sheet.getContext('2d')!.drawImage(r.canvas, (k % cols) * setup.width, Math.floor(k / cols) * setup.height);
-      else pngs.push(await canvasToPng(r.canvas));
+      fctx.putImageData(r.readPixels(), 0, 0);
+      if (sheet) sheet.getContext('2d')!.drawImage(frame, (k % cols) * setup.width, Math.floor(k / cols) * setup.height);
+      else pngs.push(await canvasToPng(frame));
     }
   } finally {
     r.dispose();
@@ -658,13 +685,23 @@ export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Prom
   if (r !== 'ok') return;
   const path = normPath(pathInput.value.trim() || `reanim/${safe}.reanim`);
   const name = basename(path).replace(/\.reanim$/i, '');
+  // Never bake over a prefab this scene is built from.
+  const key = pathKey(path);
+  if (scene.state.layers.some((l) => l.kind === 'reanim' && (pathKey(l.source) === key || pathKey(ws.editPathFor(l.source)) === key))) {
+    await alertDialog('Bake scene', `${path} is a prefab used in this scene. Choose another name for the baked reanim.`);
+    return;
+  }
+  const existing = ws.findDoc(path);
+  if ((library && ws.assets.vfs.has(path)) || existing) {
+    const unsaved = existing?.dirty ? ' Its open tab has unsaved changes, which will be lost.' : '';
+    if (!(await confirmDialog('Replace file?', `${path} already exists.${unsaved} Replace it with the baked scene?`, 'Replace', true))) return;
+  }
   const xml = serializeReanimXml(definition);
   if (download) downloadBlob(new Blob([xml], { type: 'text/xml' }), basename(path));
   if (library) {
     ws.assets.vfs.set(memoryFile(path, enc.encode(xml), 'generated'));
     ws.assets.invalidate('definitions');
   }
-  const existing = ws.findDoc(path);
   if (existing) ws.closeDoc(existing);
   if (open) {
     const doc = ReanimDocument.fromDefinition(parseReanimXml(xml), name, path, ws.settings.simplifyOnImport);

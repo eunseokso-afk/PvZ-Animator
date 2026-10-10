@@ -327,7 +327,7 @@ export class Viewport {
     if (doc && !doc.view.fitted) this.fit(false);
     this.renderBackground(doc);
     const r = this.renderer;
-    r.begin([0, 0, 0, 0]);
+    r.begin([0, 0, 0, 0], r.kind === 'canvas2d' ? this.bgCanvas : undefined);
     this.drawn = [];
     if (doc?.kind === 'reanim') this.renderReanim(doc);
     else if (doc?.kind === 'particle') this.preview?.sys.draw(r, this.ws.assets, this.viewMatrix(doc));
@@ -415,10 +415,10 @@ export class Viewport {
       if (f - 1 >= start) ghosts.push([f - 1, [1, 0.45, 0.45, 1]]);
       if (f + 1 <= end) ghosts.push([f + 1, [0.45, 1, 0.55, 1]]);
       for (const [g, tint] of ghosts) {
-        drawReanim(r, ws.assets, tracks, { before: g, after: g, fraction: 0 }, view, { hidden, alpha: 0.28, color: tint, fps: doc.fps });
+        drawReanim(r, ws.assets, tracks, { before: g, after: g, fraction: 0 }, view, { hidden, alpha: 0.28, color: tint, fps: ws.playbackFps(doc), rangeStart: doc.activeRange().start });
       }
     }
-    drawReanim(r, ws.assets, tracks, ws.frameTime(doc), view, { hidden, collect: this.drawn, fps: doc.fps });
+    drawReanim(r, ws.assets, tracks, ws.frameTime(doc), view, { hidden, collect: this.drawn, fps: ws.playbackFps(doc), rangeStart: doc.activeRange().start });
     const systems = ws.playing ? ws.live.map((l) => l.sys) : ws.pausedParticleSystems(doc);
     for (const s of systems) s.draw(r, ws.assets, view);
   }
@@ -467,7 +467,7 @@ export class Viewport {
       ctx.closePath();
       ctx.stroke();
     }
-    const sel = this.drawn.find((i) => i.trackIndex === doc.ui.track);
+    const sel = this.drawn.find((i) => i.trackIndex === doc.ui.track && !i.attached);
     if (sel && !this.ws.playing) {
       const pts = this.polygon(sel);
       ctx.strokeStyle = '#ffd34d';
@@ -616,7 +616,7 @@ export class Viewport {
   }
 
   private hitHandle(doc: ReanimDocument, x: number, y: number): { kind: 'rotate' } | { kind: 'scale'; corner: number } | null {
-    const sel = this.drawn.find((i) => i.trackIndex === doc.ui.track);
+    const sel = this.drawn.find((i) => i.trackIndex === doc.ui.track && !i.attached);
     if (!sel || this.ws.playing) return null;
     const [rx, ry] = this.rotateHandle(sel);
     if (Math.hypot(rx - x, ry - y) <= HANDLE + 3) return { kind: 'rotate' };
@@ -742,7 +742,7 @@ export class Viewport {
     const handle = this.hitHandle(doc, x, y);
     const frame = doc.ui.frame;
     if (handle) {
-      const sel = this.drawn.find((i) => i.trackIndex === doc.ui.track)!;
+      const sel = this.drawn.find((i) => i.trackIndex === doc.ui.track && !i.attached)!;
       const track = doc.state.tracks[doc.ui.track];
       const start = { ...track.transforms[frame] };
       const pivot = apply(transformMatrix(start), sel.width / 2, sel.height / 2);

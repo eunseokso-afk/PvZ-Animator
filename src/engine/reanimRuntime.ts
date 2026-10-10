@@ -101,6 +101,8 @@ export interface DrawTrackInfo {
   transform: ReanimTransform;
   width: number;
   height: number;
+  /** A part of a reanim drawn by attacher track `trackIndex` (not the track's own image). */
+  attached?: boolean;
 }
 
 export interface DrawOptions {
@@ -116,6 +118,13 @@ export interface DrawOptions {
   fps?: number;
   /** Cross-fade from another pose of the same tracks (Reanimation::StartBlend); weight 1 = all `from`. */
   blend?: { from: FrameTime; weight: number };
+  /**
+   * First frame of the animation being played: attachers count time from where they
+   * appeared, but never from before the animation started.
+   */
+  rangeStart?: number;
+  /** The game screen's coordinate space (top-left at 0,0), for "fullscreen" tracks. Defaults to `base`. */
+  screen?: Readonly<Mat>;
   /** Collect the drawn tracks (for hit testing / gizmos). */
   collect?: DrawTrackInfo[];
   tint?: (trackIndex: number) => RGBA | null;
@@ -197,23 +206,25 @@ export function drawReanim(
       const img = textImage(t.text, t.font);
       r.drawImage(img, 0, 0, img.width, img.height, m, c, 'normal');
       opts.collect?.push({ trackIndex: ti, matrix: m, transform: t, width: img.width, height: img.height });
+    } else if (track.name.toLowerCase() === 'fullscreen') {
+      // DrawTrack: a "fullscreen" track fills the 800x600 screen with its colour, ignoring its transform.
+      r.fillRect(opts.screen ?? base, SCREEN_W, SCREEN_H, c, 'normal');
     }
 
     // Attachers: a track named attacher__* whose text is "attacher__Reanim__anim_name[tags]".
     if ((opts.depth ?? 0) < 3 && t.text && track.name.toLowerCase().startsWith('attacher__')) {
-      drawAttacher(r, assets, track.transforms, ft, m, c, opts);
+      drawAttacher(r, assets, ti, track.transforms, ft, m, c, opts, base);
     }
   }
 }
 
 /** StartBlend(20): 20 updates of 1/100 s. */
 const ATTACHER_BLEND_SECONDS = 0.2;
+const SCREEN_W = 800;
+const SCREEN_H = 600;
 
 interface AttacherSegment {
   info: AttacherInfo;
-  /** Rate and loop mode are fixed when the attachment is created. */
-  rate: number;
-  loop: AttacherInfo['loop'];
   /** Frame where the current animation (re)started. */
   start: number;
   trackName: string;
@@ -226,13 +237,14 @@ interface AttacherSegment {
  * a new attached reanim is created when the attacher appears or names another reanim,
  * and its animation restarts (SetFramesForLayer) when the attacher names another track.
  */
-function attacherSegment(transforms: ReanimTransform[], at: number): AttacherSegment | null {
+function attacherSegment(transforms: ReanimTransform[], at: number, rangeStart: number): AttacherSegment | null {
   at = Math.max(0, Math.min(at, transforms.length - 1));
   const info = parseAttacher(transforms[at].text);
   if (!info) return null;
   const reanim = info.reanimName.toLowerCase();
+  const floor = Math.max(0, Math.min(rangeStart, at));
   let runStart = at;
-  for (let k = at - 1; k >= 0; k--) {
+  for (let k = at - 1; k >= floor; k--) {
     const t = transforms[k];
     if (Math.round(t.f) < 0) break;
     if (t.text !== transforms[k + 1].text) {
@@ -241,9 +253,8 @@ function attacherSegment(transforms: ReanimTransform[], at: number): AttacherSeg
     }
     runStart = k;
   }
-  const first = parseAttacher(transforms[runStart].text) ?? info;
   let start = runStart;
-  let trackName = first.trackName;
+  let trackName = (parseAttacher(transforms[runStart].text) ?? info).trackName;
   let prev: AttacherSegment['prev'];
   for (let k = runStart + 1; k <= at; k++) {
     if (transforms[k].text === transforms[k - 1].text) continue;
@@ -254,11 +265,32 @@ function attacherSegment(transforms: ReanimTransform[], at: number): AttacherSeg
       trackName = next.trackName;
     }
   }
-  return { info, rate: first.fps, loop: first.loop, start, trackName, prev };
+  return { info, start, trackName, prev };
 }
 
-function drawAttacher(r: Renderer, assets: AssetLibrary, transforms: ReanimTransform[], ft: FrameTime, m: Mat, color: RGBA, opts: DrawOptions) {
-  const seg = attacherSegment(transforms, ft.before);
+/**
+ * Animation progress (in passes) of an attachment between parent frames `from` and
+ * `until`. The game applies the spec's [rate] on every update, so a tempo change in
+ * the text speeds the attachment up without restarting it.
+ */
+function attacherProgress(transforms: ReanimTransform[], from: number, until: number, parentFps: number, count: number): number {
+  let frames = 0;
+  let text: string | undefined;
+  let rate = 12;
+  for (let k = from; k < until; k++) {
+    const t = transforms[Math.min(k, transforms.length - 1)].text;
+    if (t !== text) {
+      text = t;
+      rate = parseAttacher(t)?.fps ?? rate;
+    }
+    frames += (Math.min(k + 1, until) - k) * rate;
+  }
+  // Reanimation::Update: mAnimTime += SECONDS_PER_UPDATE * mAnimRate / mFrameCount.
+  return frames / parentFps / Math.max(1, count);
+}
+
+function drawAttacher(r: Renderer, assets: AssetLibrary, ti: number, transforms: ReanimTransform[], ft: FrameTime, m: Mat, color: RGBA, opts: DrawOptions, base: Readonly<Mat>) {
+  const seg = attacherSegment(transforms, ft.before, opts.rangeStart ?? 0);
   if (!seg) return;
   const path = assets.findReanimPath(seg.info.reanimName);
   if (!path) return;
@@ -266,28 +298,40 @@ function drawAttacher(r: Renderer, assets: AssetLibrary, transforms: ReanimTrans
   if (!def) return;
   const parentFps = Math.max(1e-3, opts.fps ?? 12);
   const pos = ft.before + ft.fraction;
-  // Reanimation::Update: mAnimTime += SECONDS_PER_UPDATE * mAnimRate / mFrameCount.
-  const timeAt = (from: number, trackName: string, until: number): FrameTime => {
+  const loop = seg.info.loop;
+  const timeAt = (from: number, trackName: string, until: number): FrameTime | null => {
     const range = animRangeOf(def, trackName);
-    let animTime = ((Math.max(0, until - from) / parentFps) * seg.rate) / Math.max(1, range.count);
-    if (seg.loop === 'loop') animTime -= Math.floor(animTime);
-    else animTime = Math.min(1, animTime);
+    let animTime = attacherProgress(transforms, from, until, parentFps, range.count);
+    if (loop === 'loop') animTime -= Math.floor(animTime);
+    else if (animTime >= 1) {
+      // [once] is REANIM_PLAY_ONCE: the attachment dies when it ends; [hold] keeps the last frame.
+      if (loop === 'once') return null;
+      animTime = 1;
+    }
     return computeFrameTime(range.start, range.count, animTime, false);
   };
   const cur = timeAt(seg.start, seg.trackName, pos);
+  if (!cur) return;
   let blend: DrawOptions['blend'];
   if (seg.prev) {
     const since = (pos - seg.start) / parentFps;
-    if (since < ATTACHER_BLEND_SECONDS) blend = { from: timeAt(seg.prev.start, seg.prev.trackName, seg.start), weight: 1 - since / ATTACHER_BLEND_SECONDS };
+    const from = since < ATTACHER_BLEND_SECONDS ? timeAt(seg.prev.start, seg.prev.trackName, seg.start) : null;
+    if (from) blend = { from, weight: 1 - since / ATTACHER_BLEND_SECONDS };
   }
   const range = animRangeOf(def, seg.trackName);
+  const nested: DrawTrackInfo[] | undefined = opts.collect ? [] : undefined;
   drawReanim(r, assets, def.tracks, cur, m, {
     color,
     depth: (opts.depth ?? 0) + 1,
     // The attached reanim's frames advance at rate * (count - 1) / count per second.
-    fps: (seg.rate * Math.max(1, range.count - 1)) / Math.max(1, range.count),
+    fps: (seg.info.fps * Math.max(1, range.count - 1)) / Math.max(1, range.count),
+    rangeStart: range.start,
+    screen: opts.screen ?? base,
     blend,
+    collect: nested,
   });
+  // Attached parts count as the attacher track's (clicking a dancer selects its attacher).
+  if (nested) for (const n of nested) opts.collect!.push({ ...n, trackIndex: ti, attached: true });
 }
 
 export function animRangeOf(def: ReanimDefinition, animName: string): { start: number; count: number } {

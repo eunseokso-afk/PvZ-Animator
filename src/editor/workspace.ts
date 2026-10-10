@@ -170,9 +170,20 @@ export class Workspace extends EventTarget {
     this.emit('docs');
   }
 
+  /** The document path a library file is edited under: compiled reanims open as reanim/<name>.reanim. */
+  editPathFor(path: string): string {
+    if (!path.toLowerCase().endsWith('.compiled')) return path;
+    return `reanim/${stripExt(stripExt(basename(path)))}.reanim`;
+  }
+
+  /** The open document editing a library file, if any (compiled files map to their XML path). */
+  findDocFor(path: string): EditorDocument | undefined {
+    return this.findDoc(path) ?? this.findDoc(this.editPathFor(path));
+  }
+
   /** Prefab data for a reanim path, preferring an open (possibly edited) document. */
   prefab(path: string): Prefab | null | undefined {
-    const doc = this.findDoc(path);
+    const doc = this.findDocFor(path);
     if (doc?.kind === 'reanim') return { fps: doc.fps, tracks: doc.state.tracks };
     const def = this.assets.reanim(path);
     return def ? { fps: def.fps, tracks: def.tracks } : def;
@@ -197,6 +208,7 @@ export class Workspace extends EventTarget {
     this.pause();
     this.active = doc;
     this.previews.clear();
+    this.sceneParticleCache.clear();
     this.emit('docs');
     this.emit('change');
   }
@@ -220,7 +232,7 @@ export class Workspace extends EventTarget {
 
   /** Open a reanim or particle file from the library in a new tab. */
   async openAsset(path: string): Promise<EditorDocument | null> {
-    const existing = this.findDoc(path);
+    const existing = this.findDocFor(path);
     if (existing) {
       this.setActive(existing);
       return existing;
@@ -231,7 +243,7 @@ export class Workspace extends EventTarget {
       if (kind === 'reanim') {
         const def = await this.assets.loadReanimFile(path);
         // Compiled files are saved back as XML next to the original location.
-        const target = path.toLowerCase().endsWith('.compiled') ? `reanim/${name}.reanim` : path;
+        const target = this.editPathFor(path);
         const doc = ReanimDocument.fromDefinition(def, name, target, this.settings.simplifyOnImport);
         this.openDoc(doc);
         this.status(`Opened ${path} (${def.tracks.length} tracks, ${doc.frameCount} frames @ ${def.fps} fps)`, 'success');
@@ -293,6 +305,18 @@ export class Workspace extends EventTarget {
     }
     const f = clamp(doc.ui.frame, 0, doc.frameCount - 1);
     return { before: f, after: f, fraction: 0 };
+  }
+
+  /**
+   * Frames per second the playhead moves at for a reanim's active range. Like
+   * Reanimation::Update, one pass takes count / fps seconds, so without "full last
+   * frame" the playhead covers count - 1 frames in that time.
+   */
+  playbackFps(doc: ReanimDocument): number {
+    const { start, end } = doc.activeRange();
+    const count = end - start + 1;
+    const span = isFullLastFrame(doc.ui.loop) ? count : count - 1;
+    return span > 0 ? (doc.fps * span) / count : doc.fps;
   }
 
   /** Current (fractional while playing) frame of a scene. */
@@ -395,7 +419,7 @@ export class Workspace extends EventTarget {
       const span = full ? end - start + 1 : end - start;
       const endPos = start + span;
       const prev = this.playhead;
-      let next = prev + dt * doc.fps * this.speed;
+      let next = prev + dt * this.playbackFps(doc) * this.speed;
       const fire: [number, number][] = [];
       const inclusiveStart = this.firstTick;
       this.firstTick = false;
@@ -492,6 +516,11 @@ export class Workspace extends EventTarget {
     const rev = source?.kind === 'particle' ? source.revision : -1;
     const trigger = pose.segmentStart;
     const target = Math.round(((frame - trigger) / scene.fps) * 100);
+    if (this.sceneParticleCache.size > scene.state.layers.length) {
+      // Drop systems of deleted layers.
+      const live = new Set(scene.state.layers.map((l) => l.uid));
+      for (const uid of this.sceneParticleCache.keys()) if (!live.has(uid)) this.sceneParticleCache.delete(uid);
+    }
     let p = this.sceneParticleCache.get(layer.uid);
     if (!p || p.def !== def || p.rev !== rev || p.trigger !== trigger || p.ticks > target) {
       p = { sys: new ParticleSystem(def, pose.x, pose.y, seededRandom(layer.uid * 7919 + trigger)), ticks: 0, trigger, def, rev };

@@ -45,10 +45,11 @@ describe('scene layers', () => {
 
   it('maps scene frames to prefab frames per loop mode', () => {
     const l = layer([{ anim: 'anim_b', loop: 'loop' }], [0]);
-    // scene 30 fps, prefab 10 fps: 3 scene frames per prefab frame; anim_b spans 2 intervals.
+    // Like the game, one pass of the 3-frame anim_b at 10 fps takes 3 / 10 s = 9 scene frames at 30 fps,
+    // so the playhead covers the 2 intervals at 10 * 2 / 3 prefab frames per second.
     expect(instanceFrameTime(prefab, evalLayer(l, 0)!, 30, 0)).toEqual({ before: 3, after: 4, fraction: 0 });
-    expect(instanceFrameTime(prefab, evalLayer(l, 3)!, 30, 3).before).toBe(4);
-    expect(instanceFrameTime(prefab, evalLayer(l, 6)!, 30, 6).before).toBe(3); // wrapped
+    expect(instanceFrameTime(prefab, evalLayer(l, 4.5)!, 30, 4.5)).toEqual({ before: 4, after: 5, fraction: 0 });
+    expect(instanceFrameTime(prefab, evalLayer(l, 9)!, 30, 9).before).toBe(3); // wrapped
     l.keys[0].loop = 'once';
     expect(instanceFrameTime(prefab, evalLayer(l, 60)!, 30, 60)).toEqual({ before: 5, after: 5, fraction: 0 });
     l.keys[0].loop = 'single';
@@ -98,20 +99,86 @@ describe('SceneDocument', () => {
   });
 });
 
+describe('SceneDocument editing rules', () => {
+  it('inserts and removes frames on one layer only (Animate F5 / Shift+F5)', () => {
+    const doc = SceneDocument.create('S');
+    doc.addLayer('image', 'IMAGE_X', 'A', {}, 0);
+    doc.setKey(0, 20, { x: 5 }, 'k');
+    doc.addLayer('image', 'IMAGE_X', 'B', {}, 0);
+    doc.setKey(1, 20, { x: 5 }, 'k');
+    doc.shiftLayerFrames(0, 10, 3);
+    expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([0, 23]);
+    expect(doc.state.layers[1].keys.map((k) => k.frame)).toEqual([0, 20]);
+    expect(doc.state.length).toBe(93);
+    doc.shiftLayerFrames(1, 20, -1);
+    expect(doc.state.layers[1].keys.map((k) => k.frame)).toEqual([0]);
+    expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([0, 23]);
+  });
+
+  it('keeps a lone key where a removed span began instead of moving it earlier', () => {
+    const doc = SceneDocument.create('S');
+    doc.addLayer('particle', 'particles/Fx.xml', 'Fx', {}, 30);
+    doc.shiftFrames(30, -1);
+    expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([30]);
+  });
+
+  it('never clears the first keyframe', () => {
+    const doc = SceneDocument.create('S');
+    doc.addLayer('image', 'IMAGE_X', 'A', {}, 0);
+    doc.setKey(0, 10, { x: 5 }, 'k');
+    expect(doc.removeKey(0, 0)).toBe(false);
+    expect(doc.removeKey(0, 10)).toBe(true);
+    expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([0]);
+  });
+
+  it('does not tween towards a blank keyframe', () => {
+    const l = layer([{ x: 0 }, { x: 100, visible: false }], [0, 10]);
+    expect(evalLayer(l, 5)!.x).toBe(0);
+  });
+
+  it('reselects the layer that was selected when undoing', () => {
+    const doc = SceneDocument.create('S');
+    doc.addLayer('image', 'IMAGE_X', 'A', {}, 0);
+    doc.addLayer('image', 'IMAGE_X', 'B', {}, 0);
+    doc.ui.layer = 1;
+    const uid = doc.state.layers[1].uid;
+    doc.removeLayer(1);
+    doc.ui.layer = 0;
+    doc.undo();
+    expect(doc.selectedLayer?.uid).toBe(uid);
+    doc.ui.layer = 1;
+    doc.moveLayer(1, 0);
+    doc.ui.layer = 1;
+    doc.undo();
+    expect(doc.selectedLayer?.uid).toBe(uid);
+  });
+
+  it('trims keys and cues past a shorter end', () => {
+    const doc = SceneDocument.create('S');
+    doc.addLayer('image', 'IMAGE_X', 'A', {}, 0);
+    doc.setKey(0, 50, { x: 5 }, 'k');
+    doc.addSoundCue(60, 'sounds/x.ogg');
+    expect(doc.setLength(30)).toEqual({ keys: 1, cues: 1 });
+    expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([0]);
+    doc.undo();
+    expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([0, 50]);
+  });
+});
+
 describe('bakeScene', () => {
   it('composes instance and part transforms exactly', () => {
     const doc = SceneDocument.create('S');
-    doc.state.length = 4;
+    doc.state.length = 8;
     doc.addLayer('reanim', 'reanim/P.reanim', 'Pea Shooter', { x: 100, y: 50, rotation: 30, scaleX: 2, anim: 'anim_a' }, 0);
     const res = { assets: new AssetLibrary(), prefab: () => prefab };
     const { definition, warnings } = bakeScene(doc.state, res);
     expect(warnings).toEqual([]);
     expect(definition.tracks.map((t) => t.name)).toEqual(['anim_scene', 'Pea_Shooter_part']);
     const part = definition.tracks[1].transforms;
-    // Scene 30 fps, prefab 10 fps: scene frame 3 shows prefab frame 1 (x = 1).
-    const pose = evalLayer(doc.state.layers[0], 3)!;
-    const expected = mul(poseMatrix(pose), transformMatrix(tr({ x: 1 })));
-    const got = transformMatrix(part[3]);
+    // Scene 30 fps, prefab 10 fps, 3-frame anim_a: scene frame 6 (0.2 s) is prefab position 0.2 * 10 * 2 / 3 = 4/3.
+    const pose = evalLayer(doc.state.layers[0], 6)!;
+    const expected = mul(poseMatrix(pose), transformMatrix(tr({ x: 4 / 3 })));
+    const got = transformMatrix(part[6]);
     for (const [px, py] of [
       [0, 0],
       [10, 5],

@@ -29,7 +29,10 @@ export function thumbnail(ws: Workspace, path: string, size = 64): HTMLElement {
         const s = Math.min((size * 2) / img.celWidth, (size * 2) / img.celHeight, 4);
         const w = img.celWidth * s;
         const hh = img.celHeight * s;
-        c.getContext('2d')!.drawImage(img.source, 0, 0, img.celWidth, img.celHeight, (size * 2 - w) / 2, (size * 2 - hh) / 2, w, hh);
+        // A 1:1 canvas copy first, so scaling does not bleed colour hidden in transparent pixels.
+        const src = h('canvas', { width: img.celWidth, height: img.celHeight });
+        src.getContext('2d')!.drawImage(img.source, 0, 0, img.celWidth, img.celHeight, 0, 0, img.celWidth, img.celHeight);
+        c.getContext('2d')!.drawImage(src, 0, 0, img.celWidth, img.celHeight, (size * 2 - w) / 2, (size * 2 - hh) / 2, w, hh);
         holder.title = `${img.width}×${img.height}${img.rows * img.cols > 1 ? ` (${img.cols}×${img.rows} cels)` : ''}`;
       } else {
         holder.classList.add('broken');

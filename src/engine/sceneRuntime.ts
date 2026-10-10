@@ -25,6 +25,11 @@ export interface SceneResolver {
   particles?(layer: SceneLayer, pose: LayerPose, frame: number): ParticleSystem | null;
 }
 
+/** Prefab frames per second an instance's playhead moves at (Reanimation::Update: a pass lasts count / fps). */
+export function instanceFps(prefab: Prefab, count: number, speed: number): number {
+  return (prefab.fps * Math.max(0, speed) * Math.max(1, count - 1)) / Math.max(1, count);
+}
+
 /** Which prefab frame an instance shows at a scene frame. */
 export function instanceFrameTime(prefab: Prefab, pose: LayerPose, sceneFps: number, frame: number): FrameTime {
   const key = pose.key;
@@ -36,7 +41,8 @@ export function instanceFrameTime(prefab: Prefab, pose: LayerPose, sceneFps: num
     return { before: f, after: f, fraction: 0 };
   }
   const seconds = Math.max(0, frame - pose.segmentStart) / Math.max(1e-6, sceneFps);
-  let pos = offset + seconds * prefab.fps * Math.max(0, key.speed);
+  // As in the game, one pass of a count-frame animation takes count / fps seconds.
+  let pos = offset + seconds * instanceFps(prefab, range.count, key.speed);
   if (key.loop === 'loop') pos %= last;
   else pos = Math.min(pos, last);
   const before = Math.floor(pos);
@@ -110,7 +116,14 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
       const prefab = res.prefab(layer.source);
       if (prefab) {
         const ft = instanceFrameTime(prefab, pose, scene.fps, frame);
-        drawReanim(r, assets, prefab.tracks, ft, m, { color, fps: prefab.fps * (pose.key.speed > 0 ? pose.key.speed : 1), collect: parts });
+        const range = animRangeOf({ fps: prefab.fps, tracks: prefab.tracks as ReanimDefinition['tracks'] }, pose.key.anim);
+        drawReanim(r, assets, prefab.tracks, ft, m, {
+          color,
+          fps: instanceFps(prefab, range.count, pose.key.speed > 0 ? pose.key.speed : 1),
+          rangeStart: range.start,
+          screen: view,
+          collect: parts,
+        });
       } else if (prefab === null) {
         r.fillRect(m, 40, 40, [1, 0.3, 0.6, 0.3 * color[3]], 'normal');
         parts.push({ trackIndex: -1, matrix: m, transform: { ...DEFAULT_TRANSFORM }, width: 40, height: 40 });
@@ -123,7 +136,9 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
       }
     } else if (layer.kind === 'particle') {
       const sys = res.particles?.(layer, pose, frame);
-      if (sys) sys.draw(r, assets, view, color);
+      // Particles are simulated in stage space around the emitter (pose.x, pose.y); rotate,
+      // scale and flip them about the emitter like the rest of the layer.
+      if (sys) sys.draw(r, assets, mul(m, [1, 0, 0, 1, -pose.x, -pose.y]), color);
       // A small handle area so emitters can be selected and dragged.
       parts.push({ trackIndex: -1, matrix: m, transform: { ...DEFAULT_TRANSFORM }, width: 0, height: 0 });
     }

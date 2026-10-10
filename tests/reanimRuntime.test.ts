@@ -24,6 +24,7 @@ function recorder(): Renderer & { xs: number[] } {
     fillRect() {},
     end() {},
     dispose() {},
+    readPixels: () => ({}) as ImageData,
   };
 }
 
@@ -103,5 +104,46 @@ describe('attachers', () => {
   it('starts over when the attacher reappears after being hidden', () => {
     expect(xAt(8)).toBeUndefined();
     expect(xAt(9)).toBe(0);
+  });
+
+  const run = (texts: string[], frame: number, opts: { rangeStart?: number } = {}) => {
+    const r = recorder();
+    const tracks = [{ name: 'attacher__Child', transforms: texts.map((text) => tr({ text })) }];
+    drawReanim(r, assets(child), tracks, at(frame), [1, 0, 0, 1, 0, 0], { fps: 10, ...opts });
+    return r.xs[0];
+  };
+
+  it('applies a tempo change without restarting', () => {
+    // 0.1 s at 10 fps then 0.1 s at 20 fps over 4 frames: (1 + 2) / 4 = 0.75 -> frame 2.25.
+    expect(run(['attacher__Child__anim_a[10]', 'attacher__Child__anim_a[20]', 'attacher__Child__anim_a[20]'], 2)).toBe(2.25);
+  });
+
+  it('drops [once] attachments when they finish but holds [hold] ones', () => {
+    const once = Array(6).fill('attacher__Child__anim_a[10][once]');
+    expect(run(once, 3)).toBe(2.25);
+    expect(run(once, 4)).toBeUndefined();
+    expect(run(Array(6).fill('attacher__Child__anim_a[10][hold]'), 5)).toBe(3);
+  });
+
+  it('times attachers from the start of the animation being played', () => {
+    const texts = Array(8).fill('attacher__Child__anim_a[10]');
+    expect(run(texts, 6)).toBe(1.5);
+    expect(run(texts, 6, { rangeStart: 4 })).toBe(1.5);
+    expect(run(texts, 6, { rangeStart: 6 })).toBe(0);
+  });
+
+  it('collects attached parts under the attacher track', () => {
+    const collect: DrawTrackInfo[] = [];
+    drawReanim(recorder(), assets(child), parent, at(0), [1, 0, 0, 1, 0, 0], { fps: 10, collect });
+    expect(collect.map((c) => [c.trackIndex, c.attached])).toEqual([[0, true]]);
+  });
+});
+
+describe('fullscreen tracks', () => {
+  it('fill the 800x600 screen with the track colour, ignoring the track transform', () => {
+    const fills: [number, number, number][] = [];
+    const r = { ...recorder(), fillRect: (m: Readonly<Mat>, w: number, hgt: number) => void fills.push([m[4], w, hgt]) };
+    drawReanim(r, assets(), [{ name: 'fullscreen', transforms: [tr({ x: 50, a: 0.5 })] }], at(0), [1, 0, 0, 1, 7, 0]);
+    expect(fills).toEqual([[7, 800, 600]]);
   });
 });
