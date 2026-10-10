@@ -6,20 +6,23 @@
 import { apply, type Mat } from '../engine/math';
 import { createRenderer, type Renderer, type RGBA } from '../engine/renderer';
 import { drawReanim, isLooping, type DrawTrackInfo } from '../engine/reanimRuntime';
+import { bakeScene, drawScene } from '../engine/sceneRuntime';
 import { basename, memoryFile, normPath, pathKey, type VFile } from '../engine/vfs';
 import { dateToFileTime, PAK_XOR_KEY, writePak, type PakWriteFile } from '../formats/pak';
 import { parseParticleXml, serializeParticleXml } from '../formats/particles';
 import { parseReanimXml, serializeReanimXml } from '../formats/reanim';
 import { writeZip } from '../formats/zip';
 import { ParticleDocument } from '../editor/particleDoc';
-import { ReanimDocument, type Ease } from '../editor/reanimDoc';
+import { nextUid, ReanimDocument, type Ease } from '../editor/reanimDoc';
+import { SceneDocument, type SceneState } from '../editor/sceneDoc';
 import type { EditorDocument, Workspace } from '../editor/workspace';
 import { downloadBlob, fileBytes, h } from './dom';
 import { checkbox, numberField, openDialog, select } from './widgets';
 
 const enc = new TextEncoder();
 
-export function serializeDoc(ws: Workspace, doc: EditorDocument): Uint8Array {
+/** File bytes of a reanim or particle document (scenes are not game files; bake them instead). */
+export function serializeDoc(ws: Workspace, doc: ReanimDocument | ParticleDocument): Uint8Array {
   if (doc.kind === 'reanim') return enc.encode(serializeReanimXml(doc.toDefinition(ws.settings.embedCues)));
   return enc.encode(serializeParticleXml(doc.def));
 }
@@ -27,6 +30,10 @@ export function serializeDoc(ws: Workspace, doc: EditorDocument): Uint8Array {
 export function exportCurrentDoc(ws: Workspace): void {
   const doc = ws.active;
   if (!doc) return;
+  if (doc.kind === 'scene') {
+    void bakeSceneDialog(ws, doc);
+    return;
+  }
   const bytes = serializeDoc(ws, doc);
   downloadBlob(new Blob([bytes as BlobPart], { type: 'text/xml' }), basename(doc.path));
   ws.status(`Exported ${basename(doc.path)}`, 'success');
@@ -34,6 +41,7 @@ export function exportCurrentDoc(ws: Workspace): void {
 
 /** Write a document into the library so other documents (cues, attachers) see it. */
 export function applyToLibrary(ws: Workspace, doc: EditorDocument): void {
+  if (doc.kind === 'scene') return; // scenes live in the project, not in the game files
   ws.assets.vfs.set(memoryFile(doc.path, serializeDoc(ws, doc), 'generated'));
   ws.assets.invalidate('definitions');
   doc.markSaved();
@@ -63,6 +71,7 @@ export async function exportPak(ws: Workspace): Promise<void> {
     changes.set(pathKey(f.path), { path: f.path, label, bytes: () => f.read(), checked: f.origin !== 'demo' });
   }
   for (const doc of ws.docs) {
+    if (doc.kind === 'scene') continue;
     // Unchanged documents are already represented by their library file (if any).
     if (!doc.dirty && !doc.isNew && ws.assets.vfs.has(doc.path)) continue;
     changes.set(pathKey(doc.path), { path: doc.path, label: doc.dirty ? 'edited document' : 'document', bytes: async () => serializeDoc(ws, doc), checked: true });
@@ -175,42 +184,52 @@ interface ProjectDoc {
   loop?: string;
 }
 
+interface ProjectScene {
+  name: string;
+  open: boolean;
+  state: SceneState;
+}
+
 interface ProjectFile {
   format: 'pvz-animator-project';
   version: 1;
   savedAt: string;
   pakName?: string;
   docs: ProjectDoc[];
+  scenes?: ProjectScene[];
   files: { path: string; origin: string; data: string }[];
 }
 
 export async function saveProject(ws: Workspace): Promise<void> {
-  const docs: ProjectDoc[] = ws.docs.map((d) => {
-    if (d.kind === 'reanim') {
-      const tracks = d.state.tracks;
-      return {
-        kind: 'reanim',
-        name: d.name,
-        path: d.path,
-        isNew: d.isNew,
-        xml: serializeReanimXml(d.toDefinition(true)),
-        keys: tracks.map((t) => t.keys.flatMap((k, i) => (k ? [i] : []))),
-        ease: tracks.map((t) => Object.fromEntries(t.ease.flatMap((e, i) => (t.keys[i] && e !== 'linear' ? [[String(i), e]] : [])))),
-        anim: d.ui.anim,
-        loop: d.ui.loop,
-      };
-    }
-    return { kind: 'particle', name: d.name, path: d.path, isNew: d.isNew, xml: serializeParticleXml(d.def) };
-  });
+  const docs: ProjectDoc[] = ws.docs.flatMap((d): ProjectDoc[] => (d.kind === 'scene' ? [] : [projectDoc(d)]));
+  const scenes: ProjectScene[] = ws.scenes.map((sc) => ({ name: sc.name, open: ws.docs.includes(sc), state: sc.state }));
   const files: ProjectFile['files'] = [];
   for (const f of ws.assets.vfs.list()) {
     if (f.origin === 'pak') continue;
     files.push({ path: f.path, origin: f.origin, data: toBase64(await f.read()) });
   }
-  const project: ProjectFile = { format: 'pvz-animator-project', version: 1, savedAt: new Date().toISOString(), pakName: ws.assets.pakName || undefined, docs, files };
+  const project: ProjectFile = { format: 'pvz-animator-project', version: 1, savedAt: new Date().toISOString(), pakName: ws.assets.pakName || undefined, docs, scenes, files };
   const name = (ws.active?.name ?? 'project').replace(/[^\w.-]+/g, '_');
   downloadBlob(new Blob([JSON.stringify(project)], { type: 'application/json' }), `${name}.pvzanim.json`);
-  ws.status(`Saved project (${docs.length} documents, ${files.length} files). Re-open main.pak after loading it.`, 'success');
+  for (const sc of ws.scenes) sc.markSaved();
+  ws.emit('docs');
+  ws.status(`Saved project (${docs.length} documents, ${scenes.length} scenes, ${files.length} files). Re-open main.pak after loading it.`, 'success');
+}
+
+function projectDoc(d: ReanimDocument | ParticleDocument): ProjectDoc {
+  if (d.kind === 'particle') return { kind: 'particle', name: d.name, path: d.path, isNew: d.isNew, xml: serializeParticleXml(d.def) };
+  const tracks = d.state.tracks;
+  return {
+    kind: 'reanim',
+    name: d.name,
+    path: d.path,
+    isNew: d.isNew,
+    xml: serializeReanimXml(d.toDefinition(true)),
+    keys: tracks.map((t) => t.keys.flatMap((k, i) => (k ? [i] : []))),
+    ease: tracks.map((t) => Object.fromEntries(t.ease.flatMap((e, i) => (t.keys[i] && e !== 'linear' ? [[String(i), e]] : [])))),
+    anim: d.ui.anim,
+    loop: d.ui.loop,
+  };
 }
 
 export async function loadProject(ws: Workspace, file: File): Promise<void> {
@@ -248,7 +267,20 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
     doc.savedVersion = -1;
     ws.openDoc(doc);
   }
-  ws.status(`Loaded project with ${p.docs.length} documents${p.pakName && !ws.assets.pak ? ` — open ${p.pakName} to see game assets` : ''}.`, 'success');
+  for (const sc of p.scenes ?? []) {
+    const state = sc.state;
+    // Fresh ids so they never collide with ids handed out in this session.
+    for (const l of state.layers) {
+      l.uid = nextUid();
+      for (const k of l.keys) k.tint = [...(k.tint ?? [1, 1, 1])] as [number, number, number];
+    }
+    for (const c of state.soundCues) c.uid = nextUid();
+    const doc = SceneDocument.fromState(sc.name, state);
+    doc.markSaved();
+    ws.addScene(doc);
+    if (sc.open) ws.openDoc(doc);
+  }
+  ws.status(`Loaded project with ${p.docs.length} documents, ${(p.scenes ?? []).length} scenes${p.pakName && !ws.assets.pak ? ` — open ${p.pakName} to see game assets` : ''}.`, 'success');
 }
 
 // ---------------------------------------------------------------- rendering exports
@@ -263,15 +295,40 @@ class NullRenderer implements Renderer {
   end(): void {}
 }
 
-async function preloadImages(ws: Workspace, doc: ReanimDocument): Promise<void> {
+/** What a frame/video export renders: a reanim's active range or a whole scene. */
+interface ExportTarget {
+  label: string;
+  frames: number[];
+  /** Content box in document space. */
+  box: { x: number; y: number; w: number; h: number };
+  isScene: boolean;
+  defaultLoops: number;
+  /** Draw a (possibly fractional) frame with `base` mapping document space to the output. */
+  draw(r: Renderer, base: Mat, frame: number, background: boolean): void;
+  /** Current frame while the workspace is playing (for video). */
+  playingFrame(): number;
+}
+
+async function preloadImages(ws: Workspace, tracks: { transforms: { i: string }[] }[]): Promise<void> {
   const ids = new Set<string>();
-  for (const t of doc.state.tracks) for (const tr of t.transforms) if (tr.i) ids.add(tr.i);
+  for (const t of tracks) for (const tr of t.transforms) if (tr.i) ids.add(tr.i);
   await Promise.all([...ids].map((id) => ws.assets.loadImage(id)));
 }
 
-function rangeFrames(doc: ReanimDocument): number[] {
-  const { start, end } = doc.activeRange();
-  return Array.from({ length: end - start + 1 }, (_, i) => start + i);
+/** Load every prefab, image and particle definition a scene needs. */
+async function preloadScene(ws: Workspace, doc: SceneDocument): Promise<void> {
+  const s = doc.state;
+  if (s.backgroundImage) await ws.assets.loadImage(s.backgroundImage);
+  for (const l of s.layers) {
+    if (l.kind === 'reanim') {
+      const prefab = ws.prefab(l.source) ?? (await ws.assets.reanimAsync(l.source));
+      if (prefab) await preloadImages(ws, prefab.tracks);
+    } else if (l.kind === 'image') await ws.assets.loadImage(l.source);
+    else if (!ws.particleDef(l.source)) {
+      const def = await ws.assets.particleAsync(l.source);
+      for (const em of def?.emitters ?? []) if (em.image) await ws.assets.loadImage(em.image);
+    }
+  }
 }
 
 /** Bounding box (reanim space) of all visible parts over the given frames. */
@@ -303,7 +360,53 @@ function measure(ws: Workspace, doc: ReanimDocument, frames: number[]): { x: num
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
+async function exportTarget(ws: Workspace): Promise<ExportTarget | null> {
+  const scene = ws.scene;
+  if (scene) {
+    await preloadScene(ws, scene);
+    const s = scene.state;
+    const res = { assets: ws.assets, prefab: (p: string) => ws.prefab(p), particles: ws.sceneParticles.bind(ws, scene) };
+    return {
+      label: scene.name,
+      frames: Array.from({ length: s.length }, (_, i) => i),
+      box: { x: 0, y: 0, w: s.width, h: s.height },
+      isScene: true,
+      defaultLoops: 1,
+      draw: (r, base, frame, background) => drawScene(r, res, s, frame, base, { hidden: (l) => scene.ui.hidden.has(l.uid), clock: ws.clock, drawBackground: background }),
+      playingFrame: () => ws.sceneFrame(scene),
+    };
+  }
+  const doc = ws.reanim;
+  if (!doc) return null;
+  await preloadImages(ws, doc.state.tracks);
+  const { start, end } = doc.activeRange();
+  const frames = Array.from({ length: end - start + 1 }, (_, i) => start + i);
+  const hidden = (i: number) => doc.ui.hidden.has(doc.state.tracks[i].uid);
+  return {
+    label: `${doc.name}${doc.ui.anim ? '_' + doc.ui.anim : ''}`,
+    frames,
+    box: measure(ws, doc, frames),
+    isScene: false,
+    defaultLoops: isLooping(doc.ui.loop) ? 3 : 1,
+    draw: (r, base, frame) => {
+      const playing = ws.playing && ws.active === doc;
+      const ft = playing ? ws.frameTime(doc) : { before: frame, after: frame, fraction: 0 };
+      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, clock: ws.clock });
+      if (playing) {
+        for (const l of ws.live) l.sys.draw(r, ws.assets, base);
+      } else {
+        const saved = doc.ui.frame;
+        doc.ui.frame = frame;
+        for (const sys of ws.pausedParticleSystems(doc)) sys.draw(r, ws.assets, base);
+        doc.ui.frame = saved;
+      }
+    },
+    playingFrame: () => ws.frameTime(doc).before,
+  };
+}
+
 const BG_COLORS: Record<string, RGBA | null> = {
+  stage: null,
   transparent: null,
   dark: [0.137, 0.149, 0.18, 1],
   lawn: [0.3, 0.54, 0.17, 1],
@@ -316,20 +419,21 @@ interface RenderSetup {
   height: number;
   base: Mat;
   bg: RGBA | null;
+  /** Draw the scene's own stage background. */
+  stageBackground: boolean;
 }
 
-async function renderSettingsDialog(ws: Workspace, doc: ReanimDocument, title: string, extra: (HTMLElement | null)[], defaults: { scale: number; padding: number }): Promise<(RenderSetup & { frames: number[] }) | null> {
-  await preloadImages(ws, doc);
-  const frames = rangeFrames(doc);
-  const box = measure(ws, doc, frames);
+async function renderSettingsDialog(target: ExportTarget, title: string, extra: (HTMLElement | null)[], defaults: { scale: number; padding: number }): Promise<RenderSetup | null> {
+  const box = target.box;
   let scale = defaults.scale;
-  let padding = defaults.padding;
-  let bg = 'transparent';
+  let padding = target.isScene ? 0 : defaults.padding;
+  let bg = target.isScene ? 'stage' : 'transparent';
   const sizeText = h('div', { class: 'dim small' });
   const update = () => {
-    sizeText.textContent = `Output: ${Math.ceil((box.w + padding * 2) * scale)} × ${Math.ceil((box.h + padding * 2) * scale)} px · ${frames.length} frames (${doc.ui.anim || 'all frames'})`;
+    sizeText.textContent = `Output: ${Math.ceil((box.w + padding * 2) * scale)} × ${Math.ceil((box.h + padding * 2) * scale)} px · ${target.frames.length} frames (${target.label})`;
   };
   update();
+  const bgOptions = Object.keys(BG_COLORS).filter((k) => target.isScene || k !== 'stage');
   const r = await openDialog({
     title,
     width: 460,
@@ -340,14 +444,14 @@ async function renderSettingsDialog(ws: Workspace, doc: ReanimDocument, title: s
         'div',
         { class: 'insp-grid2' },
         numberField({ label: 'Scale', value: scale, step: 0.1, precision: 2, min: 0.1, max: 8, onChange: (v) => ((scale = v), update()) }).el,
-        numberField({ label: 'Padding', value: padding, precision: 0, min: 0, max: 400, onChange: (v) => ((padding = v), update()) }).el,
+        target.isScene ? null : numberField({ label: 'Padding', value: padding, precision: 0, min: 0, max: 400, onChange: (v) => ((padding = v), update()) }).el,
       ),
       h(
         'label',
         { class: 'field-col' },
         'Background',
         select(
-          Object.keys(BG_COLORS).map((k) => ({ value: k, label: k[0].toUpperCase() + k.slice(1) })),
+          bgOptions.map((k) => ({ value: k, label: k === 'stage' ? 'Stage background' : k[0].toUpperCase() + k.slice(1) })),
           bg,
           (v) => (bg = v),
         ),
@@ -364,13 +468,12 @@ async function renderSettingsDialog(ws: Workspace, doc: ReanimDocument, title: s
   const width = Math.max(2, Math.ceil((box.w + padding * 2) * scale));
   const height = Math.max(2, Math.ceil((box.h + padding * 2) * scale));
   const base: Mat = [scale, 0, 0, scale, (padding - box.x) * scale, (padding - box.y) * scale];
-  return { width, height, base, bg: BG_COLORS[bg], frames };
+  return { width, height, base, bg: BG_COLORS[bg], stageBackground: bg === 'stage' };
 }
 
-function renderFrameTo(ws: Workspace, doc: ReanimDocument, r: Renderer, setup: RenderSetup, frame: { before: number; after: number; fraction: number }, systems: { draw: (r: Renderer, a: typeof ws.assets, m: Mat) => void }[]) {
+function renderFrameTo(target: ExportTarget, r: Renderer, setup: RenderSetup, frame: number) {
   r.begin(setup.bg ?? [0, 0, 0, 0]);
-  drawReanim(r, ws.assets, doc.state.tracks, frame, setup.base, { hidden: (i) => doc.ui.hidden.has(doc.state.tracks[i].uid), clock: ws.clock });
-  for (const s of systems) s.draw(r, ws.assets, setup.base);
+  target.draw(r, setup.base, frame, setup.stageBackground);
   r.end();
 }
 
@@ -381,12 +484,12 @@ function canvasToPng(c: HTMLCanvasElement): Promise<Uint8Array> {
 }
 
 export async function exportFrames(ws: Workspace): Promise<void> {
-  const doc = ws.reanim;
-  if (!doc) return;
+  ws.pause();
+  const target = await exportTarget(ws);
+  if (!target) return;
   let mode = 'zip' as 'zip' | 'sheet';
   const setup = await renderSettingsDialog(
-    ws,
-    doc,
+    target,
     'Export PNG frames',
     [
       h(
@@ -406,62 +509,56 @@ export async function exportFrames(ws: Workspace): Promise<void> {
     { scale: 1, padding: 8 },
   );
   if (!setup) return;
-  ws.pause();
   const canvas = document.createElement('canvas');
   const r = createRenderer(canvas);
   r.resize(setup.width, setup.height, 1);
-  const savedFrame = doc.ui.frame;
   const pngs: Uint8Array[] = [];
-  const cols = Math.ceil(Math.sqrt(setup.frames.length));
+  const cols = Math.ceil(Math.sqrt(target.frames.length));
   const sheet = mode === 'sheet' ? document.createElement('canvas') : null;
   if (sheet) {
     sheet.width = cols * setup.width;
-    sheet.height = Math.ceil(setup.frames.length / cols) * setup.height;
+    sheet.height = Math.ceil(target.frames.length / cols) * setup.height;
   }
+  ws.invalidatePreviews();
   try {
-    for (let k = 0; k < setup.frames.length; k++) {
-      const f = setup.frames[k];
-      doc.ui.frame = f;
-      const systems = ws.pausedParticleSystems(doc);
-      renderFrameTo(ws, doc, r, setup, { before: f, after: f, fraction: 0 }, systems);
+    for (let k = 0; k < target.frames.length; k++) {
+      renderFrameTo(target, r, setup, target.frames[k]);
       if (sheet) sheet.getContext('2d')!.drawImage(canvas, (k % cols) * setup.width, Math.floor(k / cols) * setup.height);
       else pngs.push(await canvasToPng(canvas));
     }
   } finally {
-    doc.ui.frame = savedFrame;
     ws.invalidatePreviews();
   }
-  const base = `${doc.name}${doc.ui.anim ? '_' + doc.ui.anim : ''}`;
   if (sheet) {
-    downloadBlob(new Blob([(await canvasToPng(sheet)) as BlobPart], { type: 'image/png' }), `${base}_sheet_${cols}x${Math.ceil(setup.frames.length / cols)}.png`);
+    downloadBlob(new Blob([(await canvasToPng(sheet)) as BlobPart], { type: 'image/png' }), `${target.label}_sheet_${cols}x${Math.ceil(target.frames.length / cols)}.png`);
   } else {
-    downloadBlob(writeZip(pngs.map((data, i) => ({ name: `${base}_${String(setup.frames[i]).padStart(4, '0')}.png`, data }))), `${base}_frames.zip`);
+    downloadBlob(writeZip(pngs.map((data, i) => ({ name: `${target.label}_${String(target.frames[i]).padStart(4, '0')}.png`, data }))), `${target.label}_frames.zip`);
   }
-  ws.status(`Exported ${setup.frames.length} frames.`, 'success');
+  ws.status(`Exported ${target.frames.length} frames.`, 'success');
 }
 
 export async function exportVideo(ws: Workspace): Promise<void> {
-  const doc = ws.reanim;
-  if (!doc) return;
   if (typeof MediaRecorder === 'undefined') {
     ws.status('Video export needs MediaRecorder support (Chrome, Edge or Firefox).', 'error');
     return;
   }
-  let loops = isLooping(doc.ui.loop) ? 3 : 1;
+  ws.pause();
+  const doc = ws.timed;
+  const target = await exportTarget(ws);
+  if (!doc || !target) return;
+  let loops = target.defaultLoops;
   let withSound = true;
   const setup = await renderSettingsDialog(
-    ws,
-    doc,
+    target,
     'Export video (WebM)',
     [
       numberField({ label: 'Loops', value: loops, precision: 0, min: 1, max: 50, onChange: (v) => (loops = Math.round(v)) }).el,
       checkbox('Record sound cues', withSound, (v) => (withSound = v)),
       h('p', { class: 'dim small' }, 'The animation plays in real time while recording.'),
     ],
-    { scale: 2, padding: 16 },
+    { scale: target.isScene ? 1 : 2, padding: 16 },
   );
   if (!setup) return;
-  ws.pause();
   const glCanvas = document.createElement('canvas');
   const r = createRenderer(glCanvas);
   r.resize(setup.width, setup.height, 1);
@@ -476,8 +573,10 @@ export async function exportVideo(ws: Workspace): Promise<void> {
   const chunks: Blob[] = [];
   rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
   const done = new Promise<void>((resolve) => (rec.onstop = () => resolve()));
-  const { start } = doc.activeRange();
-  doc.ui.frame = start;
+  doc.ui.frame = target.frames[0];
+  const savedLoop = doc.kind === 'scene' ? doc.ui.loopPlayback : undefined;
+  if (doc.kind === 'scene') doc.ui.loopPlayback = loops > 1;
+  ws.invalidatePreviews();
   rec.start(250);
   ws.play();
   ws.status('Recording video…');
@@ -487,11 +586,14 @@ export async function exportVideo(ws: Workspace): Promise<void> {
     const step = () => {
       if (ws.playhead < last - 0.5) loopCount++;
       last = ws.playhead;
-      const ft = ws.frameTime(doc);
-      renderFrameTo(ws, doc, r, setup, ft, ws.live.map((l) => l.sys));
+      if (loopCount >= loops || ws.active !== doc) {
+        setTimeout(resolve, 100);
+        return;
+      }
+      renderFrameTo(target, r, setup, ws.playing ? ws.playhead : target.playingFrame());
       ctx.clearRect(0, 0, out.width, out.height);
       ctx.drawImage(glCanvas, 0, 0);
-      if (!ws.playing || loopCount >= loops || ws.active !== doc) {
+      if (!ws.playing) {
         setTimeout(resolve, 200);
         return;
       }
@@ -500,12 +602,63 @@ export async function exportVideo(ws: Workspace): Promise<void> {
     requestAnimationFrame(step);
   });
   ws.pause();
+  if (doc.kind === 'scene' && savedLoop !== undefined) doc.ui.loopPlayback = savedLoop;
   rec.stop();
   await done;
   ws.audio.stopRecording();
   const blob = new Blob(chunks, { type: 'video/webm' });
-  downloadBlob(blob, `${doc.name}${doc.ui.anim ? '_' + doc.ui.anim : ''}.webm`);
+  downloadBlob(blob, `${target.label}.webm`);
   ws.status(`Exported video (${(blob.size / 1024).toFixed(0)} KB).`, 'success');
+}
+
+// ---------------------------------------------------------------- baking scenes
+
+/** Flatten a scene into one .reanim (optionally opening it and adding it to the library). */
+export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Promise<void> {
+  ws.pause();
+  await preloadScene(ws, scene);
+  const { definition, warnings } = bakeScene(scene.state, { assets: ws.assets, prefab: (p) => ws.prefab(p) });
+  const safe = scene.name.replace(/[^A-Za-z0-9_]+/g, '_') || 'Scene';
+  const pathInput = h('input', { type: 'text', class: 'wide mono', value: `reanim/${safe}.reanim` });
+  let open = true;
+  let library = true;
+  let download = false;
+  const parts = definition.tracks.length - 1;
+  const r = await openDialog({
+    title: 'Bake scene to reanim',
+    width: 520,
+    body: h(
+      'div',
+      { class: 'form-col' },
+      h('p', null, `Flattens every instance into one reanim: ${parts} part track${parts === 1 ? '' : 's'}, ${scene.state.length} frames at ${scene.state.fps} fps, playable in the game as `, h('b', null, 'anim_scene'), '.'),
+      warnings.length ? h('ul', { class: 'warn small' }, warnings.map((w) => h('li', null, w))) : null,
+      h('label', { class: 'field-col' }, 'Save as', pathInput),
+      checkbox('Open it for editing', open, (v) => (open = v)),
+      checkbox('Add it to the library (included in Build main.pak)', library, (v) => (library = v)),
+      checkbox('Download the .reanim file', download, (v) => (download = v)),
+    ),
+    buttons: [
+      { label: 'Cancel', value: 'cancel' },
+      { label: 'Bake', value: 'ok', primary: true },
+    ],
+  });
+  if (r !== 'ok') return;
+  const path = normPath(pathInput.value.trim() || `reanim/${safe}.reanim`);
+  const name = basename(path).replace(/\.reanim$/i, '');
+  const xml = serializeReanimXml(definition);
+  if (download) downloadBlob(new Blob([xml], { type: 'text/xml' }), basename(path));
+  if (library) {
+    ws.assets.vfs.set(memoryFile(path, enc.encode(xml), 'generated'));
+    ws.assets.invalidate('definitions');
+  }
+  const existing = ws.findDoc(path);
+  if (existing) ws.closeDoc(existing);
+  if (open) {
+    const doc = ReanimDocument.fromDefinition(parseReanimXml(xml), name, path, ws.settings.simplifyOnImport);
+    if (library) doc.markSaved();
+    ws.openDoc(doc);
+  }
+  ws.status(`Baked ${scene.name} into ${path}${warnings.length ? ` (${warnings.length} warning${warnings.length > 1 ? 's' : ''})` : ''}.`, 'success');
 }
 
 /** Re-export helper used by the asset browser. */

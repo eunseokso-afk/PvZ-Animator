@@ -92,7 +92,7 @@ interface Snapshot<S> {
 
 export abstract class DocumentBase<S> {
   readonly id = docCounter++;
-  abstract readonly kind: 'reanim' | 'particle';
+  abstract readonly kind: 'reanim' | 'particle' | 'scene';
   name: string;
   /** Where the file lives in the game folder (e.g. reanim/Foo.reanim). */
   path: string;

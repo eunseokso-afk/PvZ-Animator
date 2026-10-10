@@ -7,13 +7,16 @@ import { interpolateTransform, transformMatrix } from '../engine/reanimRuntime';
 import { basename, extname, IMAGE_EXTS, SOUND_EXTS, stripExt, type VFile } from '../engine/vfs';
 import { isAnimTrackName } from '../formats/reanim';
 import { ReanimDocument } from '../editor/reanimDoc';
+import { cloneSceneState, SceneDocument } from '../editor/sceneDoc';
 import type { EditorDocument, Workspace } from '../editor/workspace';
 import { AssetBrowser } from './assetBrowser';
 import { downloadBlob, h, isTextInput, pickFiles } from './dom';
-import { applyToLibrary, exportCurrentDoc, exportFrames, exportPak, exportVideo, extractFile, loadProject, saveProject } from './exporters';
+import { applyToLibrary, bakeSceneDialog, exportCurrentDoc, exportFrames, exportPak, exportVideo, extractFile, loadProject, saveProject } from './exporters';
 import { ReanimInspector } from './inspector';
 import { ParticleInspector, ParticlePanel } from './particleEditor';
 import { clearThumbnails, pickAsset, pickImage, previewSound } from './pickers';
+import { SceneInspector } from './sceneInspector';
+import { SceneTimeline } from './sceneTimeline';
 import { Timeline } from './timeline';
 import { Viewport } from './viewport';
 import { alertDialog, closeMenus, confirmDialog, openDialog, promptText, showMenu, toast, type MenuItem } from './widgets';
@@ -33,6 +36,8 @@ export class App {
   private reanimInspector: ReanimInspector;
   private particleInspector: ParticleInspector;
   private particlePanel: ParticlePanel;
+  private sceneTimeline: SceneTimeline;
+  private sceneInspector: SceneInspector;
   private browser: AssetBrowser;
   private rightHost: HTMLElement;
   private bottomHost: HTMLElement;
@@ -60,6 +65,15 @@ export class App {
     this.reanimInspector = new ReanimInspector(ws);
     this.particleInspector = new ParticleInspector(ws);
     this.particlePanel = new ParticlePanel(ws, this.viewport);
+    this.sceneTimeline = new SceneTimeline(ws, {
+      layerMenu: (doc, li) => this.viewport.sceneStage.layerMenu(doc, li),
+      addMenu: (doc) => this.sceneAddMenu(doc),
+      addSoundCue: (doc, frame) => void this.addSceneSoundCue(doc, frame),
+      renameLayer: (doc, li) => void this.renameLayer(doc, li),
+      previewSound: (p) => void previewSound(ws, p),
+      bake: (doc) => void bakeSceneDialog(ws, doc),
+    });
+    this.sceneInspector = new SceneInspector(ws);
     this.browser = new AssetBrowser(ws, {
       openPak: () => void this.openPak(),
       openFolder: () => void this.openFolder(),
@@ -67,6 +81,8 @@ export class App {
       loadDemo: () => void this.loadDemo(),
       assetMenu: (f, kind, e) => this.assetMenu(f, kind, e),
       activate: (f, kind) => void this.activateAsset(f, kind),
+      newScene: () => ws.newScene(),
+      sceneMenu: (scene, e) => this.sceneMenu(scene, e),
     });
     this.rightHost = h('aside', { class: 'right-panel' });
     this.bottomHost = h('section', { class: 'bottom-panel' });
@@ -111,7 +127,7 @@ export class App {
     this.bindKeys();
     this.bindFileDrop();
     window.addEventListener('beforeunload', (e) => {
-      if (ws.docs.some((d) => d.dirty)) {
+      if (ws.docs.some((d) => d.dirty) || ws.scenes.some((s) => s.dirty)) {
         e.preventDefault();
         e.returnValue = '';
       }
@@ -167,11 +183,14 @@ export class App {
 
   private swapPanels() {
     const doc = this.ws.active;
-    const right = doc?.kind === 'particle' ? this.particleInspector.el : this.reanimInspector.el;
-    const bottom = doc?.kind === 'particle' ? this.particlePanel.el : this.timeline.el;
+    const right = doc?.kind === 'particle' ? this.particleInspector.el : doc?.kind === 'scene' ? this.sceneInspector.el : this.reanimInspector.el;
+    const bottom = doc?.kind === 'particle' ? this.particlePanel.el : doc?.kind === 'scene' ? this.sceneTimeline.el : this.timeline.el;
     if (this.rightHost.firstChild !== right) this.rightHost.replaceChildren(right);
     if (this.bottomHost.firstChild !== bottom) this.bottomHost.replaceChildren(bottom);
-    if (doc?.kind === 'particle') {
+    if (doc?.kind === 'scene') {
+      this.sceneInspector.refresh(true);
+      this.sceneTimeline.draw();
+    } else if (doc?.kind === 'particle') {
       this.particleInspector.refresh(true);
       this.particlePanel.refresh();
     } else {
@@ -227,6 +246,7 @@ export class App {
       h('div', { class: 'menubar-sep' }),
       h('button', { class: 'tool-btn labeled', title: 'New reanim animation', onclick: () => this.ws.newReanim() }, '＋ Reanim'),
       h('button', { class: 'tool-btn labeled', title: 'New particle effect', onclick: () => this.ws.newParticle() }, '＋ Particle'),
+      h('button', { class: 'tool-btn labeled', title: 'New scene: place prefabs on a stage and animate them (like Adobe Animate)', onclick: () => this.ws.newScene() }, '＋ Scene'),
       h('div', { class: 'spacer' }),
       h('button', { class: 'tool-btn labeled accent', title: 'Merge your changes into a new main.pak', onclick: () => void exportPak(this.ws) }, '⬇ Build main.pak'),
     );
@@ -244,15 +264,21 @@ export class App {
       { separator: true },
       { label: 'New reanim', action: () => ws.newReanim() },
       { label: 'New particle effect', action: () => ws.newParticle() },
+      { label: 'New scene', action: () => ws.newScene() },
       { separator: true },
       { label: 'Open project…', action: () => void this.openProject() },
       { label: 'Save project…', shortcut: 'Ctrl+S', action: () => void saveProject(ws) },
       { separator: true },
-      { label: 'Save document to library', shortcut: 'Ctrl+Shift+S', disabled: !doc, action: () => doc && this.saveToLibrary(doc) },
-      { label: doc?.kind === 'particle' ? 'Export particle .xml…' : 'Export .reanim…', shortcut: 'Ctrl+E', disabled: !doc, action: () => exportCurrentDoc(ws) },
+      { label: 'Save document to library', shortcut: 'Ctrl+Shift+S', disabled: !doc || doc.kind === 'scene', action: () => doc && this.saveToLibrary(doc) },
+      {
+        label: doc?.kind === 'particle' ? 'Export particle .xml…' : doc?.kind === 'scene' ? 'Bake scene to .reanim…' : 'Export .reanim…',
+        shortcut: 'Ctrl+E',
+        disabled: !doc,
+        action: () => exportCurrentDoc(ws),
+      },
       { label: 'Build main.pak…', shortcut: 'Ctrl+Shift+E', action: () => void exportPak(ws) },
-      { label: 'Export video (WebM, with sound)…', disabled: doc?.kind !== 'reanim', action: () => void exportVideo(ws) },
-      { label: 'Export PNG frames / sprite sheet…', disabled: doc?.kind !== 'reanim', action: () => void exportFrames(ws) },
+      { label: 'Export video (WebM, with sound)…', disabled: !ws.timed, action: () => void exportVideo(ws) },
+      { label: 'Export PNG frames / sprite sheet…', disabled: !ws.timed, action: () => void exportFrames(ws) },
       { separator: true },
       { label: 'Close document', shortcut: 'Alt+W', disabled: !doc, action: () => doc && void this.closeDoc(doc) },
     ];
@@ -267,6 +293,25 @@ export class App {
       { label: doc?.undoLabel ? `Undo ${doc.undoLabel}` : 'Undo', shortcut: 'Ctrl+Z', disabled: !doc?.undoLabel, action: () => this.undo() },
       { label: doc?.redoLabel ? `Redo ${doc.redoLabel}` : 'Redo', shortcut: 'Ctrl+Y', disabled: !doc?.redoLabel, action: () => this.redo() },
     ];
+    const sc = ws.scene;
+    if (sc) {
+      const li = sc.ui.layer;
+      const layer = sc.state.layers[li];
+      items.push({ separator: true }, ...this.sceneAddMenu(sc), { separator: true });
+      if (layer) {
+        items.push(
+          { label: 'Insert keyframe', shortcut: 'F6 / K', action: () => this.sceneKey('insert') },
+          { label: 'Insert blank keyframe (hide)', shortcut: 'F7', action: () => this.sceneKey('blank') },
+          { label: 'Clear keyframe', shortcut: 'Shift+F6', action: () => this.sceneKey('clear') },
+          { label: 'Layer', submenu: [{ label: 'Rename…', shortcut: 'F2', action: () => void this.renameLayer(sc, li) }, ...this.viewport.sceneStage.layerMenu(sc, li)] },
+        );
+      }
+      items.push(
+        { label: 'Insert frame', shortcut: 'F5', action: () => (sc.shiftFrames(sc.ui.frame + 1, 1), ws.emit('change')) },
+        { label: 'Remove frame', shortcut: 'Shift+F5', disabled: sc.state.length <= 1, action: () => (sc.shiftFrames(sc.ui.frame, -1), ws.emit('change')) },
+        { label: 'Bake scene to .reanim…', shortcut: 'Ctrl+E', action: () => void bakeSceneDialog(ws, sc) },
+      );
+    }
     if (r) {
       items.push(
         { separator: true },
@@ -374,6 +419,7 @@ export class App {
         { class: 'welcome-actions' },
         h('button', { class: 'btn', onclick: () => this.ws.newReanim() }, '＋ New reanim'),
         h('button', { class: 'btn', onclick: () => this.ws.newParticle() }, '＋ New particle effect'),
+        h('button', { class: 'btn', onclick: () => this.ws.newScene() }, '🎬 New scene'),
         h('button', { class: 'btn', onclick: () => void this.openFolder() }, '📁 Open game folder'),
         h('button', { class: 'btn', onclick: () => void this.openProject() }, '📂 Open project'),
       ),
@@ -565,6 +611,11 @@ export class App {
   }
 
   private async closeDoc(doc: EditorDocument) {
+    if (doc.kind === 'scene') {
+      this.ws.closeDoc(doc);
+      this.ws.status(`Closed ${doc.name}; it stays in the Scenes list (saved with the project).`);
+      return;
+    }
     if (doc.dirty) {
       const r = await openDialog({
         title: 'Close document',
@@ -597,6 +648,109 @@ export class App {
       this.ws.emit('change');
       this.ws.status(`Redo: ${doc.undoLabel ?? ''}`);
     }
+  }
+
+  // ------------------------------------------------------------ scene helpers
+
+  /** "Add …" items for a scene (toolbar menu, Edit menu, timeline header). */
+  private sceneAddMenu(doc: SceneDocument): MenuItem[] {
+    const ws = this.ws;
+    const center = (): [number, number] => [doc.state.width / 2, doc.state.height / 2];
+    const add = (kind: string, path: string) => void this.viewport.sceneStage.addAsset(doc, { kind, path }, ...center());
+    return [
+      {
+        label: 'Add prefab (reanim)…',
+        action: async () => {
+          const p = ws.selectedAsset?.kind === 'reanim' ? ws.selectedAsset.path : await pickAsset(ws, 'reanim', 'Add prefab to scene');
+          if (p) add('reanim', p);
+        },
+      },
+      {
+        label: 'Add particle effect…',
+        action: async () => {
+          const p = await pickAsset(ws, 'particle', 'Add particle effect to scene');
+          if (p) add('particle', p);
+        },
+      },
+      {
+        label: 'Add image…',
+        action: async () => {
+          const r = await pickImage(ws, 'Add image to scene', 'reanim');
+          if (r) add('image', r.path);
+        },
+      },
+      { label: 'Add sound cue…', action: () => void this.addSceneSoundCue(doc, doc.ui.frame) },
+    ];
+  }
+
+  private async addSceneSoundCue(doc: SceneDocument, frame: number) {
+    const sel = this.ws.selectedAsset;
+    const path = sel?.kind === 'sound' ? sel.path : await pickAsset(this.ws, 'sound', 'Add sound cue');
+    if (!path) return;
+    const cue = doc.addSoundCue(frame, path);
+    doc.ui.cue = { kind: 'sound', uid: cue.uid };
+    this.ws.emit('change');
+  }
+
+  private async renameLayer(doc: SceneDocument, li: number) {
+    const layer = doc.state.layers[li];
+    if (!layer) return;
+    const name = await promptText('Rename layer', 'Layer name', layer.name);
+    if (name?.trim()) {
+      doc.edit('Rename layer', (s) => (s.layers[li].name = name.trim()));
+      this.ws.emit('change');
+    }
+  }
+
+  /** F6 / F7 / Shift+F6 on the selected layer at the current frame. */
+  private sceneKey(action: 'insert' | 'blank' | 'clear' | 'toggle') {
+    const doc = this.ws.scene;
+    if (!doc || doc.ui.layer < 0) return;
+    const li = doc.ui.layer;
+    const f = doc.ui.frame;
+    const isKey = doc.state.layers[li].keys.some((k) => k.frame === f);
+    if (action === 'blank') doc.setKey(li, f, { visible: false }, 'Insert blank keyframe');
+    else if (action === 'clear' || (action === 'toggle' && isKey)) doc.removeKey(li, f);
+    else if (!isKey) doc.toggleKey(li, f);
+    this.ws.emit('change');
+  }
+
+  private sceneMenu(scene: SceneDocument, e: MouseEvent) {
+    const ws = this.ws;
+    showMenu(
+      [
+        { label: 'Open', action: () => ws.openDoc(scene) },
+        {
+          label: 'Rename…',
+          action: async () => {
+            const name = await promptText('Rename scene', 'Scene name', scene.name);
+            if (name?.trim()) {
+              scene.name = name.trim();
+              scene.path = `scenes/${scene.name}`;
+              ws.emit('docs');
+            }
+          },
+        },
+        {
+          label: 'Duplicate',
+          action: () => {
+            const copy = SceneDocument.fromState(`${scene.name} copy`, cloneSceneState(scene.state));
+            ws.addScene(copy);
+            ws.openDoc(copy);
+          },
+        },
+        { label: 'Bake to .reanim…', action: () => void bakeSceneDialog(ws, scene) },
+        { separator: true },
+        {
+          label: 'Delete scene',
+          action: async () => {
+            if (await confirmDialog('Delete scene', `Delete "${scene.name}"? This cannot be undone.`, 'Delete', true)) ws.deleteScene(scene);
+          },
+        },
+      ],
+      e.clientX,
+      e.clientY,
+    );
   }
 
   // ------------------------------------------------------------ reanim helpers
@@ -800,7 +954,12 @@ export class App {
     const ws = this.ws;
     const r = ws.reanim;
     const items: MenuItem[] = [];
-    if (kind === 'reanim' || kind === 'particle') items.push({ label: 'Open', action: () => void ws.openAsset(f.path) });
+    const sc = ws.scene;
+    if (sc && (kind === 'reanim' || kind === 'particle' || kind === 'image')) {
+      items.push({ label: `Add to ${sc.name}`, action: () => void this.viewport.sceneStage.addAsset(sc, { kind, path: f.path }, sc.state.width / 2, sc.state.height / 2) });
+    }
+    if (kind === 'reanim') items.push({ label: 'Edit prefab', action: () => void (sc ? ws.editPrefab(f.path, sc) : ws.openAsset(f.path)) });
+    if (kind === 'particle') items.push({ label: 'Open', action: () => void ws.openAsset(f.path) });
     if (kind === 'image' && r) {
       items.push(
         { label: 'Add as new part', action: () => void this.addPart(r, f.path, ws.assets.imageIdForPath(f.path), 0, 0) },
@@ -887,6 +1046,8 @@ export class App {
         if (k === 'c' && r) return handled(), this.copyPose();
         if (k === 'v' && r) return handled(), this.pastePose();
         if (k === 'd' && r && r.ui.track >= 0) return handled(), (r.ui.track = r.duplicateTrack(r.ui.track)), ws.emit('change');
+        const sc = ws.scene;
+        if (k === 'd' && sc && sc.ui.layer >= 0) return handled(), (sc.ui.layer = sc.duplicateLayer(sc.ui.layer)), ws.emit('change');
         return;
       }
       if (e.altKey && key.toLowerCase() === 'w') return handled(), doc && void this.closeDoc(doc);
@@ -908,6 +1069,7 @@ export class App {
         if (key === 'r') return handled(), this.viewport.restartParticles();
         return;
       }
+      if (doc?.kind === 'scene') return this.sceneKeys(e, doc, handled);
       if (!r) return;
       if (key === ' ') return handled(), ws.togglePlay();
       const nudge = (dx: number, dy: number) => {
@@ -969,6 +1131,60 @@ export class App {
         ws.emit('change');
       }
     });
+  }
+
+  private sceneKeys(e: KeyboardEvent, doc: SceneDocument, handled: () => void) {
+    const ws = this.ws;
+    const key = e.key;
+    const li = doc.ui.layer;
+    const step = e.shiftKey ? 10 : 1;
+    if (key === ' ') return handled(), ws.togglePlay();
+    if (e.altKey && key.startsWith('Arrow')) {
+      handled();
+      const d: Record<string, [number, number]> = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+      this.viewport.sceneStage.nudge(doc, ...d[key]);
+      return;
+    }
+    if (key === 'ArrowLeft' || key === ',') return handled(), ws.stepFrame(-1);
+    if (key === 'ArrowRight' || key === '.') return handled(), ws.stepFrame(1);
+    if (key === 'ArrowUp' || key === 'ArrowDown') {
+      handled();
+      const n = doc.state.layers.length;
+      if (!n) return;
+      // The timeline lists the top layer first, so "down" goes to a lower index.
+      doc.ui.layer = li < 0 ? n - 1 : Math.max(0, Math.min(n - 1, li + (key === 'ArrowUp' ? 1 : -1)));
+      doc.ui.cue = null;
+      ws.emit('change');
+      return;
+    }
+    if (key === 'Home') return handled(), ws.setFrame(0);
+    if (key === 'End') return handled(), ws.setFrame(doc.state.length - 1);
+    if (key === 'F6' && e.shiftKey) return handled(), this.sceneKey('clear');
+    if (key === 'F6') return handled(), this.sceneKey('insert');
+    if (key === 'F7') return handled(), this.sceneKey('blank');
+    if (key === 'k' || key === 'K') return handled(), this.sceneKey('toggle');
+    if (key === 'F5') {
+      handled();
+      if (e.shiftKey) doc.shiftFrames(doc.ui.frame, -1);
+      else doc.shiftFrames(doc.ui.frame + 1, 1);
+      ws.emit('change');
+      return;
+    }
+    if (key === 'F2' && li >= 0) return handled(), void this.renameLayer(doc, li);
+    if ((key === ']' || key === '[') && li >= 0) return handled(), doc.moveLayer(li, li + (key === ']' ? 1 : -1)), ws.emit('change');
+    if (key === 'h' && li >= 0) {
+      handled();
+      const uid = doc.state.layers[li].uid;
+      if (!doc.ui.hidden.delete(uid)) doc.ui.hidden.add(uid);
+      ws.emit('change');
+      return;
+    }
+    if (key === 'Delete' || key === 'Backspace') {
+      handled();
+      if (doc.ui.cue) doc.removeSoundCue(doc.ui.cue.uid);
+      else if (li >= 0) doc.removeLayer(li);
+      ws.emit('change');
+    }
   }
 
   // ------------------------------------------------------------ help

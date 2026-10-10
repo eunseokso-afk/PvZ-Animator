@@ -396,6 +396,20 @@ export class AssetLibrary extends EventTarget {
     return undefined;
   }
 
+  /** Promise for a (cached) reanim definition. */
+  reanimAsync(path: string): Promise<ReanimDefinition | null> {
+    const cached = this.reanim(path);
+    if (cached !== undefined) return Promise.resolve(cached);
+    return this.reanims.get(pathKey(path)) ?? Promise.resolve(null);
+  }
+
+  /** Promise for a (cached) particle definition. */
+  particleAsync(path: string): Promise<ParticleDefinition | null> {
+    const cached = this.particle(path);
+    if (cached !== undefined) return Promise.resolve(cached);
+    return this.particles.get(pathKey(path)) ?? Promise.resolve(null);
+  }
+
   particle(path: string): ParticleDefinition | null | undefined {
     const key = pathKey(path);
     if (this.particleCache.has(key)) return this.particleCache.get(key);

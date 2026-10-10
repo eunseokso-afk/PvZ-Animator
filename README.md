@@ -30,6 +30,17 @@ included in this repository.
 - **Sound cues**: place sounds on the timeline (with waveforms) and hear them during playback.
 - **Particle cues**: attach particle effects to a frame and optionally to a part so they follow it.
 
+**Scenes (Adobe Animate style)**
+- Reanims are **prefabs**: drag one from the library onto a scene's stage to create an instance.
+  Particle effects and images can be placed the same way, and sounds go on the scene's sound lane.
+- Each layer has keyframes for position, rotation, scale, flip, alpha, tint and visibility, tweened with
+  easing. A key also chooses which of the prefab's animations plays (`anim_idle`, `anim_shoot`…), with
+  loop / play-once / single-frame modes, speed and first frame — like a graphic symbol's looping options.
+- Animate-style timeline: F6 keyframe, F7 blank keyframe, F5 insert frame, drag keys, onion skin.
+- Double-click an instance to edit its prefab; a breadcrumb leads back and edits show up live.
+- Several scenes per project (Scenes tab), saved in project files. **Bake** turns a scene into a single
+  `.reanim` (every part of every instance becomes a track) that the game can play as `anim_scene`.
+
 **Particle editor**
 - Edits every emitter property: float tracks (`5`, `[min max]`, `1,80 0`, `EaseIn 0 1` …) with live
   validation and curve previews, flags, emitter shapes, image strips, particle and system fields.

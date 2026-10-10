@@ -6,6 +6,7 @@
 import { encodeWav } from './formats/au';
 import { DEFAULT_TRANSFORM, serializeReanimXml, type ReanimTransform } from './formats/reanim';
 import { ReanimDocument } from './editor/reanimDoc';
+import { SceneDocument } from './editor/sceneDoc';
 import type { Workspace } from './editor/workspace';
 
 async function png(w: number, h: number, draw: (ctx: CanvasRenderingContext2D) => void): Promise<Uint8Array> {
@@ -240,6 +241,26 @@ function buildReanim(): ReanimDocument {
   return doc;
 }
 
+/** A small scene using the demo prefab twice, a particle effect and a sound. */
+function buildScene(): SceneDocument {
+  const scene = SceneDocument.create('Demo Scene');
+  const s = scene.state;
+  s.length = 90;
+  s.fps = 30;
+  const plant = 'reanim/DemoPlant.reanim';
+  const walker = scene.addLayer('reanim', plant, 'Wandering plant', { x: 120, y: 330, anim: 'anim_idle', scaleX: 1.4, scaleY: 1.4, ease: 'easeInOut' }, 0);
+  scene.setKey(walker, 45, { x: 300, y: 300, rotation: -8, ease: 'easeInOut' });
+  scene.setKey(walker, 89, { x: 120, y: 330, rotation: 0 });
+  const shooter = scene.addLayer('reanim', plant, 'Shooter', { x: 640, y: 300, anim: 'anim_shoot', flipX: true, scaleX: 1.6, scaleY: 1.6 }, 0);
+  scene.setKey(shooter, 60, { tint: [1, 0.8, 0.8] });
+  scene.addLayer('particle', 'particles/DemoSparkle.xml', 'Sparkle', { x: 470, y: 250 }, 30);
+  scene.addSoundCue(30, 'sounds/demo_pop.wav', 0.9);
+  scene.clearHistory();
+  scene.markSaved();
+  scene.ui.layer = -1;
+  return scene;
+}
+
 export async function loadDemoAssets(ws: Workspace): Promise<void> {
   const files = [...(await makeImages()), ...makeSounds()];
   files.push({ path: 'particles/DemoSparkle.xml', data: new TextEncoder().encode(PARTICLE_XML) });
@@ -247,5 +268,6 @@ export async function loadDemoAssets(ws: Workspace): Promise<void> {
   files.push({ path: 'reanim/DemoPlant.reanim', data: new TextEncoder().encode(serializeReanimXml(reanim.toDefinition(true))) });
   await ws.assets.importFiles(files, 'demo');
   await ws.openAsset('reanim/DemoPlant.reanim');
-  ws.status('Loaded demo assets: a reanim with idle/shoot animations, a particle effect and two sounds.', 'success');
+  ws.addScene(buildScene());
+  ws.status('Loaded demo assets: a prefab with idle/shoot animations, a particle effect, two sounds and a demo scene (see the Scenes tab).', 'success');
 }

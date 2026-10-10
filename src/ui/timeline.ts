@@ -26,7 +26,7 @@ type Row =
 
 const ANIM_COLORS = ['#4f9dde', '#e08a3c', '#53b86a', '#c95fb8', '#d4c14a', '#5fc4c4', '#e0606a', '#8a7be0'];
 
-const C = {
+export const C = {
   bg: '#1d2027',
   rowAlt: '#21252d',
   names: '#262a33',
@@ -1054,7 +1054,7 @@ export class Timeline {
 const envelopes = new WeakMap<AudioBuffer, Float32Array>();
 
 /** Peak amplitude at 200 points per second (cached per buffer). */
-function envelopeOf(buf: AudioBuffer): Float32Array {
+export function envelopeOf(buf: AudioBuffer): Float32Array {
   let env = envelopes.get(buf);
   if (env) return env;
   const step = Math.max(1, Math.floor(buf.sampleRate / 200));
@@ -1076,7 +1076,7 @@ function toggle(set: Set<number>, v: number) {
   else set.add(v);
 }
 
-function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+export function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   r = Math.min(r, w / 2, h / 2);
   ctx.beginPath();
   ctx.moveTo(x + r, y);

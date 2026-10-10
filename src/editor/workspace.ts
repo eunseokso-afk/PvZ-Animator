@@ -11,10 +11,14 @@ import { interpolateTransform, isFullLastFrame, isLooping, transformMatrix, type
 import { basename, stripExt } from '../engine/vfs';
 import type { ParticleDefinition } from '../formats/particles';
 import type { ReanimTransform } from '../formats/reanim';
+import type { Prefab } from '../engine/sceneRuntime';
 import { ParticleDocument } from './particleDoc';
-import { ReanimDocument, type ParticleCue } from './reanimDoc';
+import { ReanimDocument, type ParticleCue, type SoundCue } from './reanimDoc';
+import { SceneDocument, type LayerPose, type SceneLayer } from './sceneDoc';
 
-export type EditorDocument = ReanimDocument | ParticleDocument;
+export type EditorDocument = ReanimDocument | ParticleDocument | SceneDocument;
+/** Documents with a frame timeline. */
+export type TimedDocument = ReanimDocument | SceneDocument;
 
 export type WsEvent = 'docs' | 'change' | 'frame' | 'assets' | 'status' | 'settings';
 
@@ -52,6 +56,14 @@ interface LiveSystem {
   sys: ParticleSystem;
 }
 
+interface SceneParticle {
+  sys: ParticleSystem;
+  ticks: number;
+  trigger: number;
+  def: ParticleDefinition;
+  rev: number;
+}
+
 interface PreviewSystem {
   sys: ParticleSystem;
   ticks: number;
@@ -83,6 +95,12 @@ export class Workspace extends EventTarget {
 
   live: LiveSystem[] = [];
   private previews = new Map<number, PreviewSystem>();
+  private sceneParticleCache = new Map<number, SceneParticle>();
+
+  /** All scenes of the project (they stay here when their tab is closed). */
+  scenes: SceneDocument[] = [];
+  /** Prefab documents opened from a scene ("edit in place"), for the breadcrumb back. */
+  readonly returnTo = new WeakMap<EditorDocument, SceneDocument>();
 
   constructor() {
     super();
@@ -125,6 +143,52 @@ export class Workspace extends EventTarget {
     return this.active?.kind === 'particle' ? this.active : null;
   }
 
+  get scene(): SceneDocument | null {
+    return this.active?.kind === 'scene' ? this.active : null;
+  }
+
+  /** The active document if it has a timeline. */
+  get timed(): TimedDocument | null {
+    return this.reanim ?? this.scene;
+  }
+
+  newScene(): SceneDocument {
+    let n = this.scenes.length + 1;
+    while (this.scenes.some((s) => s.name.toLowerCase() === `scene ${n}`)) n++;
+    const doc = SceneDocument.create(`Scene ${n}`);
+    this.addScene(doc);
+    this.openDoc(doc);
+    return doc;
+  }
+
+  addScene(doc: SceneDocument): void {
+    if (!this.scenes.includes(doc)) this.scenes.push(doc);
+    this.emit('docs');
+  }
+
+  deleteScene(doc: SceneDocument): void {
+    this.scenes = this.scenes.filter((s) => s !== doc);
+    this.closeDoc(doc);
+    this.emit('docs');
+  }
+
+  /** Prefab data for a reanim path, preferring an open (possibly edited) document. */
+  prefab(path: string): Prefab | null | undefined {
+    const doc = this.findDoc(path);
+    if (doc?.kind === 'reanim') return { fps: doc.fps, tracks: doc.state.tracks };
+    const def = this.assets.reanim(path);
+    return def ? { fps: def.fps, tracks: def.tracks } : def;
+  }
+
+  /** Open a prefab's reanim for editing, remembering the scene to return to. */
+  async editPrefab(path: string, from: SceneDocument): Promise<void> {
+    const doc = await this.openAsset(path);
+    if (doc) {
+      this.returnTo.set(doc, from);
+      this.emit('docs');
+    }
+  }
+
   openDoc(doc: EditorDocument): void {
     if (!this.docs.includes(doc)) this.docs.push(doc);
     this.setActive(doc);
@@ -139,6 +203,7 @@ export class Workspace extends EventTarget {
     this.emit('change');
   }
 
+  /** Close a tab. Scenes stay in the project's scene list. */
   closeDoc(doc: EditorDocument): void {
     const i = this.docs.indexOf(doc);
     if (i < 0) return;
@@ -232,7 +297,26 @@ export class Workspace extends EventTarget {
     return { before: f, after: f, fraction: 0 };
   }
 
+  /** Current (fractional while playing) frame of a scene. */
+  sceneFrame(doc: SceneDocument): number {
+    if (this.playing && doc === this.active) return Math.min(this.playhead, doc.state.length - 1);
+    return clamp(doc.ui.frame, 0, doc.state.length - 1);
+  }
+
   play(): void {
+    const scene = this.scene;
+    if (scene && !this.playing) {
+      let f = scene.ui.frame;
+      if (f >= scene.state.length - 1) f = 0;
+      this.playhead = f;
+      this.clock = 0;
+      this.playing = true;
+      this.firstTick = true;
+      this.audio.context;
+      this.resumeCueSounds(scene.state.soundCues, scene.fps, f, 0);
+      this.emit('change');
+      return;
+    }
     const doc = this.reanim;
     if (!doc || this.playing) return;
     const { start, end } = doc.activeRange();
@@ -251,13 +335,16 @@ export class Workspace extends EventTarget {
 
   /** When playback starts mid-animation, pick up sounds that would already be playing. */
   private resumeSounds(doc: ReanimDocument, frame: number): void {
+    this.resumeCueSounds(doc.state.soundCues, doc.fps, frame, doc.activeRange().start);
+  }
+
+  private resumeCueSounds(cues: SoundCue[], fps: number, frame: number, start: number): void {
     if (!this.soundEnabled) return;
-    const { start } = doc.activeRange();
-    for (const cue of doc.state.soundCues) {
+    for (const cue of cues) {
       if (cue.frame >= frame || cue.frame < start) continue;
       const file = this.assets.resolveSound(cue.sound);
       const buf = file ? this.audio.peek(file) : null;
-      const offset = (frame - cue.frame) / doc.fps;
+      const offset = (frame - cue.frame) / fps;
       if (buf && offset < buf.duration) this.audio.play(buf, cue.volume, offset);
     }
   }
@@ -267,7 +354,7 @@ export class Workspace extends EventTarget {
     this.playing = false;
     this.live = [];
     this.previews.clear();
-    const doc = this.reanim;
+    const doc = this.timed;
     if (doc) doc.ui.frame = doc.ui.frameEnd = clamp(Math.floor(this.playhead), 0, doc.frameCount - 1);
     this.emit('change');
   }
@@ -278,7 +365,7 @@ export class Workspace extends EventTarget {
   }
 
   setFrame(frame: number, extend = false): void {
-    const doc = this.reanim;
+    const doc = this.timed;
     if (!doc) return;
     if (this.playing) this.pause();
     const f = clamp(Math.round(frame), 0, doc.frameCount - 1);
@@ -288,9 +375,9 @@ export class Workspace extends EventTarget {
   }
 
   stepFrame(delta: number): void {
-    const doc = this.reanim;
+    const doc = this.timed;
     if (!doc) return;
-    const { start, end } = doc.activeRange();
+    const { start, end } = doc.kind === 'reanim' ? doc.activeRange() : { start: 0, end: doc.state.length - 1 };
     let f = doc.ui.frame + delta;
     if (f > end) f = start;
     if (f < start) f = end;
@@ -300,6 +387,11 @@ export class Workspace extends EventTarget {
   /** Advance playback and particle previews by dt seconds. */
   update(dt: number): boolean {
     let changed = false;
+    const scene = this.scene;
+    if (scene && this.playing) {
+      this.updateScene(scene, dt);
+      changed = true;
+    }
     const doc = this.reanim;
     if (doc && this.playing) {
       const { start, end } = doc.activeRange();
@@ -353,21 +445,76 @@ export class Workspace extends EventTarget {
     return changed;
   }
 
+  private updateScene(scene: SceneDocument, dt: number): void {
+    const end = scene.state.length;
+    const prev = this.playhead;
+    let next = prev + dt * scene.fps * this.speed;
+    const inclusive = this.firstTick;
+    this.firstTick = false;
+    if (next >= end) {
+      this.playSoundCues(scene.state.soundCues, prev, end, inclusive);
+      if (scene.ui.loopPlayback && end > 1) {
+        next %= end;
+        this.playSoundCues(scene.state.soundCues, -1e-9, next, false);
+        this.sceneParticleCache.clear();
+      } else {
+        this.playhead = end - 1;
+        this.playing = false;
+        scene.ui.frame = scene.ui.frameEnd = end - 1;
+        this.emit('change');
+        return;
+      }
+    } else {
+      this.playSoundCues(scene.state.soundCues, prev, next, inclusive);
+    }
+    this.playhead = next;
+    scene.ui.frame = scene.ui.frameEnd = clamp(Math.floor(next), 0, end - 1);
+    this.clock += dt * this.speed;
+  }
+
+  private playSoundCues(cues: SoundCue[], from: number, to: number, inclusive: boolean): void {
+    if (!this.soundEnabled) return;
+    for (const cue of cues) {
+      if (!((inclusive ? cue.frame >= from : cue.frame > from) && cue.frame <= to)) continue;
+      const file = this.assets.resolveSound(cue.sound);
+      if (!file) continue;
+      const buf = this.audio.peek(file);
+      if (buf) this.audio.play(buf, cue.volume);
+      else
+        void this.audio.load(file).then((b) => {
+          if (b && this.playing) this.audio.play(b, cue.volume);
+        });
+    }
+  }
+
+  /**
+   * The particle system of a scene's particle layer at a frame, simulated
+   * deterministically from the start of the layer's current run.
+   */
+  sceneParticles(scene: SceneDocument, layer: SceneLayer, pose: LayerPose, frame: number): ParticleSystem | null {
+    const def = this.particleDef(layer.source);
+    if (!def) return null;
+    const source = this.findDoc(layer.source);
+    const rev = source?.kind === 'particle' ? source.revision : -1;
+    const trigger = pose.segmentStart;
+    const target = Math.round(((frame - trigger) / scene.fps) * 100);
+    let p = this.sceneParticleCache.get(layer.uid);
+    if (!p || p.def !== def || p.rev !== rev || p.trigger !== trigger || p.ticks > target) {
+      p = { sys: new ParticleSystem(def, pose.x, pose.y, seededRandom(layer.uid * 7919 + trigger)), ticks: 0, trigger, def, rev };
+      this.sceneParticleCache.set(layer.uid, p);
+    }
+    p.sys.setPosition(pose.x, pose.y);
+    let budget = 3000;
+    while (p.ticks < target && budget-- > 0) {
+      p.sys.tick();
+      p.ticks++;
+    }
+    return p.sys.dead ? null : p.sys;
+  }
+
   private fireCues(doc: ReanimDocument, from: number, to: number, inclusive: boolean): void {
     const hit = (f: number) => (inclusive ? f >= from : f > from) && f <= to;
-    if (this.soundEnabled) {
-      for (const cue of doc.state.soundCues) {
-        if (!hit(cue.frame)) continue;
-        const file = this.assets.resolveSound(cue.sound);
-        if (!file) continue;
-        const buf = this.audio.peek(file);
-        if (buf) this.audio.play(buf, cue.volume);
-        else
-          void this.audio.load(file).then((b) => {
-            if (b && this.playing) this.audio.play(b, cue.volume);
-          });
-      }
-    }
+    this.playSoundCues(doc.state.soundCues, from, to, inclusive);
     for (const cue of doc.state.particleCues) {
       if (!hit(cue.frame)) continue;
       const def = this.particleDef(cue.particle);
@@ -429,5 +576,6 @@ export class Workspace extends EventTarget {
 
   invalidatePreviews(): void {
     this.previews.clear();
+    this.sceneParticleCache.clear();
   }
 }

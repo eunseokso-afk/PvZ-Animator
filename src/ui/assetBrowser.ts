@@ -2,19 +2,21 @@
 
 import type { AssetKind } from '../engine/assets';
 import { basename, dirname, type VFile } from '../engine/vfs';
+import type { SceneDocument } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
 import { formatBytes, h, rafThrottle } from './dom';
 import { previewSound, thumbnail } from './pickers';
 import { ASSET_MIME } from './viewport';
 
-type Tab = AssetKind | 'all';
+type Tab = AssetKind | 'all' | 'scenes';
 
-const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: 'reanim', label: 'Reanims', icon: '▶' },
-  { id: 'particle', label: 'Particles', icon: '✦' },
-  { id: 'image', label: 'Images', icon: '▣' },
-  { id: 'sound', label: 'Sounds', icon: '♪' },
-  { id: 'all', label: 'All', icon: '≡' },
+const TABS: { id: Tab; label: string; icon: string; title: string }[] = [
+  { id: 'scenes', label: 'Scenes', icon: '🎬', title: 'Scenes: stages where prefabs are placed and animated' },
+  { id: 'reanim', label: 'Prefabs', icon: '▶', title: 'Prefabs (reanim animations): drag onto a scene, double-click to edit' },
+  { id: 'particle', label: 'Particles', icon: '✦', title: 'Particle effects' },
+  { id: 'image', label: 'Images', icon: '▣', title: 'Images' },
+  { id: 'sound', label: 'Sounds', icon: '♪', title: 'Sounds' },
+  { id: 'all', label: 'All', icon: '≡', title: 'All files' },
 ];
 
 const ROW_H = 26;
@@ -28,6 +30,8 @@ export interface AssetBrowserHooks {
   loadDemo(): void;
   assetMenu(file: VFile, kind: AssetKind, e: MouseEvent): void;
   activate(file: VFile, kind: AssetKind): void;
+  newScene(): void;
+  sceneMenu(scene: SceneDocument, e: MouseEvent): void;
 }
 
 export class AssetBrowser {
@@ -96,6 +100,12 @@ export class AssetBrowser {
     new ResizeObserver(() => this.renderWindow()).observe(this.scroller);
     const refresh = rafThrottle(() => this.refresh());
     ws.on('assets', refresh);
+    const refreshScenes = rafThrottle(() => {
+      const sig = this.scenesSig();
+      if (sig !== this.lastScenes) this.refresh(true);
+    });
+    ws.on('docs', refreshScenes);
+    ws.on('change', refreshScenes);
     this.refresh(true);
   }
 
@@ -105,10 +115,18 @@ export class AssetBrowser {
     this.refresh(true);
   }
 
+  private lastScenes = '';
+
+  private scenesSig(): string {
+    const ws = this.ws;
+    return ws.scenes.map((s) => `${s.id}:${s.name}:${s.dirty}:${s.state.layers.length}:${ws.active === s}`).join('|');
+  }
+
   refresh(force = false): void {
     const vfs = this.ws.assets.vfs;
     if (!force && vfs.version === this.lastVersion) return;
     this.lastVersion = vfs.version;
+    this.lastScenes = this.scenesSig();
     const all = this.ws.assets.list();
     const counts = new Map<Tab, number>();
     for (const f of all) {
@@ -116,17 +134,24 @@ export class AssetBrowser {
       counts.set(k, (counts.get(k) ?? 0) + 1);
     }
     counts.set('all', all.length);
+    counts.set('scenes', this.ws.scenes.length);
     this.tabsEl.replaceChildren(
       ...TABS.map((t) =>
         h(
           'button',
-          { class: `asset-tab${t.id === this.tab ? ' active' : ''}`, title: t.label, onclick: () => this.setTab(t.id) },
+          { class: `asset-tab${t.id === this.tab ? ' active' : ''}`, title: t.title, onclick: () => this.setTab(t.id) },
           h('span', { class: 'tab-icon' }, t.icon),
           h('span', { class: 'tab-label' }, t.label),
           h('span', { class: 'tab-count' }, String(counts.get(t.id) ?? 0)),
         ),
       ),
     );
+    if (this.tab === 'scenes') {
+      this.welcome.style.display = 'none';
+      this.scroller.style.display = '';
+      this.renderScenes();
+      return;
+    }
     const q = this.query;
     // compiled/reanim/X.reanim.compiled is a cache of reanim/X.reanim; only list it when the XML is missing.
     const duplicate = (f: VFile) => {
@@ -147,7 +172,41 @@ export class AssetBrowser {
     return this.tab === 'image';
   }
 
+  private renderScenes() {
+    const ws = this.ws;
+    const q = this.query;
+    const scenes = ws.scenes.filter((s) => !q || s.name.toLowerCase().includes(q));
+    this.inner.style.height = 'auto';
+    this.inner.replaceChildren(
+      h('button', { class: 'btn small scene-new', onclick: () => this.hooks.newScene() }, '＋ New scene'),
+      ...scenes.map((s) => {
+        const st = s.state;
+        const row = h(
+          'div',
+          {
+            class: `scene-row${ws.active === s ? ' sel' : ''}`,
+            title: 'Click to open · right-click for more',
+            onclick: () => ws.openDoc(s),
+            oncontextmenu: (e: MouseEvent) => {
+              e.preventDefault();
+              this.hooks.sceneMenu(s, e);
+            },
+          },
+          h('span', { class: 'scene-icon' }, '🎬'),
+          h('div', { class: 'scene-text' }, h('div', { class: 'scene-name' }, s.name + (s.dirty ? ' •' : '')), h('div', { class: 'dim small' }, `${st.width}×${st.height} · ${st.layers.length} layer${st.layers.length === 1 ? '' : 's'} · ${(st.length / st.fps).toFixed(1)} s`)),
+        );
+        return row;
+      }),
+      ...(scenes.length === 0
+        ? [h('p', { class: 'dim small scene-help' }, 'A scene is a stage where you place prefabs (reanims), particle effects and images as layers and animate them with keyframes — like Adobe Animate. Create one, then drag prefabs from the Prefabs tab onto it.')]
+        : []),
+    );
+    this.summary.textContent = `${ws.scenes.length} scene${ws.scenes.length === 1 ? '' : 's'} in this project`;
+  }
+
   private renderWindow() {
+    if (this.tab === 'scenes') return;
+    this.inner.style.height = '';
     const width = this.scroller.clientWidth || 240;
     const cols = this.gridMode ? Math.max(1, Math.floor(width / CELL_W)) : 1;
     const rowH = this.gridMode ? CELL_H : ROW_H;

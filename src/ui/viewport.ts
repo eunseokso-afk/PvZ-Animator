@@ -13,6 +13,7 @@ import type { ParticleDocument } from '../editor/particleDoc';
 import type { ReanimDocument } from '../editor/reanimDoc';
 import type { EditorDocument, Workspace } from '../editor/workspace';
 import { h } from './dom';
+import { SceneStage } from './sceneStage';
 import { showMenu, type MenuItem } from './widgets';
 
 export const ASSET_MIME = 'application/x-pvz-asset';
@@ -23,7 +24,8 @@ type Drag =
   | { kind: 'rotate'; track: number; frame: number; start: ReanimTransform; w: number; h: number; startAngle: number; pivot: [number, number] }
   | { kind: 'scale'; track: number; frame: number; start: ReanimTransform; w: number; h: number; corner: [number, number]; inv: Mat; pivot: [number, number] }
   | { kind: 'emitter'; sx: number; sy: number; ox: number; oy: number }
-  | { kind: 'cue'; uid: number; sx: number; sy: number; began: boolean };
+  | { kind: 'cue'; uid: number; sx: number; sy: number; began: boolean }
+  | { kind: 'scene' };
 
 const BACKGROUNDS: Record<string, string> = {
   dark: '#23262e',
@@ -56,6 +58,8 @@ export class Viewport {
   private lastT = 0;
   private preview: { doc: ParticleDocument; revision: number; sys: ParticleSystem; deadFor: number } | null = null;
   private cueScreen: { uid: number; x: number; y: number }[] = [];
+  private crumbs: HTMLElement;
+  readonly sceneStage: SceneStage;
 
   constructor(
     private ws: Workspace,
@@ -68,8 +72,14 @@ export class Viewport {
     this.info = h('div', { class: 'stage-info' });
     this.empty = h('div', { class: 'stage-empty' }, actions.welcome);
     this.stage = h('div', { class: 'stage' }, this.bgCanvas, this.glCanvas, this.ovCanvas, this.info, this.empty);
-    this.el = h('div', { class: 'viewport' }, this.tabs, this.stage);
+    this.crumbs = h('div', { class: 'crumbs' });
+    this.el = h('div', { class: 'viewport' }, this.tabs, this.crumbs, this.stage);
     this.renderer = createRenderer(this.glCanvas);
+    this.sceneStage = new SceneStage(ws, {
+      view: (d) => this.viewMatrix(d),
+      toStage: (d, x, y) => this.toWorld(d, x, y),
+      invalidate: () => this.invalidate(),
+    });
 
     new ResizeObserver(() => this.resize()).observe(this.stage);
     this.bindInput();
@@ -127,7 +137,7 @@ export class Viewport {
               } else if (e.button === 0) ws.setActive(d);
             },
           },
-          h('span', { class: `doc-kind ${d.kind}` }, d.kind === 'reanim' ? '▶' : '✦'),
+          h('span', { class: `doc-kind ${d.kind}` }, d.kind === 'reanim' ? '▶' : d.kind === 'scene' ? '🎬' : '✦'),
           h('span', { class: 'doc-name' }, d.name + (d.dirty ? ' •' : '')),
           h(
             'button',
@@ -146,6 +156,25 @@ export class Viewport {
       ),
     );
     this.empty.style.display = ws.active ? 'none' : '';
+    this.renderCrumbs();
+  }
+
+  /** "Scene › Prefab" breadcrumb while editing a prefab opened from a scene. */
+  private renderCrumbs() {
+    const ws = this.ws;
+    const doc = ws.active;
+    const scene = doc ? ws.returnTo.get(doc) : undefined;
+    if (!doc || !scene || !ws.scenes.includes(scene)) {
+      this.crumbs.style.display = 'none';
+      return;
+    }
+    this.crumbs.style.display = '';
+    this.crumbs.replaceChildren(
+      h('button', { class: 'btn small', title: `Back to ${scene.name}`, onclick: () => ws.openDoc(scene) }, `⬅ ${scene.name}`),
+      h('span', { class: 'crumb' }, '🎬 ', scene.name),
+      h('span', { class: 'crumb-sep' }, '›'),
+      h('span', { class: 'crumb current' }, '▶ ', doc.name, h('span', { class: 'dim' }, '  (prefab — changes show up in the scene)')),
+    );
   }
 
   /** Overridden by the app to confirm closing unsaved documents. */
@@ -182,6 +211,12 @@ export class Viewport {
     const doc = this.ws.active;
     if (!doc) return true;
     const v = doc.view;
+    if (doc.kind === 'scene') {
+      this.sceneStage.fit(doc, this.cssW, this.cssH);
+      this.invalidate();
+      this.ws.emit('settings');
+      return true;
+    }
     if (doc.kind === 'particle') {
       v.zoom = 1;
       v.panX = 0;
@@ -295,6 +330,7 @@ export class Viewport {
     this.drawn = [];
     if (doc?.kind === 'reanim') this.renderReanim(doc);
     else if (doc?.kind === 'particle') this.preview?.sys.draw(r, this.ws.assets, this.viewMatrix(doc));
+    else if (doc?.kind === 'scene') this.sceneStage.render(doc, r);
     r.end();
     this.renderOverlay(doc);
   }
@@ -397,9 +433,12 @@ export class Viewport {
       return;
     }
     if (doc.kind === 'reanim') this.overlayReanim(ctx, doc);
+    else if (doc.kind === 'scene') this.sceneStage.overlay(ctx, doc, this.cssW, this.cssH);
     else this.overlayParticle(ctx, doc);
     const zoom = Math.round(doc.view.zoom * 100);
-    if (doc.kind === 'reanim') {
+    if (doc.kind === 'scene') {
+      this.info.textContent = `frame ${Math.floor(this.ws.sceneFrame(doc))} · ${doc.state.width}×${doc.state.height} · ${zoom}%`;
+    } else if (doc.kind === 'reanim') {
       const ft = this.ws.frameTime(doc);
       this.info.textContent = `frame ${ft.before}${doc.ui.anim ? ` · ${doc.ui.anim}` : ''} · ${zoom}%`;
     } else {
@@ -613,9 +652,17 @@ export class Viewport {
     ov.addEventListener('pointerup', (e) => this.onUp(e));
     ov.addEventListener('pointercancel', (e) => this.onUp(e));
     ov.addEventListener('pointerleave', () => {
-      if (this.hoverTrack !== -1) {
+      if (this.hoverTrack !== -1 || this.sceneStage.hover !== -1) {
         this.hoverTrack = -1;
+        this.sceneStage.hover = -1;
         this.invalidate();
+      }
+    });
+    ov.addEventListener('dblclick', (e) => {
+      const doc = this.ws.active;
+      if (doc?.kind === 'scene') {
+        const [x, y] = this.localPos(e);
+        this.sceneStage.dblclick(doc, x, y);
       }
     });
     ov.addEventListener(
@@ -669,6 +716,11 @@ export class Viewport {
       return;
     }
     if (e.button !== 0) return;
+    if (doc.kind === 'scene') {
+      if (this.sceneStage.down(doc, x, y)) this.drag = { kind: 'scene' };
+      else this.drag = { kind: 'pan', sx: x, sy: y, px: doc.view.panX, py: doc.view.panY, moved: false, button: 0, hit: -1 };
+      return;
+    }
     if (doc.kind === 'particle') {
       const [ox, oy] = apply(this.viewMatrix(doc), doc.ui.x, doc.ui.y);
       if (Math.hypot(ox - x, oy - y) < 14) {
@@ -749,10 +801,15 @@ export class Viewport {
       } else if (doc.kind === 'particle') {
         const [ox, oy] = apply(this.viewMatrix(doc), doc.ui.x, doc.ui.y);
         this.ovCanvas.style.cursor = Math.hypot(ox - x, oy - y) < 14 ? 'move' : 'default';
+      } else if (doc.kind === 'scene' && !this.ws.playing) {
+        this.ovCanvas.style.cursor = this.sceneStage.cursor(doc, x, y);
       }
       return;
     }
     switch (drag.kind) {
+      case 'scene':
+        if (doc.kind === 'scene') this.sceneStage.move(doc, x, y, e.shiftKey);
+        break;
       case 'pan': {
         const dx = x - drag.sx;
         const dy = y - drag.sy;
@@ -859,10 +916,15 @@ export class Viewport {
     const doc = this.ws.active;
     if (!drag || !doc) return;
     const [x, y] = this.localPos(e);
+    if (drag.kind === 'scene') this.sceneStage.up();
     if (drag.kind === 'pan' && !drag.moved) {
       if (drag.button === 2) this.contextMenu(e, x, y);
       else if (drag.button === 0 && doc.kind === 'reanim' && (doc.ui.track !== -1 || doc.ui.cue)) {
         doc.ui.track = -1;
+        doc.ui.cue = null;
+        this.ws.emit('change');
+      } else if (drag.button === 0 && doc.kind === 'scene' && (doc.ui.layer !== -1 || doc.ui.cue)) {
+        doc.ui.layer = -1;
         doc.ui.cue = null;
         this.ws.emit('change');
       }
@@ -879,6 +941,14 @@ export class Viewport {
         doc.ui.track = hit;
         this.ws.emit('change');
         items.push(...this.trackMenu(doc, hit), { separator: true });
+      }
+    } else if (doc?.kind === 'scene') {
+      const hit = this.sceneStage.hitLayer(doc, x, y);
+      if (hit >= 0) {
+        doc.ui.layer = hit;
+        doc.ui.cue = null;
+        this.ws.emit('change');
+        items.push(...this.sceneStage.layerMenu(doc, hit), { separator: true });
       }
     }
     items.push(
@@ -905,6 +975,12 @@ export class Viewport {
 
   /** Overridden by the app: handle assets dropped from the browser. */
   onAssetDrop(asset: { kind: string; path: string }, pos: [number, number]): void {
+    const scene = this.ws.scene;
+    if (scene) {
+      const [sx, sy] = this.toWorld(scene, pos[0], pos[1]);
+      void this.sceneStage.addAsset(scene, asset, sx, sy);
+      return;
+    }
     const doc = this.ws.reanim;
     if (!doc) return;
     const [wx, wy] = this.toWorld(doc, pos[0], pos[1]);
