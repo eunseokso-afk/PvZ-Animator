@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { defaultKey, evalLayer, poseMatrix, SceneDocument, type SceneLayer } from '../src/editor/sceneDoc';
-import { bakeScene, instanceFrameTime, type Prefab } from '../src/engine/sceneRuntime';
+import { bakeScene, instanceCueHits, instanceFrameTime, type Prefab } from '../src/engine/sceneRuntime';
 import { apply, mul } from '../src/engine/math';
 import { DEFAULT_TRANSFORM, parseReanimXml, serializeReanimXml, type ReanimTransform } from '../src/formats/reanim';
 import { transformMatrix } from '../src/engine/reanimRuntime';
@@ -94,7 +94,8 @@ describe('SceneDocument', () => {
     expect(doc.state.soundCues[0].frame).toBe(30);
     expect(doc.state.length).toBe(95);
     doc.shiftFrames(20, -10);
-    expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([0]);
+    // Like Animate, the key at 25 loses the removed frames but still starts its span (now at 20).
+    expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([0, 20]);
     expect(doc.state.soundCues[0].frame).toBe(20);
   });
 });
@@ -111,8 +112,24 @@ describe('SceneDocument editing rules', () => {
     expect(doc.state.layers[1].keys.map((k) => k.frame)).toEqual([0, 20]);
     expect(doc.state.length).toBe(93);
     doc.shiftLayerFrames(1, 20, -1);
-    expect(doc.state.layers[1].keys.map((k) => k.frame)).toEqual([0]);
+    expect(doc.state.layers[1].keys.map((k) => k.frame)).toEqual([0, 20]);
+    // A key whose span is one frame long goes when that frame is removed.
+    doc.setKey(1, 21, { x: 9 }, 'k');
+    doc.shiftLayerFrames(1, 20, -1);
+    expect(doc.state.layers[1].keys.map((k) => k.frame)).toEqual([0, 20]);
+    expect(doc.state.layers[1].keys[1].x).toBe(9);
     expect(doc.state.layers[0].keys.map((k) => k.frame)).toEqual([0, 23]);
+  });
+
+  it('never makes a layer vanish by removing frames at its first key', () => {
+    const doc = SceneDocument.create('S');
+    doc.addLayer('image', 'IMAGE_X', 'A', { x: 1 }, 0);
+    doc.setKey(0, 45, { x: 2 }, 'k');
+    doc.shiftLayerFrames(0, 0, -1);
+    expect(doc.state.layers[0].keys.map((k) => [k.frame, k.x])).toEqual([
+      [0, 1],
+      [44, 2],
+    ]);
   });
 
   it('keeps a lone key where a removed span began instead of moving it earlier', () => {
@@ -200,5 +217,32 @@ describe('bakeScene', () => {
     const { definition, warnings } = bakeScene(doc.state, { assets: new AssetLibrary(), prefab: () => prefab });
     expect(definition.tracks[1].transforms.map((t) => t.f)).toEqual([-1, -1, -1, 0, 0, 0]);
     expect(warnings.some((w) => w.includes('Particle'))).toBe(true);
+  });
+});
+
+describe('prefab cues in scenes', () => {
+  // anim_b = prefab frames 3-5 at 10 fps: one pass is 0.3 s = 9 scene frames at 30 fps.
+  const cue = { frame: 3, sound: 'sounds/x.ogg', volume: 1 };
+  const loopLayer = () => layer([{ anim: 'anim_b', loop: 'loop' }], [0]);
+
+  it('plays a cue on the first frame and on every later pass, once each', () => {
+    const l = loopLayer();
+    const hitsAt: number[] = [];
+    for (let f = 0; f < 30; f++) if (instanceCueHits(l, prefab, [cue], 30, f === 0 ? -1 : f - 1, f, f === 0).length) hitsAt.push(f);
+    expect(hitsAt).toEqual([0, 9, 18, 27]);
+    // A cue on a loop's last frame would coincide with the next pass's first frame: it does not play.
+    const end = { ...cue, frame: 5 };
+    expect([0, 9, 18].flatMap((f) => instanceCueHits(l, prefab, [end], 30, f === 0 ? -1 : f - 1, f, f === 0))).toEqual([]);
+  });
+
+  it('bakes prefab cues and fullscreen tracks', () => {
+    const doc = SceneDocument.create('S');
+    doc.state.length = 20;
+    doc.addLayer('reanim', 'reanim/P.reanim', 'P', { anim: 'anim_b', loop: 'loop' }, 0);
+    const withFill: Prefab = { ...prefab, tracks: [...prefab.tracks, { name: 'fullscreen', transforms: prefab.tracks[2].transforms.map((t) => ({ ...t, i: '', a: 0.5 })) }] };
+    const { definition, soundCues } = bakeScene(doc.state, { assets: new AssetLibrary(), prefab: () => withFill, soundCues: () => [cue] });
+    expect(soundCues.map((c) => c.frame)).toEqual([0, 9, 18]);
+    const fill = definition.tracks.find((t) => t.name === 'fullscreen');
+    expect(fill?.transforms[0]).toMatchObject({ f: 0, a: 0.5 });
   });
 });

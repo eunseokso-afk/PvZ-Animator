@@ -187,21 +187,36 @@ export function poseMatrix(p: { x: number; y: number; rotation: number; scaleX: 
   return [c * sx, s * sx, -s * sy, c * sy, p.x, p.y];
 }
 
-/** Shift a layer's keys at or after `at` by `count` frames, dropping keys in a removed span. */
+/**
+ * Shift a layer's keys at or after `at` by `count` frames. Removing frames works like
+ * Animate's Remove Frames: spans get shorter. The key in force at the end of the removed
+ * span carries on from where the span began, unless the next key starts right there.
+ */
 function shiftKeys(l: SceneLayer, at: number, count: number, length: number): void {
   if (count < 0) {
     const end = at - count;
+    const inSpan = l.keys.filter((k) => k.frame >= at && k.frame < end);
     const kept = l.keys.filter((k) => k.frame < at || k.frame >= end);
-    if (!kept.length) {
-      // Every key was in the removed span: keep the first one where the span began.
-      const first = l.keys[0];
-      first.frame = Math.max(0, Math.min(at, length - 1));
-      l.keys = [first];
-      return;
+    const carry = inSpan[inSpan.length - 1];
+    if (carry && !kept.some((k) => k.frame === end)) {
+      carry.frame = end;
+      kept.push(carry);
+      kept.sort((a, b) => a.frame - b.frame);
     }
     l.keys = kept;
   }
   for (const k of l.keys) if (k.frame >= at) k.frame = Math.max(0, k.frame + count);
+  // Keys pushed past a shorter end: keep the last of them on the last frame.
+  const past = l.keys.filter((k) => k.frame > length - 1);
+  if (past.length) {
+    const inside = l.keys.filter((k) => k.frame <= length - 1);
+    const last = past[past.length - 1];
+    if (!inside.some((k) => k.frame === length - 1)) {
+      last.frame = length - 1;
+      inside.push(last);
+    }
+    l.keys = inside.length ? inside : [last];
+  }
 }
 
 export interface SceneUiState {

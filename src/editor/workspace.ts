@@ -8,11 +8,11 @@ import { AudioEngine } from '../engine/audio';
 import { clamp, seededRandom } from '../engine/math';
 import { ParticleSystem } from '../engine/particleSystem';
 import { gameHiddenTracks } from '../engine/gameVisibility';
-import { animRangeOf, interpolateTransform, isFullLastFrame, isLooping, transformMatrix, type FrameTime } from '../engine/reanimRuntime';
+import { interpolateTransform, isFullLastFrame, isLooping, transformMatrix, type FrameTime } from '../engine/reanimRuntime';
 import { basename, stripExt } from '../engine/vfs';
 import type { ParticleDefinition } from '../formats/particles';
-import type { ReanimDefinition, ReanimTransform } from '../formats/reanim';
-import { instanceFrameTime, type Prefab } from '../engine/sceneRuntime';
+import type { ReanimTransform } from '../formats/reanim';
+import { instanceCueHits, instanceFrameTime, type Prefab } from '../engine/sceneRuntime';
 import { ParticleDocument } from './particleDoc';
 import { CUE_TRACK_NAME, decodeCues, ReanimDocument, type ParticleCue, type SoundCue } from './reanimDoc';
 import { evalLayer, SceneDocument, type LayerPose, type SceneLayer } from './sceneDoc';
@@ -163,6 +163,14 @@ export class Workspace extends EventTarget {
     this.addScene(doc);
     this.openDoc(doc);
     return doc;
+  }
+
+  /** Document versions as last saved to (or loaded from) a project file. */
+  readonly projectVersions = new WeakMap<EditorDocument, number>();
+
+  /** Whether anything changed since the project was last saved or opened. */
+  get projectChanged(): boolean {
+    return [...this.docs, ...this.scenes].some((d) => d.version !== this.projectVersions.get(d));
   }
 
   /** Close every document and scene (before opening a project). */
@@ -331,7 +339,9 @@ export class Workspace extends EventTarget {
       const { end } = doc.activeRange();
       const before = Math.min(Math.floor(this.playhead), end);
       const after = Math.min(before + 1, end);
-      return { before, after, fraction: before >= end ? 0 : this.playhead - Math.floor(this.playhead), loops: this.loops };
+      // Between the last frame and the wrap (full-last-frame loops) the frame holds, but time goes on.
+      const overrun = this.playhead > end ? this.playhead - end : 0;
+      return { before, after, fraction: before >= end ? 0 : this.playhead - Math.floor(this.playhead), loops: this.loops, ...(overrun ? { overrun } : {}) };
     }
     const f = clamp(doc.ui.frame, 0, doc.frameCount - 1);
     return { before: f, after: f, fraction: 0 };
@@ -509,7 +519,8 @@ export class Workspace extends EventTarget {
     const inclusive = this.firstTick;
     this.firstTick = false;
     if (next >= end) {
-      this.playSceneCues(scene, prev, end, inclusive);
+      // Stop just short of the end: the wrap below starts instances fresh, which plays their first cues.
+      this.playSceneCues(scene, prev, end - 1e-9, inclusive);
       if (scene.ui.loopPlayback && end > 1) {
         next %= end;
         this.playSceneCues(scene, -1e-9, next, false);
@@ -536,36 +547,12 @@ export class Workspace extends EventTarget {
       const cues = this.prefabSoundCues(layer.source);
       const prefab = cues.length ? this.prefab(layer.source) : null;
       if (!prefab) continue;
-      const pose = evalLayer(layer, Math.max(0, to));
-      if (!pose || !pose.visible || pose.key.loop === 'single') continue;
-      const range = animRangeOf({ fps: prefab.fps, tracks: prefab.tracks as ReanimDefinition['tracks'] }, pose.key.anim);
-      const last = range.count - 1;
-      // Unwrapped position in the animation (frames from its start, counting loops).
-      const raw = (f: number, p: LayerPose) => {
-        const ft = instanceFrameTime(prefab, p, scene.fps, f);
-        return ft.before - range.start + ft.fraction + (ft.loops ?? 0) * last;
-      };
-      const prevPose = from >= 0 ? evalLayer(layer, from) : null;
-      // A fresh start (layer appears or its animation restarts) plays cues on its first frame too.
-      const fresh = !prevPose || !prevPose.visible || prevPose.segmentStart !== pose.segmentStart;
-      const a = fresh ? -1e-9 : raw(from, prevPose) - (inclusive ? 1e-9 : 0);
-      const b = raw(to, pose);
-      for (const cue of cues) {
-        const rel = cue.frame - range.start;
-        if (rel < 0 || rel > last) continue;
-        let hit = a < rel && rel <= b;
-        if (!hit && pose.key.loop === 'loop' && last > 0) {
-          // Any later pass: rel + k * last inside (a, b].
-          const k = Math.ceil((a - rel) / last + 1e-9);
-          hit = k > 0 && rel + k * last <= b;
-        }
-        if (hit) this.playSoundCues([cue], -1, cue.frame, false);
-      }
+      for (const cue of instanceCueHits(layer, prefab, cues, scene.fps, from, to, inclusive)) this.playSoundCues([cue], -1, cue.frame, false);
     }
   }
 
   /** Sound cues stored with a prefab: its open document's, or the embedded cue track of the file. */
-  private prefabSoundCues(path: string): SoundCue[] {
+  prefabSoundCues(path: string): SoundCue[] {
     const doc = this.findDocFor(path);
     if (doc?.kind === 'reanim') return doc.state.soundCues;
     const def = this.assets.reanim(path);

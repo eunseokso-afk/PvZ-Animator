@@ -31,6 +31,8 @@ export interface Renderer {
    * drawn over transparency is kept visible by raising alpha to the brightest channel.
    */
   readPixels(): ImageData;
+  /** Whether the canvas really got a drawing buffer of its full size (WebGL may grant less). */
+  fits(): boolean;
 }
 
 /**
@@ -39,7 +41,8 @@ export interface Renderer {
  * that takes the original's place in the DOM; always use `renderer.canvas`.
  * `onRestored` runs after a lost WebGL context comes back, to request a redraw.
  */
-export function createRenderer(canvas: HTMLCanvasElement, onRestored?: () => void): Renderer {
+export function createRenderer(canvas: HTMLCanvasElement, onRestored?: () => void, opts: { force2d?: boolean } = {}): Renderer {
+  if (opts.force2d) return new Canvas2DRenderer(canvas);
   const gl = canvas.getContext('webgl2', { premultipliedAlpha: true, alpha: true, antialias: true, preserveDrawingBuffer: true });
   if (gl) {
     try {
@@ -279,6 +282,10 @@ class WebGLRenderer implements Renderer {
     this.gl.getExtension('WEBGL_lose_context')?.loseContext();
   }
 
+  fits(): boolean {
+    return this.lost || (this.gl.drawingBufferWidth >= this.canvas.width && this.gl.drawingBufferHeight >= this.canvas.height);
+  }
+
   readPixels(): ImageData {
     const gl = this.gl;
     const w = this.canvas.width;
@@ -358,27 +365,41 @@ class Canvas2DRenderer implements Renderer {
     else this.ctx.drawImage(this.tinted(img, sx, sy, sw, sh, color), 0, 0, sw, sh, 0, 0, sw, sh);
   }
 
-  private tintCanvas: HTMLCanvasElement | null = null;
+  /** Tinted copies of image cels, most recently used last. */
+  private tintCache = new Map<string, HTMLCanvasElement>();
 
-  /** The source rect multiplied by `color` (over-brightening is clamped; 2D canvas can't do it). */
+  /**
+   * The source rect with its colour multiplied by `color`, computed per pixel on
+   * straight-alpha values so soft edges keep their colour (composite-operation tricks
+   * leave tint-coloured halos there). Over-brightening above 1 is clamped.
+   */
   private tinted(img: LoadedImage, sx: number, sy: number, sw: number, sh: number, color: RGBA): HTMLCanvasElement {
-    const c = (this.tintCanvas ??= document.createElement('canvas'));
-    const w = Math.ceil(sw);
-    const h = Math.ceil(sh);
-    if (c.width < w) c.width = w;
-    if (c.height < h) c.height = h;
-    const t = c.getContext('2d')!;
-    t.globalCompositeOperation = 'source-over';
-    t.clearRect(0, 0, w, h);
+    const q = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 255);
+    const [r, g, b] = [q(color[0]), q(color[1]), q(color[2])];
+    const key = `${img.serial}|${sx},${sy},${sw},${sh}|${r},${g},${b}`;
+    let c = this.tintCache.get(key);
+    if (c) {
+      this.tintCache.delete(key);
+      this.tintCache.set(key, c);
+      return c;
+    }
+    c = document.createElement('canvas');
+    const w = Math.max(1, Math.ceil(sw));
+    const h = Math.max(1, Math.ceil(sh));
+    c.width = w;
+    c.height = h;
+    const t = c.getContext('2d', { willReadFrequently: true })!;
     t.drawImage(img.source, sx, sy, sw, sh, 0, 0, sw, sh);
-    t.globalCompositeOperation = 'multiply';
-    const k = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 255);
-    t.fillStyle = `rgb(${k(color[0])},${k(color[1])},${k(color[2])})`;
-    t.fillRect(0, 0, w, h);
-    // multiply fills transparent pixels too; cut back to the image's own alpha.
-    t.globalCompositeOperation = 'destination-in';
-    t.drawImage(img.source, sx, sy, sw, sh, 0, 0, sw, sh);
-    t.globalCompositeOperation = 'source-over';
+    const data = t.getImageData(0, 0, w, h);
+    const d = data.data;
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = (d[i] * r) / 255;
+      d[i + 1] = (d[i + 1] * g) / 255;
+      d[i + 2] = (d[i + 2] * b) / 255;
+    }
+    t.putImageData(data, 0, 0);
+    this.tintCache.set(key, c);
+    if (this.tintCache.size > 300) this.tintCache.delete(this.tintCache.keys().next().value!);
     return c;
   }
 
@@ -397,11 +418,15 @@ class Canvas2DRenderer implements Renderer {
   }
 
   dispose(): void {
-    this.tintCanvas = null;
+    this.tintCache.clear();
   }
 
   readPixels(): ImageData {
     return this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
+  }
+
+  fits(): boolean {
+    return true;
   }
 }
 

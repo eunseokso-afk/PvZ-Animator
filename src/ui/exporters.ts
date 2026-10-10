@@ -184,6 +184,9 @@ interface ProjectDoc {
   loop?: string;
   /** Whether the document had changes not yet in the library (missing in older projects). */
   dirty?: boolean;
+  /** Indexes of reanim tracks hidden / locked in the editor. */
+  hidden?: number[];
+  locked?: number[];
 }
 
 interface ProjectScene {
@@ -220,6 +223,7 @@ export async function saveProject(ws: Workspace): Promise<void> {
   const name = (ws.active?.name ?? 'project').replace(/[^\w.-]+/g, '_');
   downloadBlob(new Blob([JSON.stringify(project)], { type: 'application/json' }), `${name}.pvzanim.json`);
   for (const sc of ws.scenes) sc.markSaved();
+  for (const d of [...ws.docs, ...ws.scenes]) ws.projectVersions.set(d, d.version);
   ws.emit('docs');
   ws.status(`Saved project (${docs.length} documents, ${scenes.length} scenes, ${files.length} files). Re-open main.pak after loading it.`, 'success');
 }
@@ -238,6 +242,8 @@ function projectDoc(d: ReanimDocument | ParticleDocument): ProjectDoc {
     anim: d.ui.anim,
     loop: d.ui.loop,
     dirty: d.dirty,
+    hidden: tracks.flatMap((t, i) => (d.ui.hidden.has(t.uid) ? [i] : [])),
+    locked: tracks.flatMap((t, i) => (d.ui.locked.has(t.uid) ? [i] : [])),
   };
 }
 
@@ -247,7 +253,7 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
   if (p.format !== 'pvz-animator-project') throw new Error('Not a PvZ Animator project file.');
   // A project replaces the open documents and scenes instead of being merged into them.
   if (ws.docs.length || ws.scenes.length) {
-    const unsaved = ws.docs.some((d) => d.dirty) || ws.scenes.some((s) => s.dirty);
+    const unsaved = ws.projectChanged;
     if (unsaved && !(await confirmDialog('Open project', 'Opening a project closes the open documents and scenes. Unsaved changes will be lost.', 'Open project', true))) return;
     ws.reset();
   }
@@ -274,15 +280,20 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
       });
       if (d.anim !== undefined) r.ui.anim = d.anim;
       if (d.loop) r.ui.loop = d.loop as typeof r.ui.loop;
+      for (const i of d.hidden ?? []) if (r.state.tracks[i]) r.ui.hidden.add(r.state.tracks[i].uid);
+      for (const i of d.locked ?? []) if (r.state.tracks[i]) r.ui.locked.add(r.state.tracks[i].uid);
       doc = r;
     } else {
       doc = ParticleDocument.fromDefinition(parseParticleXml(d.xml), d.name, d.path);
     }
     doc.isNew = d.isNew;
-    // Unchanged documents stay unchanged (so Build main.pak doesn't repack them).
-    if (d.dirty === false && ws.assets.vfs.has(d.path)) doc.markSaved();
+    // Unchanged documents stay unchanged (so Build main.pak doesn't repack them). A document
+    // opened from a compiled reanim is edited under reanim/<name>.reanim but lives in compiled/.
+    const inLibrary = ws.assets.vfs.has(d.path) || ws.assets.vfs.has(`compiled/${d.path}.compiled`);
+    if (d.dirty === false && inLibrary) doc.markSaved();
     else doc.savedVersion = -1;
     ws.openDoc(doc);
+    ws.projectVersions.set(doc, doc.version);
   }
   for (const sc of p.scenes ?? []) {
     const state = sc.state;
@@ -298,6 +309,7 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
     for (const i of sc.hidden ?? []) if (state.layers[i]) doc.ui.hidden.add(state.layers[i].uid);
     for (const i of sc.locked ?? []) if (state.layers[i]) doc.ui.locked.add(state.layers[i].uid);
     doc.markSaved();
+    ws.projectVersions.set(doc, doc.version);
     ws.addScene(doc);
     if (sc.open) ws.openDoc(doc);
   }
@@ -328,6 +340,25 @@ class NullRenderer implements Renderer {
   readPixels(): ImageData {
     return new ImageData(1, 1);
   }
+  fits(): boolean {
+    return true;
+  }
+}
+
+/**
+ * A renderer for a w x h export. WebGL may silently grant a smaller drawing buffer for
+ * very large frames, which would corrupt the output, so fall back to Canvas 2D then.
+ */
+function exportRenderer(w: number, h: number): Renderer {
+  if (w > MAX_CANVAS_SIDE || h > MAX_CANVAS_SIDE || w * h > MAX_CANVAS_AREA) throw new Error(`${w}×${h} frames are larger than browsers can draw; choose a lower scale.`);
+  let r = createRenderer(document.createElement('canvas'));
+  r.resize(w, h, 1);
+  if (!r.fits()) {
+    r.dispose();
+    r = createRenderer(document.createElement('canvas'), undefined, { force2d: true });
+    r.resize(w, h, 1);
+  }
+  return r;
 }
 
 /** What a frame/video export renders: a reanim's active range or a whole scene. */
@@ -393,7 +424,7 @@ function measure(ws: Workspace, doc: ReanimDocument, frames: number[]): { x: num
   const nr = new NullRenderer();
   for (const f of frames) {
     const infos: DrawTrackInfo[] = [];
-    drawReanim(nr, ws.assets, doc.state.tracks, { before: f, after: f, fraction: 0 }, [1, 0, 0, 1, 0, 0], { collect: infos, fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility, hidden: ws.hiddenTracks(doc) });
+    drawReanim(nr, ws.assets, doc.state.tracks, { before: f, after: f, fraction: 0 }, [1, 0, 0, 1, 0, 0], { collect: infos, fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility, reanimFor: (p) => ws.prefab(p), hidden: ws.hiddenTracks(doc) });
     for (const info of infos) {
       for (const [cx, cy] of [
         [0, 0],
@@ -444,7 +475,7 @@ async function exportTarget(ws: Workspace): Promise<ExportTarget | null> {
     draw: (r, base, frame) => {
       const playing = ws.playing && ws.active === doc;
       const ft = playing ? ws.frameTime(doc) : { before: frame, after: frame, fraction: 0 };
-      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility });
+      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility, reanimFor: (p) => ws.prefab(p) });
       if (playing) {
         for (const l of ws.live) l.sys.draw(r, ws.assets, base);
       } else {
@@ -596,8 +627,7 @@ async function exportFramesInner(ws: Workspace): Promise<void> {
     }
     cols = layout.cols;
   }
-  const r = createRenderer(document.createElement('canvas'));
-  r.resize(setup.width, setup.height, 1);
+  const r = exportRenderer(setup.width, setup.height);
   const pngs: Uint8Array[] = [];
   const sheet = mode === 'sheet' ? document.createElement('canvas') : null;
   if (sheet) {
@@ -659,8 +689,7 @@ async function exportVideoInner(ws: Workspace): Promise<void> {
     { scale: target.isScene ? 1 : 2, padding: 16 },
   );
   if (!setup) return;
-  const r = createRenderer(document.createElement('canvas'));
-  r.resize(setup.width, setup.height, 1);
+  const r = exportRenderer(setup.width, setup.height);
   const out = document.createElement('canvas');
   out.width = setup.width % 2 ? setup.width + 1 : setup.width;
   out.height = setup.height % 2 ? setup.height + 1 : setup.height;
@@ -668,6 +697,9 @@ async function exportVideoInner(ws: Workspace): Promise<void> {
   const stream = out.captureStream(60);
   const savedLoop = doc.kind === 'scene' ? doc.ui.loopPlayback : undefined;
   const chunks: Blob[] = [];
+  // Recording sound needs cues to play even if the timeline's speaker is muted.
+  const soundWas = ws.soundEnabled;
+  if (withSound) ws.soundEnabled = true;
   try {
     if (withSound) for (const t of ws.audio.startRecording().getAudioTracks()) stream.addTrack(t);
     const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find((m) => MediaRecorder.isTypeSupported(m)) ?? '';
@@ -710,6 +742,7 @@ async function exportVideoInner(ws: Workspace): Promise<void> {
     ws.status(`Video export failed: ${e instanceof Error ? e.message : String(e)}`, 'error');
     return;
   } finally {
+    ws.soundEnabled = soundWas;
     if (doc.kind === 'scene' && savedLoop !== undefined) doc.ui.loopPlayback = savedLoop;
     ws.audio.stopRecording();
     for (const t of stream.getTracks()) t.stop();
@@ -730,7 +763,7 @@ async function exportVideoInner(ws: Workspace): Promise<void> {
 export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Promise<void> {
   ws.pause();
   await preloadScene(ws, scene);
-  const { definition, warnings } = bakeScene(scene.state, { assets: ws.assets, prefab: (p) => ws.prefab(p), gameVisibility: ws.settings.gameVisibility });
+  const { definition, warnings, soundCues: instanceCues } = bakeScene(scene.state, { assets: ws.assets, prefab: (p) => ws.prefab(p), gameVisibility: ws.settings.gameVisibility, soundCues: (p) => ws.prefabSoundCues(p) });
   const safe = scene.name.replace(/[^A-Za-z0-9_]+/g, '_') || 'Scene';
   const pathInput = h('input', { type: 'text', class: 'wide mono', value: `reanim/${safe}.reanim` });
   let open = true;
@@ -745,13 +778,13 @@ export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Prom
       { class: 'form-col' },
       h('p', null, `Flattens every instance into one reanim: ${parts} part track${parts === 1 ? '' : 's'}, ${scene.state.length} frames at ${scene.state.fps} fps, playable in the game as `, h('b', null, 'anim_scene'), '.'),
       warnings.length ? h('ul', { class: 'warn small' }, warnings.map((w) => h('li', null, w))) : null,
-      scene.state.soundCues.length
+      scene.state.soundCues.length + instanceCues.length
         ? h(
             'p',
             { class: 'dim small' },
             ws.settings.embedCues
-              ? `The ${scene.state.soundCues.length} sound cue(s) go into the reanim's hidden cue track (the game ignores it; PvZ Animator plays them).`
-              : `The ${scene.state.soundCues.length} sound cue(s) stay in the open document only: embedding cues in exported reanims is turned off (Edit menu).`,
+              ? `The ${scene.state.soundCues.length + instanceCues.length} sound cue(s) (scene and prefab cues) go into the reanim's hidden cue track (the game ignores it; PvZ Animator plays them).`
+              : `The ${scene.state.soundCues.length + instanceCues.length} sound cue(s) stay in the open document only: embedding cues in exported reanims is turned off (Edit menu).`,
           )
         : null,
       h('label', { class: 'field-col' }, 'Save as', pathInput),
@@ -780,7 +813,9 @@ export async function bakeSceneDialog(ws: Workspace, scene: SceneDocument): Prom
   }
   // The baked frames are the scene's frames, so the scene's sound cues carry over unchanged.
   const doc = ReanimDocument.fromDefinition(definition, name, path, ws.settings.simplifyOnImport);
-  doc.state.soundCues = scene.state.soundCues.map((c) => ({ ...c, uid: nextUid() }));
+  doc.state.soundCues = [...scene.state.soundCues, ...instanceCues]
+    .map((c) => ({ frame: c.frame, sound: c.sound, volume: c.volume, uid: nextUid() }))
+    .sort((a, b) => a.frame - b.frame);
   const xml = serializeReanimXml(doc.toDefinition(ws.settings.embedCues));
   if (download) downloadBlob(new Blob([xml], { type: 'text/xml' }), basename(path));
   if (library) {

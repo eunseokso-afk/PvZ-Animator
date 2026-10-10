@@ -416,7 +416,7 @@ export class Viewport {
     const hidden = (i: number) => doc.ui.hidden.has(tracks[i].uid) || (!!game?.has(i) && i !== sel);
     const tintSel: RGBA = [1, 1, 1, 0.35];
     const tint = game?.has(sel) ? (i: number) => (i === sel ? tintSel : null) : undefined;
-    const common = { fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility, tint };
+    const common = { fps: ws.playbackFps(doc), range: doc.activeRange(), gameVisibility: ws.settings.gameVisibility, tint, reanimFor: (p: string) => ws.prefab(p) };
     if (ws.settings.onion && !ws.playing) {
       const { start, end } = doc.activeRange();
       const f = doc.ui.frame;
@@ -468,9 +468,11 @@ export class Viewport {
       const isSel = info.trackIndex === doc.ui.track;
       const isHover = info.trackIndex === this.hoverTrack;
       if (!isSel && !isHover && !showAll) continue;
-      if (isSel) continue;
+      // A selected track's own image gets the box with handles below; the parts an
+      // attacher draws (it has no image of its own) are outlined in the selection colour.
+      if (isSel && !info.attached) continue;
       const pts = this.polygon(info);
-      ctx.strokeStyle = isHover ? 'rgba(120, 200, 255, 0.9)' : 'rgba(120, 200, 255, 0.18)';
+      ctx.strokeStyle = isSel ? 'rgba(255, 211, 77, 0.85)' : isHover ? 'rgba(120, 200, 255, 0.9)' : 'rgba(120, 200, 255, 0.18)';
       ctx.beginPath();
       pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
       ctx.closePath();

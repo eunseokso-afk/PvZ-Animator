@@ -26,6 +26,14 @@ export interface SceneResolver {
   particles?(layer: SceneLayer, pose: LayerPose, frame: number): ParticleSystem | null;
   /** Hide the parts the game hides from code (e.g. a plain zombie's accessories). */
   gameVisibility?: boolean;
+  /** A prefab's own sound cues (baking copies the ones its instances play). */
+  soundCues?(path: string): readonly SoundCueLike[];
+}
+
+export interface SoundCueLike {
+  frame: number;
+  sound: string;
+  volume: number;
 }
 
 /** Prefab frames per second an instance's playhead moves at (Reanimation::Update: a pass lasts count / fps). */
@@ -39,21 +47,60 @@ export function instanceFrameTime(prefab: Prefab, pose: LayerPose, sceneFps: num
   const range = animRangeOf({ fps: prefab.fps, tracks: prefab.tracks as ReanimDefinition['tracks'] }, key.anim);
   const last = range.count - 1;
   const offset = Math.max(0, Math.min(last, Math.round(key.startFrame)));
-  if (key.loop === 'single' || last <= 0) {
-    const f = range.start + offset;
-    return { before: f, after: f, fraction: 0 };
-  }
   const seconds = Math.max(0, frame - pose.segmentStart) / Math.max(1e-6, sceneFps);
+  if (key.loop === 'single' || last <= 0) {
+    // Held on one frame; attachments still animate for the time that passes.
+    const f = range.start + offset;
+    return { before: f, after: f, fraction: 0, overrun: seconds * instanceFps(prefab, range.count, key.speed > 0 ? key.speed : 1) };
+  }
   // As in the game, one pass of a count-frame animation takes count / fps seconds.
   let pos = offset + seconds * instanceFps(prefab, range.count, key.speed);
   let loops = 0;
+  let overrun = 0;
   if (key.loop === 'loop') {
     loops = Math.floor(pos / last);
     pos -= loops * last;
-  } else pos = Math.min(pos, last);
+  } else if (pos > last) {
+    overrun = pos - last;
+    pos = last;
+  }
   const before = Math.floor(pos);
   const after = Math.min(before + 1, last);
-  return { before: range.start + before, after: range.start + after, fraction: before >= last ? 0 : pos - before, loops };
+  return { before: range.start + before, after: range.start + after, fraction: before >= last ? 0 : pos - before, loops, ...(overrun ? { overrun } : {}) };
+}
+
+/**
+ * The prefab cues an instance passes while the scene plays from frame `from` to `to`:
+ * cue frames inside the instance's animation that its (unwrapped, looping) position
+ * crosses. A layer that appears or restarts its animation also plays cues on its first frame.
+ */
+export function instanceCueHits<C extends { frame: number }>(layer: SceneLayer, prefab: Prefab, cues: readonly C[], sceneFps: number, from: number, to: number, inclusive: boolean): C[] {
+  const pose = evalLayer(layer, Math.max(0, to));
+  if (!pose || !pose.visible || pose.key.loop === 'single' || !cues.length) return [];
+  const range = animRangeOf({ fps: prefab.fps, tracks: prefab.tracks as ReanimDefinition['tracks'] }, pose.key.anim);
+  const last = range.count - 1;
+  // Unwrapped position in the animation (frames from its start, counting loops).
+  const raw = (f: number, p: LayerPose) => {
+    const ft = instanceFrameTime(prefab, p, sceneFps, f);
+    return ft.before - range.start + ft.fraction + (ft.loops ?? 0) * last;
+  };
+  const prevPose = from >= 0 ? evalLayer(layer, from) : null;
+  const fresh = !prevPose || !prevPose.visible || prevPose.segmentStart !== pose.segmentStart;
+  const a = fresh ? -1e-9 : raw(from, prevPose) - (inclusive ? 1e-9 : 0);
+  const b = raw(to, pose);
+  const looping = pose.key.loop === 'loop' && last > 0;
+  return cues.filter((cue) => {
+    const rel = cue.frame - range.start;
+    if (rel < 0 || rel > last) return false;
+    // In a loop the last frame is the instant the next pass starts (like the reanim editor's
+    // looping playback), so only the first frame's cues play there.
+    if (looping && rel === last) return false;
+    if (a < rel && rel <= b) return true;
+    if (!looping) return false;
+    // A later pass: rel + k * last inside (a, b].
+    const k = Math.ceil((a - rel) / last + 1e-9);
+    return k > 0 && rel + k * last <= b;
+  });
 }
 
 export interface DrawnLayer {
@@ -130,6 +177,7 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
           range: { start: range.start, end: range.start + range.count - 1 },
           screen: view,
           gameVisibility: res.gameVisibility,
+          reanimFor: (p) => res.prefab(p),
           hidden: game?.size ? (i) => game.has(i) : undefined,
           collect: parts,
         });
@@ -174,6 +222,8 @@ export function hexToRgba(hex: string): RGBA {
 export interface BakeResult {
   definition: ReanimDefinition;
   warnings: string[];
+  /** Scene frames where the instances' prefab sound cues play. */
+  soundCues: SoundCueLike[];
 }
 
 function sanitize(name: string): string {
@@ -189,7 +239,7 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
   const warnings: string[] = [];
   const n = scene.length;
   const tracks: ReanimDefinition['tracks'] = [];
-  const used = new Set<string>();
+  const used = new Set<string>(['fullscreen']);
   const unique = (name: string) => {
     let out = name;
     let i = 2;
@@ -233,6 +283,7 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
     prefab.tracks.forEach((track, ti) => {
       if (isRangeTrack(track) || track.transforms.length === 0 || game?.has(ti)) return;
       const transforms: ReanimTransform[] = [];
+      const fullscreen = track.name.toLowerCase() === 'fullscreen';
       let any = false;
       for (let f = 0; f < n; f++) {
         const pose = evalLayer(layer, f);
@@ -243,17 +294,20 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
         if (pose.tint.some((c) => Math.abs(c - 1) > 1e-3)) tinted = true;
         const ft = instanceFrameTime(prefab, pose, scene.fps, f);
         const t = interpolateTransform(track.transforms, ft);
-        if (Math.round(t.f) < 0 || (!t.i && !t.text)) {
+        if (Math.round(t.f) < 0 || (!t.i && !t.text && !fullscreen)) {
           transforms.push({ ...t, f: -1 });
           continue;
         }
         any = true;
-        const d = decomposeMatrix(mul(poseMatrix(pose), transformMatrix(t)));
-        transforms.push({ ...t, ...d, f: 0, a: t.a * pose.alpha });
+        // A fullscreen fill ignores its transform in the game; only its alpha (and colour) matter.
+        if (fullscreen) transforms.push({ ...t, f: 0, a: t.a * pose.alpha });
+        else transforms.push({ ...t, ...decomposeMatrix(mul(poseMatrix(pose), transformMatrix(t))), f: 0, a: t.a * pose.alpha });
       }
-      // The game only treats tracks named attacher__* as attachers, so keep that prefix.
+      // The game only treats tracks named attacher__* as attachers and "fullscreen" as a
+      // screen fill, so keep those names (several tracks may share "fullscreen").
       const attacher = track.name.toLowerCase().startsWith('attacher__');
-      if (any) tracks.push({ name: unique(attacher ? `attacher__${base}_${tracks.length}` : `${base}_${sanitize(track.name)}`), transforms });
+      const name = fullscreen ? 'fullscreen' : unique(attacher ? `attacher__${base}_${tracks.length}` : `${base}_${sanitize(track.name)}`);
+      if (any) tracks.push({ name, transforms });
     });
   }
   if (tinted) warnings.push('Tints were dropped: the reanim format has no per-track color.');
@@ -269,7 +323,17 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
       tr.a = round(tr.a, 3);
     }
   }
-  return { definition: { fps: scene.fps, tracks }, warnings };
+  // Prefab sound cues, at the scene frames where each instance plays them.
+  const soundCues: SoundCueLike[] = [];
+  for (const layer of scene.layers) {
+    const cues = layer.kind === 'reanim' ? (res.soundCues?.(layer.source) ?? []) : [];
+    const prefab = cues.length ? res.prefab(layer.source) : null;
+    if (!prefab) continue;
+    for (let f = 0; f < n; f++) {
+      for (const cue of instanceCueHits(layer, prefab, cues, scene.fps, f === 0 ? -1 : f - 1, f, f === 0)) soundCues.push({ frame: f, sound: cue.sound, volume: cue.volume });
+    }
+  }
+  return { definition: { fps: scene.fps, tracks }, warnings, soundCues };
 }
 
 function round(v: number, digits: number): number {

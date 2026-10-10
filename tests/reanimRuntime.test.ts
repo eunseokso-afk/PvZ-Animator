@@ -26,6 +26,7 @@ function recorder(): Renderer & { xs: number[] } {
     end() {},
     dispose() {},
     readPixels: () => ({}) as ImageData,
+    fits: () => true,
   };
 }
 
@@ -142,6 +143,14 @@ describe('attachers', () => {
     expect(run(texts, 2, { range, loops: 1 })).toBe(2.25);
     // Two wraps: 1.5 passes -> 0.5 -> frame 1.5.
     expect(run(texts, 2, { range, loops: 2 })).toBe(1.5);
+  });
+
+  it('keeps attachments animating while the parent holds a frame', () => {
+    const r = recorder();
+    const tracks = [{ name: 'attacher__Child', transforms: [tr({ text: 'attacher__Child__anim_a[10]' })] }];
+    // Held on frame 0 for 2 parent frames at 10 fps: 0.2 s * 10 / 4 = 0.5 of a pass -> frame 1.5.
+    drawReanim(r, assets(child), tracks, { ...at(0), overrun: 2 }, [1, 0, 0, 1, 0, 0], { fps: 10 });
+    expect(r.xs[0]).toBe(1.5);
   });
 
   it('keeps the creation tempo for specs without an animation name', () => {

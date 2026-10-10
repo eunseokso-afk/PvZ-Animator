@@ -67,6 +67,7 @@ export class SceneInspector {
       layer?.source,
       layer?.keys.length,
       ki,
+      layer && doc.ui.locked.has(layer.uid),
       key && JSON.stringify({ ...key, x: 0, y: 0, rotation: 0, scaleX: 0, scaleY: 0, alpha: 0 }),
       doc.ui.cue?.uid,
       s.width,
@@ -210,7 +211,8 @@ export class SceneInspector {
     const isKey = key?.frame === frame;
     const locked = doc.isLocked(li);
     const set = (patch: Partial<LayerKey>, label: string, final = true, begin = true) => {
-      if (locked) {
+      // Check the lock now, not when the panel was built.
+      if (doc.isLocked(li)) {
         ws.status(`Layer "${layer.name}" is locked. Unlock it in the timeline to edit it.`);
         this.refresh(true);
         return;
@@ -337,6 +339,7 @@ export class SceneInspector {
           title: isKey && ki === 0 ? 'The first keyframe is where the layer starts' : undefined,
           onclick: () => {
             // Act on the current frame, not the one this panel was built for.
+            if (doc.isLocked(li)) return set({}, 'Toggle key');
             if (ws.playing) ws.pause();
             doc.toggleKey(li, doc.ui.frame);
             ws.emit('change');
@@ -349,7 +352,7 @@ export class SceneInspector {
             EASES.map((e) => ({ value: e.id, label: e.label })),
             key.ease,
             (v) => {
-              if (locked) return set({}, 'Set easing');
+              if (doc.isLocked(li)) return set({}, 'Set easing');
               if (ws.playing) ws.pause();
               doc.setEase(li, doc.ui.frame, v);
               ws.emit('change');
@@ -404,7 +407,7 @@ export class SceneInspector {
         keyRow,
         h('div', { class: 'insp-grid2' }, num('x', 'X', 1, 1, 'Stage X (px)'), num('y', 'Y', 1, 1, 'Stage Y (px)')),
         h('div', { class: 'insp-grid2' }, num('rotation', 'Rotation', 1, 2, 'Degrees, clockwise'), checkbox('Flip horizontally', pose.flipX, (v) => {
-            if (locked) return set({}, 'Flip');
+            if (doc.isLocked(li)) return set({}, 'Flip');
             if (ws.playing) ws.pause();
             this.hooks.flip(doc, li, v);
             ws.emit('change');

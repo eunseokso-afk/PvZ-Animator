@@ -1107,6 +1107,19 @@ export class App {
         if (k === 'd' && r && r.ui.track >= 0) return handled(), (r.ui.track = r.duplicateTrack(r.ui.track)), ws.emit('change');
         const sc = ws.scene;
         if (k === 'd' && sc && sc.ui.layer >= 0) return handled(), (sc.ui.layer = sc.duplicateLayer(sc.ui.layer)), ws.emit('change');
+        // Ctrl+F5 / Ctrl+Shift+F5: insert / remove a frame on every layer (and never reload the page).
+        if (key === 'F5') {
+          handled();
+          if (sc) this.sceneFrames(!e.shiftKey, true);
+          return;
+        }
+        return;
+      }
+      // F5 reloads the page in browsers; Animate users press it out of habit, so keep it in the app.
+      if (key === 'F5' && !ws.scene) {
+        handled();
+        if (r && !e.shiftKey) r.insertFrames(r.ui.frame + 1, 1), ws.emit('change');
+        else if (r && r.frameCount > 1) r.deleteFrames(r.ui.frame, 1), ws.emit('change');
         return;
       }
       if (e.altKey && key.toLowerCase() === 'w') return handled(), doc && void this.closeDoc(doc);
@@ -1222,7 +1235,7 @@ export class App {
     if (key === 'F6') return handled(), this.sceneKey('insert');
     if (key === 'F7') return handled(), this.sceneKey('blank');
     if (key === 'k' || key === 'K') return handled(), this.sceneKey('toggle');
-    if (key === 'F5') return handled(), this.sceneFrames(!e.shiftKey, e.ctrlKey || e.metaKey);
+    if (key === 'F5') return handled(), this.sceneFrames(!e.shiftKey);
     if (key === 'F2' && li >= 0) return handled(), void this.renameLayer(doc, li);
     if ((key === ']' || key === '[') && li >= 0) return handled(), doc.moveLayer(li, li + (key === ']' ? 1 : -1)), ws.emit('change');
     if (key === 'h' && li >= 0) {
@@ -1272,7 +1285,7 @@ export class App {
       ['↑ / ↓', 'Select part above / below'],
       ['Alt + arrows', 'Nudge selected part 1 px (Shift: 10 px)'],
       ['K', 'Toggle key at the current frame'],
-      ['Shift+I / Shift+Del', 'Insert / delete frame'],
+      ['F5 or Shift+I / Shift+F5 or Shift+Del', 'Insert / delete frame'],
       ['Del', 'Delete selected part or cue'],
       ['[ / ]', 'Send part backward / forward'],
       ['H', 'Hide part in the editor'],

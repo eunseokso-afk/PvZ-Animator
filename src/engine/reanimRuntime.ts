@@ -34,6 +34,11 @@ export interface FrameTime {
   fraction: number;
   /** How many times a looping animation has wrapped back to its start before this pass. */
   loops?: number;
+  /**
+   * Frames the playhead has gone past `before` while held there (play once and hold,
+   * single frame, the last frame of a full-last-frame loop). Attachments keep animating.
+   */
+  overrun?: number;
 }
 
 /** Reanimation::GetFrameTime. animTime is 0..1 over the range. */
@@ -129,6 +134,11 @@ export interface DrawOptions {
   range?: { start: number; end: number };
   /** Apply the parts the game hides from code (see gameVisibility.ts) inside attachments. */
   gameVisibility?: boolean;
+  /**
+   * Where attachers get the reanims they attach, e.g. preferring an open (edited)
+   * document over the library file. Defaults to the asset library.
+   */
+  reanimFor?: (path: string) => { fps: number; tracks: TrackLike[] } | null | undefined;
   /** The game screen's coordinate space (top-left at 0,0), for "fullscreen" tracks. Defaults to `base`. */
   screen?: Readonly<Mat>;
   /** Collect the drawn tracks (for hit testing / gizmos). */
@@ -309,7 +319,7 @@ function drawAttacher(r: Renderer, assets: AssetLibrary, ti: number, transforms:
   if (!seg) return;
   const path = assets.findReanimPath(seg.info.reanimName);
   if (!path) return;
-  const def = assets.reanim(path);
+  const def = (opts.reanimFor ? opts.reanimFor(path) : assets.reanim(path)) as ReanimDefinition | null | undefined;
   if (!def) return;
   const parentFps = Math.max(1e-3, opts.fps ?? 12);
   const pos = ft.before + ft.fraction;
@@ -343,7 +353,10 @@ function drawAttacher(r: Renderer, assets: AssetLibrary, ti: number, transforms:
     }
     return { ...computeFrameTime(range.start, range.count, animTime, false), loops };
   };
-  const cur = timeAt(seg.start, seg.trackName, pos, carried);
+  // Time spent held on this frame still runs the attachment, at the current spec's rate.
+  const current = seg.info.trackName ? seg.info : created;
+  const held = ((ft.overrun ?? 0) / parentFps) * current.fps / Math.max(1, animRangeOf(def, seg.trackName).count);
+  const cur = timeAt(seg.start, seg.trackName, pos, carried + held);
   if (!cur) return;
   let blend: DrawOptions['blend'];
   if (seg.prev) {
@@ -362,6 +375,7 @@ function drawAttacher(r: Renderer, assets: AssetLibrary, ti: number, transforms:
     range: { start: range.start, end: range.start + range.count - 1 },
     screen: opts.screen ?? base,
     gameVisibility: opts.gameVisibility,
+    reanimFor: opts.reanimFor,
     hidden: hideTongue ? (i) => def.tracks[i].name.toLowerCase() === 'anim_tongue' : undefined,
     blend,
     collect: nested,
