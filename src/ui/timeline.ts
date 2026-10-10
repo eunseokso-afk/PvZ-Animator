@@ -337,6 +337,14 @@ export class Timeline {
     this.draw();
   }
 
+  /** Frame under a client-space point, or null if it is not over the frame grid. */
+  frameAtClient(clientX: number, clientY: number): number | null {
+    const doc = this.doc;
+    const r = this.canvas.getBoundingClientRect();
+    if (!doc || clientX < r.left + NAME_W || clientX > r.right || clientY < r.top || clientY > r.bottom) return null;
+    return clamp(this.xToFrame(clientX - r.left), 0, doc.frameCount - 1);
+  }
+
   scrollToFrame(f: number) {
     const x = f * this.cellW;
     const visW = this.cssW - NAME_W;

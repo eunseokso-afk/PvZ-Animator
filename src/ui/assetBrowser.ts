@@ -128,7 +128,12 @@ export class AssetBrowser {
       ),
     );
     const q = this.query;
-    this.items = all.filter((f) => (this.tab === 'all' || this.ws.assets.kindOf(f) === this.tab) && (!q || f.path.toLowerCase().includes(q)));
+    // compiled/reanim/X.reanim.compiled is a cache of reanim/X.reanim; only list it when the XML is missing.
+    const duplicate = (f: VFile) => {
+      const m = /^compiled\/(.+)\.compiled$/i.exec(f.path);
+      return !!m && vfs.has(m[1]);
+    };
+    this.items = all.filter((f) => (this.tab === 'all' || (this.ws.assets.kindOf(f) === this.tab && !duplicate(f))) && (!q || f.path.toLowerCase().includes(q)));
     const empty = all.length === 0;
     this.welcome.style.display = empty ? '' : 'none';
     this.scroller.style.display = empty ? 'none' : '';

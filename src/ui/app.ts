@@ -450,14 +450,14 @@ export class App {
     return name;
   }
 
-  private async importFileList(items: { file: File; rel: string }[], fromFolder: boolean) {
+  private async importFileList(items: { file: File; rel: string }[], fromFolder: boolean): Promise<string[]> {
     const ws = this.ws;
     const pak = items.find((i) => i.file.name.toLowerCase() === 'main.pak');
     if (pak) await this.loadPak(pak.file);
     const project = items.find((i) => i.file.name.toLowerCase().endsWith('.pvzanim.json'));
     if (project && !fromFolder) {
       await loadProject(ws, project.file);
-      return;
+      return [];
     }
     const known = (p: string) => {
       const lower = p.toLowerCase();
@@ -487,6 +487,7 @@ export class App {
     } else if (!pak) {
       ws.status('No supported files found (images, sounds, .reanim, particle .xml).', 'error');
     }
+    return out.map((o) => o.path);
   }
 
   private bindFileDrop() {
@@ -528,7 +529,31 @@ export class App {
       }
       if (folder) await this.importFileList(items.filter((i) => i.rel.includes('/')), true);
       const loose = items.filter((i) => !i.rel.includes('/'));
-      if (loose.length) await this.importFileList(loose, false);
+      if (!loose.length) return;
+      const paths = await this.importFileList(loose, false);
+      this.placeDroppedFiles(paths, e.clientX, e.clientY);
+    });
+  }
+
+  /** Files dropped from the desktop onto the stage become parts; onto the timeline, sound cues. */
+  private placeDroppedFiles(paths: string[], clientX: number, clientY: number) {
+    const doc = this.ws.reanim;
+    if (!doc || !paths.length) return;
+    const kinds = paths.map((p) => this.ws.assets.kindOf(this.ws.assets.vfs.get(p)!));
+    const frame = this.timeline.frameAtClient(clientX, clientY);
+    if (frame !== null) {
+      paths.forEach((p, i) => {
+        if (kinds[i] !== 'sound') return;
+        const cue = doc.addSoundCue(frame, p);
+        doc.ui.cue = { kind: 'sound', uid: cue.uid };
+      });
+      this.ws.emit('change');
+      return;
+    }
+    const pos = this.viewport.stagePoint(clientX, clientY);
+    if (!pos) return;
+    paths.forEach((p, i) => {
+      if (kinds[i] === 'image' || kinds[i] === 'sound' || kinds[i] === 'particle') this.viewport.onAssetDrop({ kind: kinds[i], path: p }, [pos[0] + i * 12, pos[1] + i * 12]);
     });
   }
 

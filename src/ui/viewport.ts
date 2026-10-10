@@ -913,6 +913,13 @@ export class Viewport {
 
   dropHandler: (doc: ReanimDocument, asset: { kind: string; path: string }, x: number, y: number, trackUnder: number) => void = () => {};
 
+  /** Stage-local point for a client-space point, or null if outside the stage. */
+  stagePoint(clientX: number, clientY: number): [number, number] | null {
+    const r = this.stage.getBoundingClientRect();
+    if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) return null;
+    return [clientX - r.left, clientY - r.top];
+  }
+
   worldToScreen(doc: EditorDocument, x: number, y: number): [number, number] {
     return apply(this.viewMatrix(doc), x, y);
   }

@@ -59,10 +59,12 @@ export async function exportPak(ws: Workspace): Promise<void> {
   const changes = new Map<string, PakChange>();
   for (const f of ws.assets.vfs.list()) {
     if (f.origin === 'pak') continue;
-    changes.set(pathKey(f.path), { path: f.path, label: f.origin === 'generated' ? 'saved document / generated' : 'imported file', bytes: () => f.read(), checked: true });
+    const label = f.origin === 'generated' ? 'saved document' : f.origin === 'demo' ? 'demo asset' : 'imported file';
+    changes.set(pathKey(f.path), { path: f.path, label, bytes: () => f.read(), checked: f.origin !== 'demo' });
   }
   for (const doc of ws.docs) {
-    if (!doc.dirty && !doc.isNew && ws.assets.vfs.get(doc.path)?.origin === 'pak') continue;
+    // Unchanged documents are already represented by their library file (if any).
+    if (!doc.dirty && !doc.isNew && ws.assets.vfs.has(doc.path)) continue;
     changes.set(pathKey(doc.path), { path: doc.path, label: doc.dirty ? 'edited document' : 'document', bytes: async () => serializeDoc(ws, doc), checked: true });
   }
   if (changes.size === 0) {
@@ -218,8 +220,10 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
   await ws.assets.importFiles(
     p.files.filter((f) => f.origin === 'import').map((f) => ({ path: f.path, data: fromBase64(f.data) })),
   );
-  const generated = p.files.filter((f) => f.origin === 'generated');
-  if (generated.length) await ws.assets.importFiles(generated.map((f) => ({ path: f.path, data: fromBase64(f.data) })), 'generated');
+  for (const origin of ['generated', 'demo'] as const) {
+    const list = p.files.filter((f) => f.origin === origin);
+    if (list.length) await ws.assets.importFiles(list.map((f) => ({ path: f.path, data: fromBase64(f.data) })), origin);
+  }
   for (const d of p.docs) {
     let doc: EditorDocument;
     if (d.kind === 'reanim') {

@@ -5,7 +5,8 @@
 
 import type { PakArchive, PakEntry } from '../formats/pak';
 
-export type FileOrigin = 'pak' | 'import' | 'generated';
+/** pak: from main.pak · import: user files · generated: saved documents · demo: built-in demo assets */
+export type FileOrigin = 'pak' | 'import' | 'generated' | 'demo';
 
 export interface VFile {
   /** Display path, forward slashes, original case. */

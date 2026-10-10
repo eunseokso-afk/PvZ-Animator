@@ -154,7 +154,7 @@ export function drawReanim(
         opts.collect?.push({ trackIndex: ti, matrix: m, transform: t, width: img.celWidth, height: img.celHeight });
       } else if (img === null) {
         // Missing image: draw a placeholder so the part can still be selected.
-        r.fillRect(m, 24, 24, [1, 0.2, 0.6, 0.35 * alpha], 'normal');
+        r.fillRect(m, 24, 24, [1, 0.3, 0.6, 0.25 * alpha], 'normal');
         opts.collect?.push({ trackIndex: ti, matrix: m, transform: t, width: 24, height: 24 });
       }
     } else if (t.text) {

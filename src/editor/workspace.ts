@@ -242,7 +242,21 @@ export class Workspace extends EventTarget {
     this.firstTick = true;
     this.live = [];
     this.audio.context; // unlock audio on the user gesture
+    this.resumeSounds(doc, f);
     this.emit('change');
+  }
+
+  /** When playback starts mid-animation, pick up sounds that would already be playing. */
+  private resumeSounds(doc: ReanimDocument, frame: number): void {
+    if (!this.soundEnabled) return;
+    const { start } = doc.activeRange();
+    for (const cue of doc.state.soundCues) {
+      if (cue.frame >= frame || cue.frame < start) continue;
+      const file = this.assets.resolveSound(cue.sound);
+      const buf = file ? this.audio.peek(file) : null;
+      const offset = (frame - cue.frame) / doc.fps;
+      if (buf && offset < buf.duration) this.audio.play(buf, cue.volume, offset);
+    }
   }
 
   pause(): void {

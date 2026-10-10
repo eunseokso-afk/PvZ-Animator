@@ -108,7 +108,7 @@ export class AssetLibrary extends EventTarget {
    * Add loose files. `path` is where the file should live inside the game
    * folder. Files given as Blobs are read lazily.
    */
-  async importFiles(files: { path: string; data?: Uint8Array; blob?: Blob }[], origin: 'import' | 'generated' = 'import'): Promise<void> {
+  async importFiles(files: { path: string; data?: Uint8Array; blob?: Blob }[], origin: 'import' | 'generated' | 'demo' = 'import'): Promise<void> {
     let manifestChanged = false;
     for (const f of files) {
       const path = normPath(f.path);

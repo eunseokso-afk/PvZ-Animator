@@ -245,7 +245,7 @@ export async function loadDemoAssets(ws: Workspace): Promise<void> {
   files.push({ path: 'particles/DemoSparkle.xml', data: new TextEncoder().encode(PARTICLE_XML) });
   const reanim = buildReanim();
   files.push({ path: 'reanim/DemoPlant.reanim', data: new TextEncoder().encode(serializeReanimXml(reanim.toDefinition(true))) });
-  await ws.assets.importFiles(files, 'generated');
+  await ws.assets.importFiles(files, 'demo');
   await ws.openAsset('reanim/DemoPlant.reanim');
   ws.status('Loaded demo assets: a reanim with idle/shoot animations, a particle effect and two sounds.', 'success');
 }
