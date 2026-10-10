@@ -84,8 +84,6 @@ export class Workspace extends EventTarget {
   speed = 1;
   /** Fractional frame position while playing. */
   playhead = 0;
-  /** Seconds of playback (drives attacher sub-animations). */
-  clock = 0;
   soundEnabled = true;
   private firstTick = false;
 
@@ -309,7 +307,6 @@ export class Workspace extends EventTarget {
       let f = scene.ui.frame;
       if (f >= scene.state.length - 1) f = 0;
       this.playhead = f;
-      this.clock = 0;
       this.playing = true;
       this.firstTick = true;
       this.audio.context;
@@ -324,7 +321,6 @@ export class Workspace extends EventTarget {
     if (f < start || f > end) f = start;
     if (f >= end && !isLooping(doc.ui.loop)) f = start;
     this.playhead = f;
-    this.clock = 0;
     this.playing = true;
     this.firstTick = true;
     this.live = [];
@@ -427,7 +423,6 @@ export class Workspace extends EventTarget {
       } else {
         this.emit('change');
       }
-      this.clock += dt * this.speed;
       changed = true;
     }
     if (this.live.length) {
@@ -469,7 +464,6 @@ export class Workspace extends EventTarget {
     }
     this.playhead = next;
     scene.ui.frame = scene.ui.frameEnd = clamp(Math.floor(next), 0, end - 1);
-    this.clock += dt * this.speed;
   }
 
   private playSoundCues(cues: SoundCue[], from: number, to: number, inclusive: boolean): void {

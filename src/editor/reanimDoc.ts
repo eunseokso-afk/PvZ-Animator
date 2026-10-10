@@ -16,6 +16,7 @@ import {
   frameCountOf,
   getAnimRanges,
   isAnimTrackName,
+  isRangeTrack,
   NUMERIC_FIELDS,
   type AnimRange,
   type ReanimDefinition,
@@ -346,7 +347,7 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
         continue;
       }
       const et = makeTrack(t.name, t.transforms.map((x) => ({ ...x })));
-      if (simplify && !isAnimTrackName(t.name)) simplifyKeys(et, boundaries);
+      if (simplify && !isRangeTrack(t)) simplifyKeys(et, boundaries);
       tracks.push(et);
     }
     const doc = new ReanimDocument(name, path, { fps: def.fps, tracks, soundCues, particleCues }, false, frameCountOf(def));
@@ -509,7 +510,7 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
 
   simplifyTrack(trackIndex: number): void {
     const t = this.editTrack(trackIndex);
-    if (!isAnimTrackName(t.name)) simplifyKeys(t, rangeBoundaries(this.state.tracks));
+    if (!isRangeTrack(t)) simplifyKeys(t, rangeBoundaries(this.state.tracks));
   }
 
   addTrack(name: string, image: string, x = 0, y = 0, at = this.state.tracks.length): number {
@@ -571,7 +572,7 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
     this.state.tracks.forEach((_, i) => {
       const t = this.editTrack(i);
       const src = t.transforms[Math.max(0, at - 1)] ?? { ...DEFAULT_TRANSFORM };
-      const isAnim = isAnimTrackName(t.name);
+      const isAnim = isRangeTrack(t);
       for (let k = 0; k < count; k++) {
         t.transforms.splice(at, 0, { ...src });
         t.keys.splice(at, 0, isAnim || at === 0);
@@ -594,7 +595,7 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
       t.transforms.splice(at, count);
       t.keys.splice(at, count);
       t.ease.splice(at, count);
-      if (!isAnimTrackName(t.name)) retween(t);
+      if (!isRangeTrack(t)) retween(t);
     });
     this.state.soundCues = this.editSoundCues().filter((c) => c.frame < at || c.frame >= at + count);
     this.fresh.add(this.state.soundCues);
@@ -629,11 +630,16 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
     if (!isAnimTrackName(name)) name = 'anim_' + name;
     this.checkpoint('Set animation range');
     let idx = this.findTrack(oldName ?? name);
+    // Never turn a part that happens to be called anim_* (e.g. anim_head1) into a range.
+    if (idx >= 0 && !isRangeTrack(this.state.tracks[idx])) {
+      if (!oldName) name = this.uniqueTrackName(name);
+      idx = -1;
+    }
     if (idx < 0) {
       const t = makeTrack(name, Array.from({ length: n }, () => ({ ...DEFAULT_TRANSFORM, f: -1 })), true);
       this.fresh.add(t);
       // anim_ tracks conventionally come first.
-      const firstNonAnim = this.state.tracks.findIndex((x) => !isAnimTrackName(x.name));
+      const firstNonAnim = this.state.tracks.findIndex((x) => !isRangeTrack(x));
       idx = firstNonAnim < 0 ? this.state.tracks.length : firstNonAnim;
       this.state.tracks.splice(idx, 0, t);
     }
@@ -645,7 +651,7 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
     t.keys = t.transforms.map(() => true);
     // Key every part at the range edges so tweens never cross into another animation.
     this.state.tracks.forEach((other, i) => {
-      if (isAnimTrackName(other.name)) return;
+      if (isRangeTrack(other)) return;
       const edges = [start, end, end + 1].filter((f) => f < n && !other.keys[f]);
       if (!edges.length) return;
       const e = this.editTrack(i);
@@ -659,7 +665,7 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
 
   removeAnimRange(name: string): void {
     const idx = this.findTrack(name);
-    if (idx < 0) return;
+    if (idx < 0 || !isRangeTrack(this.state.tracks[idx])) return;
     this.removeTrack(idx);
     if (this.ui.anim === name) this.ui.anim = '';
   }

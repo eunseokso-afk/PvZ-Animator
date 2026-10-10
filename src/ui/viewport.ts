@@ -415,10 +415,10 @@ export class Viewport {
       if (f - 1 >= start) ghosts.push([f - 1, [1, 0.45, 0.45, 1]]);
       if (f + 1 <= end) ghosts.push([f + 1, [0.45, 1, 0.55, 1]]);
       for (const [g, tint] of ghosts) {
-        drawReanim(r, ws.assets, tracks, { before: g, after: g, fraction: 0 }, view, { hidden, alpha: 0.28, color: tint, clock: ws.clock });
+        drawReanim(r, ws.assets, tracks, { before: g, after: g, fraction: 0 }, view, { hidden, alpha: 0.28, color: tint, fps: doc.fps });
       }
     }
-    drawReanim(r, ws.assets, tracks, ws.frameTime(doc), view, { hidden, collect: this.drawn, clock: ws.clock });
+    drawReanim(r, ws.assets, tracks, ws.frameTime(doc), view, { hidden, collect: this.drawn, fps: doc.fps });
     const systems = ws.playing ? ws.live.map((l) => l.sys) : ws.pausedParticleSystems(doc);
     for (const s of systems) s.draw(r, ws.assets, view);
   }

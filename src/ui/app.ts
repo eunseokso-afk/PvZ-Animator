@@ -5,7 +5,7 @@ import type { AssetKind } from '../engine/assets';
 import { apply, invert } from '../engine/math';
 import { interpolateTransform, transformMatrix } from '../engine/reanimRuntime';
 import { basename, extname, IMAGE_EXTS, SOUND_EXTS, stripExt, type VFile } from '../engine/vfs';
-import { isAnimTrackName } from '../formats/reanim';
+import { isAnimTrackName, isRangeTrack } from '../formats/reanim';
 import { ReanimDocument } from '../editor/reanimDoc';
 import { cloneSceneState, SceneDocument } from '../editor/sceneDoc';
 import type { EditorDocument, Workspace } from '../editor/workspace';
@@ -783,7 +783,7 @@ export class App {
       { label: 'Rename…', shortcut: 'F2', action: () => void this.renameTrack(doc, ti) },
       {
         label: 'Change image…',
-        disabled: isAnimTrackName(track.name),
+        disabled: isRangeTrack(track),
         action: async () => {
           const r = await pickImage(ws, `Image for "${track.name}" from frame ${doc.ui.frame}`, 'reanim', track.transforms[doc.ui.frame]?.i);
           if (r) {
@@ -884,7 +884,7 @@ export class App {
     const sel = this.ws.selectedAsset;
     const path = sel?.kind === 'particle' ? sel.path : await pickAsset(this.ws, 'particle', 'Add particle cue');
     if (!path) return;
-    if (!track && doc.ui.track >= 0 && !isAnimTrackName(doc.state.tracks[doc.ui.track]?.name ?? '')) track = doc.state.tracks[doc.ui.track].name;
+    if (!track && doc.ui.track >= 0 && doc.state.tracks[doc.ui.track] && !isRangeTrack(doc.state.tracks[doc.ui.track])) track = doc.state.tracks[doc.ui.track].name;
     const cue = doc.addParticleCue(frame, path, track);
     doc.ui.cue = { kind: 'particle', uid: cue.uid };
     this.ws.invalidatePreviews();
@@ -1109,7 +1109,7 @@ export class App {
       if (key === 'ArrowRight' || key === '.') return handled(), ws.stepFrame(1);
       if (key === 'ArrowUp' || key === 'ArrowDown') {
         handled();
-        const parts = r.state.tracks.map((t, i) => ({ t, i })).filter(({ t }) => !isAnimTrackName(t.name)).map(({ i }) => i).reverse();
+        const parts = r.state.tracks.map((t, i) => ({ t, i })).filter(({ t }) => !isRangeTrack(t)).map(({ i }) => i).reverse();
         if (!parts.length) return;
         const pos = parts.indexOf(r.ui.track);
         const next = pos < 0 ? 0 : Math.max(0, Math.min(parts.length - 1, pos + (key === 'ArrowDown' ? 1 : -1)));
@@ -1243,7 +1243,7 @@ export class App {
         h('h4', null, 'main.pak'),
         h('p', null, 'A PopCap archive: a directory of file names, sizes and timestamps followed by the file data, every byte XOR-ed with 0xF7. PvZ Animator reads it in place and can write a new one with your changes merged in.'),
         h('h4', null, 'Reanim (.reanim)'),
-        h('p', null, 'Each track is one part (an image) with a transform per frame: x, y, kx/ky (skew = rotation in degrees), sx/sy (scale), a (alpha), f (0 visible, -1 hidden) and i (image id). Only changed values are written. Tracks named anim_* mark animation ranges. Compiled files (compiled/reanim/*.compiled) can be opened too and are saved as XML.'),
+        h('p', null, 'Each track is one part (an image) with a transform per frame: x, y, kx/ky (skew = rotation in degrees), sx/sy (scale), a (alpha), f (0 visible, -1 hidden) and i (image id). Only changed values are written. Tracks named anim_* without images mark animation ranges; anim_* tracks with images (like a zombie’s anim_head1) are drawn like any part. Text is drawn only when a font is set, and attacher__ tracks draw the animation named in their text. Compiled files (compiled/reanim/*.compiled) can be opened too and are saved as XML.'),
         h('h4', null, 'Particles (particles/*.xml)'),
         h('p', null, 'A list of <Emitter>s. Most properties are float tracks: "5", "[min max]" (random), "1,80 0" (value at 80% of the lifetime, then interpolate to the end) and curve keywords like EaseIn. Durations are in centiseconds.'),
         h('h4', null, 'Sounds & cues'),

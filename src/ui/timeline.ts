@@ -6,7 +6,7 @@
 import { clamp } from '../engine/math';
 import { LOOP_MODES, type LoopMode } from '../engine/reanimRuntime';
 import { basename } from '../engine/vfs';
-import { isAnimTrackName, isMarkerTrack } from '../formats/reanim';
+import { isMarkerTrack, isRangeTrack } from '../formats/reanim';
 import { EASES, type ReanimDocument } from '../editor/reanimDoc';
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
@@ -283,16 +283,18 @@ export class Timeline {
     const ranges = doc.animRanges();
     rows.push({ kind: 'header', label: 'ANIMATIONS', section: 'anims' });
     ranges.forEach((r, i) => rows.push({ kind: 'anim', trackIndex: r.trackIndex, name: r.name, start: r.start, end: r.end, color: ANIM_COLORS[i % ANIM_COLORS.length] }));
+    // Range tracks are anim_* tracks without images; anim_head1 and friends are parts.
+    const isRange = doc.state.tracks.map((t) => isRangeTrack(t));
     // anim_ tracks with no visible frames still deserve a row
     doc.state.tracks.forEach((t, i) => {
-      if (isAnimTrackName(t.name) && !ranges.some((r) => r.trackIndex === i)) rows.push({ kind: 'anim', trackIndex: i, name: t.name, start: -1, end: -1, color: '#666' });
+      if (isRange[i] && !ranges.some((r) => r.trackIndex === i)) rows.push({ kind: 'anim', trackIndex: i, name: t.name, start: -1, end: -1, color: '#666' });
     });
     rows.push({ kind: 'header', label: 'CUES', section: 'cues' });
     rows.push({ kind: 'sound' });
     rows.push({ kind: 'particle' });
     rows.push({ kind: 'header', label: 'PARTS  (top = front)', section: 'parts' });
     for (let i = doc.state.tracks.length - 1; i >= 0; i--) {
-      if (!isAnimTrackName(doc.state.tracks[i].name)) rows.push({ kind: 'track', trackIndex: i });
+      if (!isRange[i]) rows.push({ kind: 'track', trackIndex: i });
     }
     return rows;
   }

@@ -3,7 +3,7 @@
  * frame-time computation, transform interpolation and matrix construction.
  */
 
-import { isAnimTrackName, parseAttacher, type ReanimDefinition, type ReanimTransform } from '../formats/reanim';
+import { parseAttacher, type AttacherInfo, type ReanimDefinition, type ReanimTransform } from '../formats/reanim';
 import type { AssetLibrary } from './assets';
 import { DEG, mul, type Mat } from './math';
 import { textImage, type Renderer, type RGBA } from './renderer';
@@ -109,8 +109,13 @@ export interface DrawOptions {
   color?: RGBA;
   /** Per-track alpha multiplier (onion skins). */
   alpha?: number;
-  /** Seconds since playback start, used for attacher sub-animations. */
-  clock?: number;
+  /**
+   * How many frames per second `ft` advances at (the reanim's playback rate). Attachers
+   * use it to time their animations from the frame where they appeared. Default 12.
+   */
+  fps?: number;
+  /** Cross-fade from another pose of the same tracks (Reanimation::StartBlend); weight 1 = all `from`. */
+  blend?: { from: FrameTime; weight: number };
   /** Collect the drawn tracks (for hit testing / gizmos). */
   collect?: DrawTrackInfo[];
   tint?: (trackIndex: number) => RGBA | null;
@@ -124,7 +129,32 @@ export interface TrackLike {
   transforms: ReanimTransform[];
 }
 
-/** Draw all tracks of a reanim at a given frame time. */
+/** BlendTransform: mix position/scale/skew/alpha towards `from` by `weight`, taking skew the short way round. */
+export function blendTransform(t: ReanimTransform, from: ReanimTransform, weight: number): ReanimTransform {
+  const lerp = (a: number, b: number) => a + (b - a) * weight;
+  const near = (a: number, b: number) => {
+    while (b > a + 180) b -= 360;
+    while (b < a - 180) b += 360;
+    return b;
+  };
+  return {
+    ...t,
+    x: lerp(t.x, from.x),
+    y: lerp(t.y, from.y),
+    sx: lerp(t.sx, from.sx),
+    sy: lerp(t.sy, from.sy),
+    kx: lerp(t.kx, near(t.kx, from.kx)),
+    ky: lerp(t.ky, near(t.ky, from.ky)),
+    a: lerp(t.a, from.a),
+  };
+}
+
+/**
+ * Draw all tracks of a reanim at a given frame time, like Reanimation::Draw: every
+ * visible track with an image is drawn, whatever its name (a zombie's head is
+ * "anim_head1"); text only when it has a font; attacher__ tracks draw the reanim
+ * their text names.
+ */
 export function drawReanim(
   r: Renderer,
   assets: AssetLibrary,
@@ -135,12 +165,17 @@ export function drawReanim(
 ): void {
   const color = opts.color ?? [1, 1, 1, 1];
   const alphaMul = opts.alpha ?? 1;
+  const truncate = opts.truncateDisappearing ?? true;
   for (let ti = 0; ti < tracks.length; ti++) {
     const track = tracks[ti];
     if (opts.hidden?.(ti)) continue;
-    if (track.transforms.length === 0 || isAnimTrackName(track.name)) continue;
-    const t = interpolateTransform(track.transforms, ft, opts.truncateDisappearing ?? true);
+    if (track.transforms.length === 0) continue;
+    let t = interpolateTransform(track.transforms, ft, truncate);
     if (Math.round(t.f) < 0) continue;
+    if (opts.blend && opts.blend.weight > 0) {
+      const from = interpolateTransform(track.transforms, opts.blend.from, truncate);
+      if (Math.round(from.f) >= 0) t = blendTransform(t, from, opts.blend.weight);
+    }
     const alpha = Math.max(0, Math.min(1, t.a * color[3] * alphaMul));
     if (alpha <= 0) continue;
     const m = mul(base, transformMatrix(t));
@@ -157,43 +192,102 @@ export function drawReanim(
         r.fillRect(m, 24, 24, [1, 0.3, 0.6, 0.25 * alpha], 'normal');
         opts.collect?.push({ trackIndex: ti, matrix: m, transform: t, width: 24, height: 24 });
       }
-    } else if (t.text) {
+    } else if (t.text && t.font) {
+      // The game draws text only with a font; attacher tracks keep their spec in the text.
       const img = textImage(t.text, t.font);
       r.drawImage(img, 0, 0, img.width, img.height, m, c, 'normal');
       opts.collect?.push({ trackIndex: ti, matrix: m, transform: t, width: img.width, height: img.height });
     }
 
-    // Attachers: "attacher__ReanimName__anim_name[tags]" in the track name or text.
-    if ((opts.depth ?? 0) < 3 && track.name.toLowerCase().startsWith('attacher__')) {
-      const info = parseAttacher(t.text || track.name);
-      if (info) drawAttacher(r, assets, info.reanimName, info.trackName, info.fps, info.loop, m, opts, alpha);
+    // Attachers: a track named attacher__* whose text is "attacher__Reanim__anim_name[tags]".
+    if ((opts.depth ?? 0) < 3 && t.text && track.name.toLowerCase().startsWith('attacher__')) {
+      drawAttacher(r, assets, track.transforms, ft, m, c, opts);
     }
   }
 }
 
-function drawAttacher(
-  r: Renderer,
-  assets: AssetLibrary,
-  reanimName: string,
-  animName: string,
-  fps: number,
-  loop: 'loop' | 'once' | 'hold',
-  m: Mat,
-  opts: DrawOptions,
-  alpha: number,
-) {
-  const path = assets.findReanimPath(reanimName);
+/** StartBlend(20): 20 updates of 1/100 s. */
+const ATTACHER_BLEND_SECONDS = 0.2;
+
+interface AttacherSegment {
+  info: AttacherInfo;
+  /** Rate and loop mode are fixed when the attachment is created. */
+  rate: number;
+  loop: AttacherInfo['loop'];
+  /** Frame where the current animation (re)started. */
+  start: number;
+  trackName: string;
+  /** The animation shown before, if the attachment switched animations (for the blend). */
+  prev?: { start: number; trackName: string };
+}
+
+/**
+ * Where the attachment shown at frame `at` came from (Reanimation::UpdateAttacherTrack):
+ * a new attached reanim is created when the attacher appears or names another reanim,
+ * and its animation restarts (SetFramesForLayer) when the attacher names another track.
+ */
+function attacherSegment(transforms: ReanimTransform[], at: number): AttacherSegment | null {
+  at = Math.max(0, Math.min(at, transforms.length - 1));
+  const info = parseAttacher(transforms[at].text);
+  if (!info) return null;
+  const reanim = info.reanimName.toLowerCase();
+  let runStart = at;
+  for (let k = at - 1; k >= 0; k--) {
+    const t = transforms[k];
+    if (Math.round(t.f) < 0) break;
+    if (t.text !== transforms[k + 1].text) {
+      const other = parseAttacher(t.text);
+      if (!other || other.reanimName.toLowerCase() !== reanim) break;
+    }
+    runStart = k;
+  }
+  const first = parseAttacher(transforms[runStart].text) ?? info;
+  let start = runStart;
+  let trackName = first.trackName;
+  let prev: AttacherSegment['prev'];
+  for (let k = runStart + 1; k <= at; k++) {
+    if (transforms[k].text === transforms[k - 1].text) continue;
+    const next = parseAttacher(transforms[k].text);
+    if (next && next.trackName.toLowerCase() !== trackName.toLowerCase()) {
+      prev = { start, trackName };
+      start = k;
+      trackName = next.trackName;
+    }
+  }
+  return { info, rate: first.fps, loop: first.loop, start, trackName, prev };
+}
+
+function drawAttacher(r: Renderer, assets: AssetLibrary, transforms: ReanimTransform[], ft: FrameTime, m: Mat, color: RGBA, opts: DrawOptions) {
+  const seg = attacherSegment(transforms, ft.before);
+  if (!seg) return;
+  const path = assets.findReanimPath(seg.info.reanimName);
   if (!path) return;
   const def = assets.reanim(path);
   if (!def) return;
-  const range = animRangeOf(def, animName);
-  const dur = rangeDuration(range.count, fps, false);
-  const clock = opts.clock ?? 0;
-  let animTime = dur > 0 ? clock / dur : 0;
-  if (loop === 'loop') animTime -= Math.floor(animTime);
-  else animTime = Math.min(1, animTime);
-  const ft = computeFrameTime(range.start, range.count, animTime, false);
-  drawReanim(r, assets, def.tracks, ft, m, { clock, depth: (opts.depth ?? 0) + 1, alpha: alpha * (opts.alpha ?? 1) });
+  const parentFps = Math.max(1e-3, opts.fps ?? 12);
+  const pos = ft.before + ft.fraction;
+  // Reanimation::Update: mAnimTime += SECONDS_PER_UPDATE * mAnimRate / mFrameCount.
+  const timeAt = (from: number, trackName: string, until: number): FrameTime => {
+    const range = animRangeOf(def, trackName);
+    let animTime = ((Math.max(0, until - from) / parentFps) * seg.rate) / Math.max(1, range.count);
+    if (seg.loop === 'loop') animTime -= Math.floor(animTime);
+    else animTime = Math.min(1, animTime);
+    return computeFrameTime(range.start, range.count, animTime, false);
+  };
+  const cur = timeAt(seg.start, seg.trackName, pos);
+  let blend: DrawOptions['blend'];
+  if (seg.prev) {
+    const since = (pos - seg.start) / parentFps;
+    if (since < ATTACHER_BLEND_SECONDS) blend = { from: timeAt(seg.prev.start, seg.prev.trackName, seg.start), weight: 1 - since / ATTACHER_BLEND_SECONDS };
+  }
+  const range = animRangeOf(def, seg.trackName);
+  drawReanim(r, assets, def.tracks, cur, m, {
+    color,
+    depth: (opts.depth ?? 0) + 1,
+    // The attached reanim's frames advance at rate * (count - 1) / count per second.
+    fps: (seg.rate * Math.max(1, range.count - 1)) / Math.max(1, range.count),
+    blend,
+  });
 }
 
 export function animRangeOf(def: ReanimDefinition, animName: string): { start: number; count: number } {

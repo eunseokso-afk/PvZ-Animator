@@ -341,7 +341,7 @@ function measure(ws: Workspace, doc: ReanimDocument, frames: number[]): { x: num
   const nr = new NullRenderer();
   for (const f of frames) {
     const infos: DrawTrackInfo[] = [];
-    drawReanim(nr, ws.assets, doc.state.tracks, { before: f, after: f, fraction: 0 }, [1, 0, 0, 1, 0, 0], { collect: infos, hidden: (i) => doc.ui.hidden.has(doc.state.tracks[i].uid) });
+    drawReanim(nr, ws.assets, doc.state.tracks, { before: f, after: f, fraction: 0 }, [1, 0, 0, 1, 0, 0], { collect: infos, fps: doc.fps, hidden: (i) => doc.ui.hidden.has(doc.state.tracks[i].uid) });
     for (const info of infos) {
       for (const [cx, cy] of [
         [0, 0],
@@ -373,7 +373,7 @@ async function exportTarget(ws: Workspace): Promise<ExportTarget | null> {
       box: { x: 0, y: 0, w: s.width, h: s.height },
       isScene: true,
       defaultLoops: 1,
-      draw: (r, base, frame, background) => drawScene(r, res, s, frame, base, { hidden: (l) => scene.ui.hidden.has(l.uid), clock: ws.clock, drawBackground: background }),
+      draw: (r, base, frame, background) => drawScene(r, res, s, frame, base, { hidden: (l) => scene.ui.hidden.has(l.uid), drawBackground: background }),
       playingFrame: () => ws.sceneFrame(scene),
     };
   }
@@ -392,7 +392,7 @@ async function exportTarget(ws: Workspace): Promise<ExportTarget | null> {
     draw: (r, base, frame) => {
       const playing = ws.playing && ws.active === doc;
       const ft = playing ? ws.frameTime(doc) : { before: frame, after: frame, fraction: 0 };
-      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, clock: ws.clock });
+      drawReanim(r, ws.assets, doc.state.tracks, ft, base, { hidden, fps: doc.fps });
       if (playing) {
         for (const l of ws.live) l.sys.draw(r, ws.assets, base);
       } else {

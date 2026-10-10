@@ -3,7 +3,7 @@
  * emitters or images, positioned by their tweened keyframes.
  */
 
-import { DEFAULT_TRANSFORM, isAnimTrackName, type ReanimDefinition, type ReanimTransform } from '../formats/reanim';
+import { DEFAULT_TRANSFORM, isRangeTrack, type ReanimDefinition, type ReanimTransform } from '../formats/reanim';
 import type { LayerPose, SceneLayer, SceneState } from '../editor/sceneDoc';
 import { evalLayer, poseMatrix } from '../editor/sceneDoc';
 import type { AssetLibrary } from './assets';
@@ -56,8 +56,6 @@ export interface DrawnLayer {
 export interface SceneDrawOptions {
   hidden?: (layer: SceneLayer) => boolean;
   collect?: DrawnLayer[];
-  /** Seconds of playback, for attacher sub-animations. */
-  clock?: number;
   /** Multiply every layer's alpha (onion skins). */
   alpha?: number;
   drawBackground?: boolean;
@@ -112,7 +110,7 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
       const prefab = res.prefab(layer.source);
       if (prefab) {
         const ft = instanceFrameTime(prefab, pose, scene.fps, frame);
-        drawReanim(r, assets, prefab.tracks, ft, m, { color, clock: opts.clock, collect: parts });
+        drawReanim(r, assets, prefab.tracks, ft, m, { color, fps: prefab.fps * (pose.key.speed > 0 ? pose.key.speed : 1), collect: parts });
       } else if (prefab === null) {
         r.fillRect(m, 40, 40, [1, 0.3, 0.6, 0.3 * color[3]], 'normal');
         parts.push({ trackIndex: -1, matrix: m, transform: { ...DEFAULT_TRANSFORM }, width: 40, height: 40 });
@@ -208,7 +206,7 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
       continue;
     }
     prefab.tracks.forEach((track) => {
-      if (isAnimTrackName(track.name) || track.transforms.length === 0) return;
+      if (isRangeTrack(track) || track.transforms.length === 0) return;
       const transforms: ReanimTransform[] = [];
       let any = false;
       for (let f = 0; f < n; f++) {
@@ -228,7 +226,9 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
         const d = decomposeMatrix(mul(poseMatrix(pose), transformMatrix(t)));
         transforms.push({ ...t, ...d, f: 0, a: t.a * pose.alpha });
       }
-      if (any) tracks.push({ name: unique(`${base}_${sanitize(track.name)}`), transforms });
+      // The game only treats tracks named attacher__* as attachers, so keep that prefix.
+      const attacher = track.name.toLowerCase().startsWith('attacher__');
+      if (any) tracks.push({ name: unique(attacher ? `attacher__${base}_${tracks.length}` : `${base}_${sanitize(track.name)}`), transforms });
     });
   }
   if (tinted) warnings.push('Tints were dropped: the reanim format has no per-track color.');

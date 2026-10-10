@@ -1,7 +1,7 @@
 /** Right-hand property panel for reanim documents. */
 
 import { basename } from '../engine/vfs';
-import { isAnimTrackName, type ReanimTransform } from '../formats/reanim';
+import { isRangeTrack, type ReanimTransform } from '../formats/reanim';
 import { EASES, type ReanimDocument } from '../editor/reanimDoc';
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
@@ -83,7 +83,7 @@ export class ReanimInspector {
       { class: 'insp-section' },
       h('h3', null, 'Reanim'),
       h('label', { class: 'field-col' }, 'Saved as', pathInput),
-      h('div', { class: 'insp-stats' }, `${doc.state.tracks.filter((t) => !isAnimTrackName(t.name)).length} parts · ${doc.animRanges().length} animations · ${doc.frameCount} frames · ${doc.fps} fps`),
+      h('div', { class: 'insp-stats' }, `${doc.state.tracks.filter((t) => !isRangeTrack(t)).length} parts · ${doc.animRanges().length} animations · ${doc.frameCount} frames · ${doc.fps} fps`),
     );
   }
 
@@ -228,7 +228,12 @@ export class ReanimInspector {
       { class: 'insp-section' },
       h('h3', null, 'Part', h('span', { class: 'dim small' }, ` #${ti}`)),
       h('label', { class: 'field-col' }, 'Track name', nameInput),
-      isAnimTrackName(track.name) ? h('div', { class: 'dim small' }, 'anim_ tracks mark animation ranges (f = 0 inside, -1 outside).') : null,
+      isRangeTrack(track) ? h('div', { class: 'dim small' }, 'anim_ tracks without images mark animation ranges (f = 0 inside, -1 outside).') : null,
+      track.name.toLowerCase().startsWith('attacher__')
+        ? h('div', { class: 'dim small' }, 'Attacher: the text holds "attacher__Reanim__anim_name[fps][once|hold]"; that animation is drawn at this part.')
+        : t.text && !t.font
+          ? h('div', { class: 'dim small' }, 'Text is only drawn when a font is set, as in the game.')
+          : null,
       imageRow,
       keyRow,
       visible,
@@ -358,7 +363,7 @@ export class ReanimInspector {
     }
     const cue = doc.state.particleCues.find((c) => c.uid === ref.uid);
     if (!cue) return this.hint();
-    const trackOptions = [{ value: '', label: '(fixed position)' }, ...doc.state.tracks.filter((t) => !isAnimTrackName(t.name)).map((t) => ({ value: t.name, label: t.name }))];
+    const trackOptions = [{ value: '', label: '(fixed position)' }, ...doc.state.tracks.filter((t) => !isRangeTrack(t)).map((t) => ({ value: t.name, label: t.name }))];
     return h(
       'section',
       { class: 'insp-section' },

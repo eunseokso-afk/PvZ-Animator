@@ -10,8 +10,10 @@
  *   a        alpha 0..1
  *   i        image id (IMAGE_REANIM_*)
  *   font, text  for text tracks
- * Tracks named "anim_*" carry no image; their f values mark the frame range
- * of a named animation (f = 0 inside the range, -1 outside).
+ * Tracks named "anim_*" that carry no image or text mark the frame range of a
+ * named animation (f = 0 inside the range, -1 outside). The game draws every
+ * track that has an image whatever its name, so image tracks such as a
+ * zombie's "anim_head1" are ordinary parts.
  */
 
 import { decodeEntities, elements, escapeXml, findChild, parseXmlFragment, textContent, type XmlElement } from './xml';
@@ -200,6 +202,21 @@ export function isAnimTrackName(name: string): boolean {
   return name.toLowerCase().startsWith('anim_');
 }
 
+type TrackShape = { name: string; transforms: { f: number; i?: string; text?: string }[] };
+
+/** Whether any frame of a track shows an image or text. */
+export function hasVisuals(track: { transforms: { i?: string; text?: string }[] }): boolean {
+  return track.transforms.some((t) => !!(t.i || t.text));
+}
+
+/**
+ * An "anim_*" track that only marks the frame range of a named animation. Image
+ * tracks named anim_* (anim_head1, anim_tongue, anim_cone…) are parts instead.
+ */
+export function isRangeTrack(track: TrackShape): boolean {
+  return isAnimTrackName(track.name) && !hasVisuals(track);
+}
+
 /** Frame range of an anim_ track: first..last frame where f >= 0. (Reanimation::GetFramesForLayer) */
 export function rangeOfTrack(transforms: { f: number }[]): { start: number; end: number } | null {
   let start = -1;
@@ -220,20 +237,19 @@ export function rangeOfTrack(transforms: { f: number }[]): { start: number; end:
   return { start, end };
 }
 
-export function getAnimRanges(tracks: { name: string; transforms: { f: number }[] }[]): AnimRange[] {
+export function getAnimRanges(tracks: TrackShape[]): AnimRange[] {
   const out: AnimRange[] = [];
   tracks.forEach((t, idx) => {
-    if (!isAnimTrackName(t.name)) return;
+    if (!isRangeTrack(t)) return;
     const r = rangeOfTrack(t.transforms);
     if (r) out.push({ name: t.name, start: r.start, end: r.end, trackIndex: idx });
   });
   return out;
 }
 
-/** Tracks that never draw anything: anim_ markers, _ground, attachers etc. */
+/** Tracks that never draw anything themselves: anim_ range markers, _ground, attachers etc. */
 export function isMarkerTrack(track: { name: string; transforms: ReanimTransform[] }): boolean {
-  if (isAnimTrackName(track.name)) return true;
-  return !track.transforms.some((t) => t.i || t.text);
+  return !track.transforms.some((t) => t.i || (t.text && t.font));
 }
 
 export interface AttacherInfo {

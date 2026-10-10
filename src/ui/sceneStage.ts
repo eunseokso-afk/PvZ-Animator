@@ -78,11 +78,11 @@ export class SceneStage {
       // Onion skin: neighbouring frames, faded, without the stage background.
       for (const g of [frame - 2, frame + 2]) {
         if (g < 0 || g >= doc.state.length) continue;
-        drawScene(r, { ...res, particles: undefined }, doc.state, g, view, { hidden, alpha: 0.25, drawBackground: false, clock: this.ws.clock });
+        drawScene(r, { ...res, particles: undefined }, doc.state, g, view, { hidden, alpha: 0.25, drawBackground: false });
       }
     }
     this.drawn = [];
-    drawScene(r, res, doc.state, frame, view, { hidden, collect: this.drawn, clock: this.ws.clock });
+    drawScene(r, res, doc.state, frame, view, { hidden, collect: this.drawn });
   }
 
   private corners(d: DrawnLayer): [number, number][] | null {
