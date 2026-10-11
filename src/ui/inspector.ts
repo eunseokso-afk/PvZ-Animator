@@ -244,8 +244,17 @@ export class ReanimInspector {
         ? h(
             'div',
             { class: 'insp-grid1' },
-            h('label', { class: 'field-col' }, 'Text', this.textInput(t.text, (v) => set({ text: v }, 'Change text', true, true))),
-            h('label', { class: 'field-col' }, 'Font', fontInput(ws, t.font, (v) => set({ font: v }, 'Change font', true, true))),
+            h('label', { class: 'field-col' }, 'Text (changes at keys)', this.textInput(t.text, (v) => set({ text: v }, 'Change text', true, true))),
+            h(
+              'label',
+              { class: 'field-col' },
+              'Font (whole part)',
+              fontInput(ws, t.font, (v) => {
+                if (ws.playing) ws.pause();
+                doc.replaceFont(ti, t.font, v);
+                ws.emit('change');
+              }),
+            ),
           )
         : null;
 

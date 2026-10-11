@@ -204,14 +204,20 @@ export function fontInput(ws: Workspace, value: string, onChange: (font: string)
     onchange: () => onChange(input.value.trim().toUpperCase()),
   });
   input.setAttribute('list', id);
-  const loaded = ws.assets.font(value);
-  const note = h('div', { class: 'dim small' }, !value ? '' : loaded ? `Bitmap font from ${loaded.path}` : loaded === null ? 'Not in the loaded files: shown with a similar system font' : 'Loading…');
+  const describe = (f: { path: string } | null | undefined) => (!value ? '' : f ? `Bitmap font from ${f.path}` : f === null ? 'Not in the loaded files: shown with a similar system font' : 'Loading…');
+  const loaded = value ? ws.assets.font(value) : null;
+  const note = h('div', { class: 'dim small' }, describe(loaded));
+  if (value && loaded === undefined) void ws.assets.loadFont(value).then((f) => (note.textContent = describe(f)));
   return h('div', { class: 'font-input' }, input, list, note);
 }
 
-/** The font new text uses: PvZ's House of Terror if available, else the first known font. */
+/**
+ * The font new text uses: PvZ's House of Terror if its bitmap font is loaded, else the
+ * first bitmap font that is, else House of Terror (drawn with a system font until a pak is open).
+ */
 export function defaultFont(ws: Workspace): string {
   const ids = ws.assets.fontIds();
-  return ids.find((f) => f === 'FONT_HOUSEOFTERROR28') ?? ids[0] ?? 'FONT_HOUSEOFTERROR28';
+  const loadable = ids.filter((f) => ws.assets.resolveFont(f));
+  return loadable.find((f) => f === 'FONT_HOUSEOFTERROR28') ?? loadable[0] ?? 'FONT_HOUSEOFTERROR28';
 }
 

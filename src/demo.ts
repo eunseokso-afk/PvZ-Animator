@@ -319,7 +319,7 @@ async function makeFont(): Promise<{ path: string; data: Uint8Array }[]> {
     'LayerSetImageMap Outline CharList RectList;',
     'LayerSetCharOffsets Outline CharList OffsetList;',
     'LayerSetColorMult Outline (0.18, 0.1, 0.02, 1);',
-    'CreateLayer Main Outline;',
+    'CreateLayerFrom Main Outline;',
     "LayerSetImage Main 'DemoFont.png';",
     'LayerSetColorMult Main (1, 0.86, 0.3, 1);',
     `SetDefaultPointSize ${size};`,

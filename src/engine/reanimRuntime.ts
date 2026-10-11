@@ -8,7 +8,7 @@ import type { AssetLibrary } from './assets';
 import { DEG, mul, type Mat } from './math';
 import { creditsHidesTongue } from './gameVisibility';
 import type { Renderer, RGBA } from './renderer';
-import { textImage } from './text';
+import { renderText } from './text';
 
 export type LoopMode = 'loop' | 'loopFullLastFrame' | 'once' | 'onceAndHold' | 'onceFullLastFrame' | 'onceAndHoldFullLastFrame';
 
@@ -112,6 +112,20 @@ export interface DrawTrackInfo {
   height: number;
   /** A part of a reanim drawn by attacher track `trackIndex` (not the track's own image). */
   attached?: boolean;
+  /**
+   * Where the box (matrix, width, height) starts relative to the track's transform
+   * origin, for text, which is drawn above and right of its baseline origin.
+   */
+  origin?: [number, number];
+}
+
+/** Draw text with its origin (left end of the baseline) at `m`; returns its box, or null while the font loads. */
+export function drawTextAt(r: Renderer, assets: AssetLibrary, text: string, font: string, m: Readonly<Mat>, color: RGBA): { matrix: Mat; width: number; height: number; origin: [number, number] } | null {
+  const t = renderText(assets, text, font);
+  if (!t) return null;
+  for (const run of t.runs) r.drawImage(run.img, 0, 0, run.img.width, run.img.height, mul(m, [1, 0, 0, 1, run.ox, run.oy]), color, run.blend);
+  const [x0, y0, x1, y1] = t.bounds;
+  return { matrix: mul(m, [1, 0, 0, 1, x0, y0]), width: x1 - x0, height: y1 - y0, origin: [x0, y0] };
 }
 
 export interface DrawOptions {
@@ -220,12 +234,8 @@ export function drawReanim(
       }
     } else if (t.text && t.font) {
       // The game draws text only with a font; attacher tracks keep their spec in the text.
-      const img = textImage(assets, t.text, t.font);
-      if (img) {
-        const mt = mul(m, [1, 0, 0, 1, img.ox, img.oy]);
-        r.drawImage(img, 0, 0, img.width, img.height, mt, c, 'normal');
-        opts.collect?.push({ trackIndex: ti, matrix: mt, transform: t, width: img.width, height: img.height });
-      }
+      const box = drawTextAt(r, assets, t.text, t.font, m, c);
+      if (box) opts.collect?.push({ trackIndex: ti, transform: t, ...box });
     } else if (track.name.toLowerCase() === 'fullscreen') {
       // DrawTrack: a "fullscreen" track fills the 800x600 screen with its colour, ignoring its transform.
       r.fillRect(opts.screen ?? base, SCREEN_W, SCREEN_H, c, 'normal');

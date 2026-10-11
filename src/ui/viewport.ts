@@ -22,8 +22,8 @@ export const ASSET_MIME = 'application/x-pvz-asset';
 type Drag =
   | { kind: 'pan'; sx: number; sy: number; px: number; py: number; moved: boolean; button: number; hit: number }
   | { kind: 'move'; sx: number; sy: number; start: ReanimTransform; track: number; frame: number; began: boolean; selectOnly: boolean }
-  | { kind: 'rotate'; track: number; frame: number; start: ReanimTransform; w: number; h: number; startAngle: number; pivot: [number, number] }
-  | { kind: 'scale'; track: number; frame: number; start: ReanimTransform; w: number; h: number; corner: [number, number]; inv: Mat; pivot: [number, number] }
+  | { kind: 'rotate'; track: number; frame: number; start: ReanimTransform; center: [number, number]; startAngle: number; pivot: [number, number] }
+  | { kind: 'scale'; track: number; frame: number; start: ReanimTransform; center: [number, number]; corner: [number, number]; inv: Mat; pivot: [number, number] }
   | { kind: 'emitter'; sx: number; sy: number; ox: number; oy: number }
   | { kind: 'cue'; uid: number; sx: number; sy: number; began: boolean }
   | { kind: 'scene' };
@@ -756,25 +756,27 @@ export class Viewport {
       const sel = this.drawn.find((i) => i.trackIndex === doc.ui.track && !i.attached)!;
       const track = doc.state.tracks[doc.ui.track];
       const start = { ...track.transforms[frame] };
-      const pivot = apply(transformMatrix(start), sel.width / 2, sel.height / 2);
+      // The part's box in its own space (text sits above and right of its baseline origin).
+      const [ox, oy] = sel.origin ?? [0, 0];
+      const center: [number, number] = [ox + sel.width / 2, oy + sel.height / 2];
+      const pivot = apply(transformMatrix(start), center[0], center[1]);
       doc.checkpoint(handle.kind === 'rotate' ? 'Rotate part' : 'Scale part');
       if (handle.kind === 'rotate') {
         const [wx, wy] = this.toWorld(doc, x, y);
-        this.drag = { kind: 'rotate', track: doc.ui.track, frame, start, w: sel.width, h: sel.height, startAngle: Math.atan2(wy - pivot[1], wx - pivot[0]), pivot };
+        this.drag = { kind: 'rotate', track: doc.ui.track, frame, start, center, startAngle: Math.atan2(wy - pivot[1], wx - pivot[0]), pivot };
       } else {
         const corners: [number, number][] = [
-          [0, 0],
-          [sel.width, 0],
-          [sel.width, sel.height],
-          [0, sel.height],
+          [ox, oy],
+          [ox + sel.width, oy],
+          [ox + sel.width, oy + sel.height],
+          [ox, oy + sel.height],
         ];
         this.drag = {
           kind: 'scale',
           track: doc.ui.track,
           frame,
           start,
-          w: sel.width,
-          h: sel.height,
+          center,
           corner: corners[handle.corner],
           inv: invert(transformMatrix(start)) ?? [1, 0, 0, 1, 0, 0],
           pivot,
@@ -870,7 +872,7 @@ export class Viewport {
           delta = kx - drag.start.kx;
         }
         const t = { ...drag.start, kx: round2(drag.start.kx + delta), ky: round2(drag.start.ky + delta) };
-        keepPivot(t, drag.w, drag.h, drag.pivot);
+        keepPivot(t, drag.center, drag.pivot);
         doc.setFields(drag.track, drag.frame, { x: t.x, y: t.y, kx: t.kx, ky: t.ky });
         this.ws.emit('change');
         break;
@@ -879,8 +881,7 @@ export class Viewport {
         if (doc.kind !== 'reanim') break;
         const [wx, wy] = this.toWorld(doc, x, y);
         const [lx, ly] = apply(drag.inv, wx, wy);
-        const cx = drag.w / 2;
-        const cy = drag.h / 2;
+        const [cx, cy] = drag.center;
         let fx = (lx - cx) / (drag.corner[0] - cx || 1);
         let fy = (ly - cy) / (drag.corner[1] - cy || 1);
         if (e.shiftKey) {
@@ -889,7 +890,7 @@ export class Viewport {
           fy = Math.sign(fy || 1) * u;
         }
         const t = { ...drag.start, sx: round3(drag.start.sx * fx), sy: round3(drag.start.sy * fy) };
-        keepPivot(t, drag.w, drag.h, drag.pivot);
+        keepPivot(t, drag.center, drag.pivot);
         doc.setFields(drag.track, drag.frame, { x: t.x, y: t.y, sx: t.sx, sy: t.sy });
         this.ws.emit('change');
         break;
@@ -1021,10 +1022,10 @@ function round3(v: number): number {
   return Math.round(v * 1000) / 1000;
 }
 
-/** Adjust x/y so the image center stays at `pivot` after changing rotation/scale. */
-function keepPivot(t: ReanimTransform, w: number, h: number, pivot: [number, number]) {
+/** Adjust x/y so the part's centre (`center`, in its own space) stays at `pivot` after changing rotation/scale. */
+function keepPivot(t: ReanimTransform, center: [number, number], pivot: [number, number]) {
   const m = transformMatrix({ ...t, x: 0, y: 0 });
-  const [cx, cy] = apply(m, w / 2, h / 2);
+  const [cx, cy] = apply(m, center[0], center[1]);
   t.x = round2(pivot[0] - cx);
   t.y = round2(pivot[1] - cy);
 }

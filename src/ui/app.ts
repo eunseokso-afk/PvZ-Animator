@@ -836,7 +836,8 @@ export class App {
       { label: 'Rename…', shortcut: 'F2', action: () => void this.renameTrack(doc, ti) },
       {
         label: 'Change image…',
-        disabled: isRangeTrack(track),
+        // Text parts have no image (an image would replace the words).
+        disabled: isRangeTrack(track) || track.transforms.some((t) => !t.i && t.text && t.font),
         action: async () => {
           const r = await pickImage(ws, `Image for "${track.name}" from frame ${doc.ui.frame}`, 'reanim', track.transforms[doc.ui.frame]?.i);
           if (r) {
@@ -946,7 +947,7 @@ export class App {
 
   /** Add a text part, drawn with a PvZ font (the game needs a font to show text). */
   private async addTextPart(doc: ReanimDocument) {
-    const text = await promptText('Add text', 'Text', 'Hello, neighbor!');
+    const text = (await promptText('Add text', 'Text', 'Hello, neighbor!'))?.trim();
     if (!text) return;
     const ti = doc.addTextTrack(text, defaultFont(this.ws), 0, 0);
     doc.ui.track = ti;

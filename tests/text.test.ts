@@ -21,7 +21,7 @@ LayerSetImageMap Outline CharList RectList;
 LayerSetCharOffsets Outline CharList OffsetList;
 LayerSetKerningPairs Outline ( "AB" ) ( -2 );
 LayerSetColorMult Outline (0.2, 0.1, 0, 1);
-CreateLayer Main Outline;
+CreateLayerFrom Main Outline;
 LayerSetImage Main "Tiny.png";
 LayerSetColorMult Main (1, 1, 1, 1);
 CreateLayer Glow;
@@ -48,7 +48,7 @@ describe('PopCap ImageFont descriptors', () => {
       ['Glow', 'Glow.png'],
     ]);
     const main = def.layers[1];
-    // CreateLayer Main Outline copies everything, then its own settings apply.
+    // CreateLayerFrom Main Outline copies everything, then its own settings apply.
     expect(main.ascent).toBe(16);
     expect(main.colorMult).toEqual([1, 1, 1, 1]);
     expect(def.layers[0].colorMult).toEqual([0.2, 0.1, 0, 1]);
@@ -77,8 +77,44 @@ describe('PopCap ImageFont descriptors', () => {
       [27 - 1, -16],
     ]);
     expect(width).toBe(27 + 10);
-    // All outline glyphs come before all fill glyphs.
-    expect(quads.findIndex((q) => q.layer === 1)).toBe(3);
+    // Like the game, glyphs are drawn character by character (outline then fill of each).
+    expect(quads.slice(0, 2).map((q) => q.layer)).toEqual([0, 1]);
+  });
+
+  it('copies layers with CreateLayerFrom and orders them with LayerSetBaseOrder', () => {
+    const def = parseImageFont(`
+      Define C ( 'A', 'B' ); Define W ( 10, 10 ); Define R ( (0,0,8,8), (8,0,8,8) );
+      CreateLayer Main; LayerSetImage Main 'f.png'; LayerSetAscent Main 8;
+      LayerSetCharWidths Main C W; LayerSetImageMap Main C R;
+      CreateLayerFrom Shadow Main; LayerSetOffset Shadow (2, 2); LayerSetBaseOrder Shadow -1;
+      CreateLayerFrom Ghost Missing;`);
+    expect(def.layers.map((l) => l.name)).toEqual(['Main', 'Shadow']);
+    expect(def.warnings).toHaveLength(1);
+    const { quads } = layoutText(def, 'AB');
+    // The shadow (order -1) goes under both letters, then the main glyphs.
+    expect(quads.map((q) => [q.layer, q.x, q.y])).toEqual([
+      [1, 2, -6],
+      [1, 12, -6],
+      [0, 0, -8],
+      [0, 10, -8],
+    ]);
+  });
+
+  it('scales layers drawn at another point size and reads colours like the game', () => {
+    const def = parseImageFont(`
+      Define C ( 'A' ); Define W ( 20 ); Define R ( (0,0,20,30) );
+      CreateLayer Main; LayerSetImage Main 'f.png'; LayerSetAscent Main 24; LayerSetPointSize Main 28;
+      LayerSetCharWidths Main C W; LayerSetImageMap Main C R;
+      LayerSetColorMult Main 0xFF808080; LayerSetColorAdd Main (0.5, 0, 0);
+      CreateLayer Big; LayerPointRange Big 20 100;
+      SetDefaultPointSize 14;`);
+    const { quads, width } = layoutText(def, 'A');
+    expect(quads[0]).toMatchObject({ x: 0, y: -12, dw: 10, dh: 15 });
+    expect(width).toBe(10);
+    expect(def.layers[0].colorMult.map((v) => Math.round(v * 255))).toEqual([128, 128, 128, 255]);
+    expect(def.layers[0].colorAdd).toEqual([0.5, 0, 0, 1]);
+    // Big is only for 20..100 pt, and the font is 14 pt.
+    expect(activeLayers(def)).toEqual([0]);
   });
 });
 

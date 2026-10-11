@@ -777,7 +777,7 @@ export class SceneTimeline {
         disabled: !key || locked,
         submenu: EASES.map((ea) => ({ label: ea.label, checked: key?.ease === ea.id, action: () => (doc.setEase(li, frame, ea.id), emit()) })),
       },
-      ...(layer.kind !== 'image'
+      ...(layer.kind === 'reanim' || layer.kind === 'particle'
         ? [{ label: layer.kind === 'particle' ? 'Restart effect here' : 'Restart animation here', checked: isKey && key?.restart, disabled: locked, action: () => (doc.setKey(li, frame, { restart: !(isKey && key?.restart) }, 'Toggle restart'), emit()) }]
         : []),
       { separator: true },

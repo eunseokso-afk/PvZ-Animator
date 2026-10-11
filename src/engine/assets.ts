@@ -396,9 +396,12 @@ export class AssetLibrary extends EventTarget {
   fontIds(): string[] {
     const ids = new Set<string>();
     for (const f of this.manifest.fonts.values()) ids.add(f.id);
-    for (const f of this.vfs.list()) {
-      const m = /^data\/([^/]+)\.txt$/i.exec(f.path);
-      if (m && !/^(lawnstrings|properties)/i.test(m[1])) ids.add(`FONT_${m[1].toUpperCase()}`);
+    // Without resources.xml, guess fonts from descriptors in data/ (the game only uses declared ones).
+    if (!this.manifest.fonts.size) {
+      for (const f of this.vfs.list()) {
+        const m = /^data\/([^/]+)\.txt$/i.exec(f.path);
+        if (m && !/^(lawnstrings|properties)/i.test(m[1])) ids.add(`FONT_${m[1].toUpperCase()}`);
+      }
     }
     // Without the game's resources.xml, also offer the usual PvZ font ids (drawn with a system font).
     if (!this.manifest.fonts.size) for (const f of COMMON_PVZ_FONTS) ids.add(f);

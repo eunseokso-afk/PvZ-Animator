@@ -25,6 +25,8 @@ export interface FontChar {
   width: number;
   /** Extra advance before the given next character. */
   kerning: Map<string, number>;
+  /** LayerSetCharOrders: added to the layer's base order. */
+  order: number;
 }
 
 export interface FontLayer {
@@ -41,8 +43,12 @@ export interface FontLayer {
   offsetY: number;
   /** 0..1 per channel (r, g, b, a). */
   colorMult: [number, number, number, number];
-  /** 0..255 per channel (r, g, b, a). */
+  /** 0..1 per channel (r, g, b, a), added to the colour after multiplying. */
   colorAdd: [number, number, number, number];
+  /** LayerSetPointSize: the size the glyph images were made for (0 = the font's size). */
+  pointSize: number;
+  /** LayerSetBaseOrder: lower orders are drawn first. */
+  baseOrder: number;
   /** 0 = normal, 1 = additive. */
   drawMode: number;
   minPointSize: number;
@@ -59,6 +65,8 @@ export interface FontDefinition {
   charMap: Map<string, string>;
   /** Files pulled in with Include (relative to the descriptor's folder). */
   includes: string[];
+  /** Commands that could not be applied. */
+  warnings: string[];
 }
 
 // ---------------------------------------------------------------- tokenizer and statements
@@ -90,6 +98,12 @@ function tokenize(src: string): Token[] {
       i++;
       out.push({ kind: 'str', value: s });
     } else if (/\d/.test(c) || ((c === '-' || c === '+' || c === '.') && /[\d.]/.test(src[i + 1] ?? ''))) {
+      const hex = /^0[xX][0-9a-fA-F]+/.exec(src.slice(i));
+      if (hex) {
+        out.push({ kind: 'num', value: String(parseInt(hex[0], 16)) });
+        i += hex[0].length;
+        continue;
+      }
       const m = /^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?/.exec(src.slice(i));
       if (!m) {
         i++;
@@ -175,6 +189,8 @@ function newLayer(name: string, base?: FontLayer): FontLayer {
     offsetY: 0,
     colorMult: [1, 1, 1, 1],
     colorAdd: [0, 0, 0, 0],
+    pointSize: 0,
+    baseOrder: 0,
     drawMode: 0,
     minPointSize: -1,
     maxPointSize: -1,
@@ -189,7 +205,7 @@ function newLayer(name: string, base?: FontLayer): FontLayer {
  * or undefined if it is missing.
  */
 export function parseImageFont(src: string, include?: (path: string) => string | undefined): FontDefinition {
-  const def: FontDefinition = { layers: [], defaultPointSize: 0, charMap: new Map(), includes: [] };
+  const def: FontDefinition = { layers: [], defaultPointSize: 0, charMap: new Map(), includes: [], warnings: [] };
   const defines = new Map<string, FontValue>();
   const layers = new Map<string, FontLayer>();
   const resolve = (v: FontValue | undefined): FontValue | undefined => {
@@ -210,6 +226,23 @@ export function parseImageFont(src: string, include?: (path: string) => string |
     return typeof r === 'string' ? r : typeof r === 'number' ? String(r) : '';
   };
   const nums = (v: FontValue | undefined): number[] => list(v).map((x) => num(x));
+  /**
+   * FontData::GetColorFromDataElement: a list is (r, g, b[, a]) in 0..1; a single
+   * number is an ARGB integer (often written in hex).
+   */
+  const color = (v: FontValue | undefined, fallback: number): [number, number, number, number] => {
+    const r = resolve(v);
+    if (Array.isArray(r)) {
+      const c = r.map((x) => num(x, fallback));
+      return [c[0] ?? fallback, c[1] ?? fallback, c[2] ?? fallback, c[3] ?? 1];
+    }
+    const n = num(r, NaN);
+    if (Number.isFinite(n)) {
+      const argb = n >>> 0;
+      return [((argb >>> 16) & 255) / 255, ((argb >>> 8) & 255) / 255, (argb & 255) / 255, ((argb >>> 24) & 255) / 255];
+    }
+    return [fallback, fallback, fallback, 1];
+  };
   const layerOf = (v: FontValue | undefined): FontLayer | undefined => {
     const name = v && typeof v === 'object' && !Array.isArray(v) ? v.ref : str(v);
     return layers.get(name.toLowerCase());
@@ -217,7 +250,7 @@ export function parseImageFont(src: string, include?: (path: string) => string |
   const charOf = (layer: FontLayer, c: string): FontChar => {
     let ch = layer.chars.get(c);
     if (!ch) {
-      ch = { rect: { x: 0, y: 0, w: 0, h: 0 }, offsetX: 0, offsetY: 0, width: 0, kerning: new Map() };
+      ch = { rect: { x: 0, y: 0, w: 0, h: 0 }, offsetX: 0, offsetY: 0, width: 0, kerning: new Map(), order: 0 };
       layer.chars.set(c, ch);
     }
     return ch;
@@ -243,10 +276,18 @@ export function parseImageFont(src: string, include?: (path: string) => string |
           if (sub !== undefined) run(sub, depth + 1);
           break;
         }
-        case 'createlayer': {
+        case 'createlayer':
+        case 'createlayerfrom': {
+          // CreateLayer <Name>; CreateLayerFrom <Name> <Source> copies an existing layer.
+          // (A two-name CreateLayer is accepted as a copy too.)
           const name = a[0] && typeof a[0] === 'object' && !Array.isArray(a[0]) ? a[0].ref : str(a[0]);
           if (!name) break;
-          const l = newLayer(name, layerOf(a[1]));
+          const src = layerOf(a[1]);
+          if (cmd === 'createlayerfrom' && !src) {
+            def.warnings.push(`CreateLayerFrom ${name}: no layer named ${str(a[1])}`);
+            break;
+          }
+          const l = newLayer(name, src);
           layers.set(name.toLowerCase(), l);
           def.layers.push(l);
           break;
@@ -293,16 +334,25 @@ export function parseImageFont(src: string, include?: (path: string) => string |
             case 'layersetdrawmode':
               layer.drawMode = num(a[1]);
               break;
-            case 'layersetcolormult': {
-              const c = nums(a[1]);
-              layer.colorMult = [c[0] ?? 1, c[1] ?? 1, c[2] ?? 1, c[3] ?? 1];
+            case 'layersetcolormult':
+              layer.colorMult = color(a[1], 1);
+              break;
+            case 'layersetcoloradd':
+              layer.colorAdd = color(a[1], 0);
+              break;
+            case 'layersetpointsize':
+              layer.pointSize = num(a[1]);
+              break;
+            case 'layersetbaseorder':
+              layer.baseOrder = num(a[1]);
+              break;
+            case 'layersetcharorders': {
+              const chars = list(a[1]).map(str);
+              const orders = nums(a[2]);
+              chars.forEach((c, i) => (charOf(layer, c).order = orders[i] ?? 0));
               break;
             }
-            case 'layersetcoloradd': {
-              const c = nums(a[1]);
-              layer.colorAdd = [c[0] ?? 0, c[1] ?? 0, c[2] ?? 0, c[3] ?? 0];
-              break;
-            }
+            case 'layerpointrange':
             case 'layersetpointrange':
               layer.minPointSize = num(a[1], -1);
               layer.maxPointSize = num(a[2], -1);
@@ -364,9 +414,13 @@ export interface GlyphQuad {
   sy: number;
   sw: number;
   sh: number;
-  /** Top-left relative to the text origin (left end of the baseline). */
+  /** Top-left and size on screen, relative to the text origin (left end of the baseline). */
   x: number;
   y: number;
+  dw: number;
+  dh: number;
+  /** Draw order: the layer's base order plus the character's order. */
+  order: number;
 }
 
 /** Layers drawn for normal text (no tags requested), like ImageFont with an empty tag list. */
@@ -380,9 +434,16 @@ export function activeLayers(def: FontDefinition): number[] {
   });
 }
 
+/** How much a layer's glyphs are scaled: the font's point size over the layer's (LayerSetPointSize). */
+export function layerScale(def: FontDefinition, layer: FontLayer): number {
+  return layer.pointSize > 0 && def.defaultPointSize > 0 ? def.defaultPointSize / layer.pointSize : 1;
+}
+
 /**
  * Glyph positions for a string (ImageFont::DrawStringEx / TodDrawStringMatrix): each
  * character advances by its width plus spacing and kerning, taking the widest layer.
+ * Glyphs come out in the game's drawing order: by order (base order + char order),
+ * and within one order character by character, all of a character's layers together.
  */
 export function layoutText(def: FontDefinition, text: string): { quads: GlyphQuad[]; width: number } {
   const layers = activeLayers(def);
@@ -396,6 +457,7 @@ export function layoutText(def: FontDefinition, text: string): { quads: GlyphQua
       const layer = def.layers[li];
       const ch = layer.chars.get(c);
       if (!ch) continue;
+      const s = layerScale(def, layer);
       if (ch.rect.w > 0 && ch.rect.h > 0) {
         quads.push({
           layer: li,
@@ -403,17 +465,20 @@ export function layoutText(def: FontDefinition, text: string): { quads: GlyphQua
           sy: ch.rect.y,
           sw: ch.rect.w,
           sh: ch.rect.h,
-          x: x + layer.offsetX + ch.offsetX,
-          y: -(layer.ascent - layer.offsetY - ch.offsetY),
+          x: x + (layer.offsetX + ch.offsetX) * s,
+          y: -(layer.ascent - layer.offsetY - ch.offsetY) * s,
+          dw: ch.rect.w * s,
+          dh: ch.rect.h * s,
+          order: layer.baseOrder + ch.order,
         });
       }
       const spacing = next !== undefined ? layer.spacing + (ch.kerning.get(next) ?? 0) : 0;
-      advance = Math.max(advance, x + ch.width + spacing);
+      advance = Math.max(advance, x + (ch.width + spacing) * s);
     }
     x = advance;
   });
-  // Draw layer by layer (outlines under fills), keeping character order within a layer.
-  quads.sort((a, b) => layers.indexOf(a.layer) - layers.indexOf(b.layer));
+  // Stable: equal orders keep the character-by-character sequence.
+  quads.sort((a, b) => a.order - b.order);
   return { quads, width: x };
 }
 

@@ -528,6 +528,17 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
     return at;
   }
 
+  /**
+   * Change a text part's font wherever it uses `from` (not just at one key), so the
+   * typeface doesn't switch partway through. Frames using other fonts are kept.
+   */
+  replaceFont(trackIndex: number, from: string, to: string): void {
+    if (!this.state.tracks[trackIndex] || from === to) return;
+    this.checkpoint('Change font');
+    const t = this.editTrack(trackIndex);
+    for (const tr of t.transforms) if (tr.font === from) tr.font = to;
+  }
+
   /** Add a text part (drawn in `font`, a FONT_* id, with its baseline's left end at x, y). */
   addTextTrack(text: string, font: string, x = 0, y = 0, at = this.state.tracks.length): number {
     this.checkpoint('Add text');

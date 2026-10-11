@@ -412,12 +412,15 @@ export class SceneStage {
     if (doc.isLocked(li)) return void this.ws.status(`Layer "${layer.name}" is locked.`);
     const text = await promptText('Edit text', `Text from frame ${doc.ui.frame}`, pose.key.text);
     if (text === null || text === pose.key.text) return;
+    // (Empty words keep the layer: it shows as a box in the editor, to type into again.)
     doc.setKey(li, doc.ui.frame, { text }, 'Change text');
     this.ws.emit('change');
   }
 
   /** Add a text layer centred near (x, y) on the stage. */
   addText(doc: SceneDocument, text: string, x: number, y: number): void {
+    text = text.trim();
+    if (!text) return void this.ws.status('Type some words to add text.');
     const font = defaultFont(this.ws);
     const size = fontSizeHint(font);
     // The text origin is its baseline's left end; centre the words roughly on the point.
@@ -499,6 +502,7 @@ export class SceneStage {
     return [
       ...(layer.kind === 'reanim' ? [{ label: 'Edit prefab', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc, layer) }] : []),
       ...(layer.kind === 'particle' ? [{ label: 'Edit effect', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc, layer) }] : []),
+      ...(layer.kind === 'text' ? [{ label: 'Edit text…', shortcut: 'dbl-click', disabled: locked, action: () => void this.editText(doc, li) }] : []),
       { label: 'Flip horizontally', disabled: !pose || locked, action: () => (this.flip(doc, li, !pose!.flipX), emit()) },
       { label: 'Duplicate', shortcut: 'Ctrl+D', action: () => ((doc.ui.layer = doc.duplicateLayer(li)), emit()) },
       { label: 'Delete layer', shortcut: 'Del', disabled: locked, action: () => (doc.removeLayer(li), emit()) },

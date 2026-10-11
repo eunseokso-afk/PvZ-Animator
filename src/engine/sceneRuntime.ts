@@ -4,14 +4,13 @@
  */
 
 import { gameHiddenTracks } from './gameVisibility';
-import { textImage } from './text';
 import { DEFAULT_TRANSFORM, isRangeTrack, type ReanimDefinition, type ReanimTransform } from '../formats/reanim';
 import type { LayerPose, SceneLayer, SceneState } from '../editor/sceneDoc';
 import { evalLayer, poseMatrix } from '../editor/sceneDoc';
 import type { AssetLibrary } from './assets';
 import { apply, invert, mul, type Mat } from './math';
 import type { ParticleSystem } from './particleSystem';
-import { animRangeOf, decomposeMatrix, drawReanim, interpolateTransform, transformMatrix, type DrawTrackInfo, type FrameTime, type TrackLike } from './reanimRuntime';
+import { animRangeOf, decomposeMatrix, drawReanim, drawTextAt, interpolateTransform, transformMatrix, type DrawTrackInfo, type FrameTime, type TrackLike } from './reanimRuntime';
 import type { Renderer, RGBA } from './renderer';
 
 export interface Prefab {
@@ -194,12 +193,11 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
       }
     } else if (layer.kind === 'text') {
       // The text origin is the left end of the baseline, as for reanim text tracks.
-      const img = pose.key.text ? textImage(assets, pose.key.text, layer.source) : undefined;
-      if (img) {
-        const mt = mul(m, [1, 0, 0, 1, img.ox, img.oy]);
-        r.drawImage(img, 0, 0, img.width, img.height, mt, color, 'normal');
-        parts.push({ trackIndex: -1, matrix: mt, transform: { ...DEFAULT_TRANSFORM }, width: img.width, height: img.height });
-      }
+      const words = pose.key.text ?? '';
+      const box = words.trim() ? drawTextAt(r, assets, words, layer.source, m, color) : null;
+      if (box) parts.push({ trackIndex: -1, transform: { ...DEFAULT_TRANSFORM }, ...box });
+      // Empty words: a box to click (and double-click to type into), shown only in the editor.
+      else if (!words.trim() && opts.collect) parts.push({ trackIndex: -1, matrix: mul(m, [1, 0, 0, 1, 0, -24]), transform: { ...DEFAULT_TRANSFORM }, width: 80, height: 28 });
     } else if (layer.kind === 'particle') {
       const sys = res.particles?.(layer, pose, frame);
       // Particles are simulated in stage space around the emitter (pose.x, pose.y); rotate,

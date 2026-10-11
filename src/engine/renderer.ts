@@ -104,6 +104,7 @@ class WebGLRenderer implements Renderer {
   private cssH = 1;
   /** True while the browser has taken the GL context away (GPU reset, too many contexts…). */
   private lost = false;
+  private maxTexture?: number;
 
   constructor(
     readonly canvas: HTMLCanvasElement,
@@ -206,9 +207,12 @@ class WebGLRenderer implements Renderer {
     // Upload explicitly premultiplied bytes. UNPACK_PREMULTIPLY_ALPHA_WEBGL is ignored for
     // ImageBitmap sources, and game art often hides white or black in fully transparent
     // pixels, which would otherwise show up as solid boxes with our premultiplied blending.
-    const w = Math.max(1, img.source.width);
-    const h = Math.max(1, img.source.height);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultipliedPixels(img.source));
+    // Images larger than the GPU allows are scaled down to fit (UVs are relative, so drawing is unchanged).
+    const max = (this.maxTexture ??= gl.getParameter(gl.MAX_TEXTURE_SIZE) as number);
+    const fit = Math.min(1, max / Math.max(1, img.source.width), max / Math.max(1, img.source.height));
+    const w = Math.max(1, Math.floor(img.source.width * fit));
+    const h = Math.max(1, Math.floor(img.source.height * fit));
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, premultipliedPixels(img.source, w, h));
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -469,15 +473,13 @@ export function premultiplyInPlace(d: Uint8Array | Uint8ClampedArray): void {
 let scratch: HTMLCanvasElement | null = null;
 
 /** Premultiplied RGBA bytes of an image, ready for texImage2D. */
-export function premultipliedPixels(src: CanvasImageSource & { width: number; height: number }): Uint8Array {
-  const w = Math.max(1, src.width);
-  const h = Math.max(1, src.height);
+export function premultipliedPixels(src: CanvasImageSource & { width: number; height: number }, w = Math.max(1, src.width), h = Math.max(1, src.height)): Uint8Array {
   scratch ??= document.createElement('canvas');
   scratch.width = w;
   scratch.height = h;
   const ctx = scratch.getContext('2d', { willReadFrequently: true })!;
   ctx.clearRect(0, 0, w, h);
-  ctx.drawImage(src, 0, 0);
+  ctx.drawImage(w === src.width && h === src.height ? src : filterable(src), 0, 0, w, h);
   const data = ctx.getImageData(0, 0, w, h).data;
   premultiplyInPlace(data);
   scratch.width = scratch.height = 1; // release the backing store
