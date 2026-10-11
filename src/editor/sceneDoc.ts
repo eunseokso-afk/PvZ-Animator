@@ -10,7 +10,8 @@ import { Curve, warpTime } from '../formats/floatTrack';
 import { DEG, type Mat } from '../engine/math';
 import { DocumentBase, EASES, nextUid, type Ease, type SoundCue } from './reanimDoc';
 
-export type LayerKind = 'reanim' | 'particle' | 'image';
+/** Text layers keep their font id (FONT_*) in `source` and their words in each key. */
+export type LayerKind = 'reanim' | 'particle' | 'image' | 'text';
 
 /** How an instance plays its prefab animation (Animate: Loop / Play once / Single frame). */
 export type InstanceLoop = 'loop' | 'once' | 'single';
@@ -44,6 +45,8 @@ export interface LayerKey {
   startFrame: number;
   /** Restart the animation / effect at this key even if nothing else changed. */
   restart: boolean;
+  /** Text layers: the words shown from this key on (they change at keys, never tween). */
+  text: string;
 }
 
 export interface SceneLayer {
@@ -111,6 +114,7 @@ export function defaultKey(frame: number, patch: Partial<LayerKey> = {}): LayerK
     speed: 1,
     startFrame: 0,
     restart: false,
+    text: '',
     ...patch,
   };
 }

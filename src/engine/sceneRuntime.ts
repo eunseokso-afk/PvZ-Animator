@@ -4,6 +4,7 @@
  */
 
 import { gameHiddenTracks } from './gameVisibility';
+import { textImage } from './text';
 import { DEFAULT_TRANSFORM, isRangeTrack, type ReanimDefinition, type ReanimTransform } from '../formats/reanim';
 import type { LayerPose, SceneLayer, SceneState } from '../editor/sceneDoc';
 import { evalLayer, poseMatrix } from '../editor/sceneDoc';
@@ -191,6 +192,14 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
         r.drawImage(img, 0, 0, img.celWidth, img.celHeight, m, color, 'normal');
         parts.push({ trackIndex: -1, matrix: m, transform: { ...DEFAULT_TRANSFORM }, width: img.celWidth, height: img.celHeight });
       }
+    } else if (layer.kind === 'text') {
+      // The text origin is the left end of the baseline, as for reanim text tracks.
+      const img = pose.key.text ? textImage(assets, pose.key.text, layer.source) : undefined;
+      if (img) {
+        const mt = mul(m, [1, 0, 0, 1, img.ox, img.oy]);
+        r.drawImage(img, 0, 0, img.width, img.height, mt, color, 'normal');
+        parts.push({ trackIndex: -1, matrix: mt, transform: { ...DEFAULT_TRANSFORM }, width: img.width, height: img.height });
+      }
     } else if (layer.kind === 'particle') {
       const sys = res.particles?.(layer, pose, frame);
       // Particles are simulated in stage space around the emitter (pose.x, pose.y); rotate,
@@ -249,6 +258,7 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
   };
   const hidden = (): ReanimTransform => ({ ...DEFAULT_TRANSFORM, f: -1 });
   let tinted = false;
+  let textColored = false;
 
   // One anim track covering the whole scene, so the game can play it by name.
   tracks.push({ name: unique('anim_scene'), transforms: Array.from({ length: n }, () => ({ ...DEFAULT_TRANSFORM, f: 0 })) });
@@ -270,6 +280,22 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
         if (pose.tint.some((c) => Math.abs(c - 1) > 1e-3)) tinted = true;
         const d = decomposeMatrix(poseMatrix(pose));
         transforms.push({ ...DEFAULT_TRANSFORM, ...d, a: pose.alpha, i: imageIdFor(layer) });
+      }
+      tracks.push({ name: unique(base), transforms });
+      continue;
+    }
+    if (layer.kind === 'text') {
+      // A reanim text track: the game draws it in the given font, in white unless code tints it.
+      const transforms: ReanimTransform[] = [];
+      for (let f = 0; f < n; f++) {
+        const pose = evalLayer(layer, f);
+        if (!pose || !pose.visible || !pose.key.text) {
+          transforms.push({ ...hidden(), font: layer.source, text: pose?.key.text ?? '' });
+          continue;
+        }
+        if (pose.tint.some((c) => Math.abs(c - 1) > 1e-3)) textColored = true;
+        const d = decomposeMatrix(poseMatrix(pose));
+        transforms.push({ ...DEFAULT_TRANSFORM, ...d, a: pose.alpha, font: layer.source, text: pose.key.text });
       }
       tracks.push({ name: unique(base), transforms });
       continue;
@@ -311,6 +337,7 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
     });
   }
   if (tinted) warnings.push('Tints were dropped: the reanim format has no per-track color.');
+  if (textColored) warnings.push('Text colors were dropped: reanim text is drawn in the font\'s own colors (white for most PvZ fonts).');
   // Round to keep files small.
   for (const t of tracks) {
     for (const tr of t.transforms) {

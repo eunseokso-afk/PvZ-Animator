@@ -302,7 +302,10 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
       // Keep particle randomness tied to the saved layer, not to this session's ids.
       l.seed ??= l.uid;
       l.uid = nextUid();
-      for (const k of l.keys) k.tint = [...(k.tint ?? [1, 1, 1])] as [number, number, number];
+      for (const k of l.keys) {
+        k.tint = [...(k.tint ?? [1, 1, 1])] as [number, number, number];
+        k.text ??= '';
+      }
     }
     for (const c of state.soundCues) c.uid = nextUid();
     const doc = SceneDocument.fromState(uniqueSceneName(ws, sc.name), state);
@@ -376,17 +379,19 @@ interface ExportTarget {
 }
 
 /** Load every image a reanim draws, following attacher__ tracks into the reanims they attach. */
-async function preloadImages(ws: Workspace, tracks: { name: string; transforms: { i: string; text: string }[] }[], depth = 0): Promise<void> {
+async function preloadImages(ws: Workspace, tracks: { name: string; transforms: { i: string; text: string; font: string }[] }[], depth = 0): Promise<void> {
   const ids = new Set<string>();
+  const fonts = new Set<string>();
   const attached = new Set<string>();
   for (const t of tracks) {
     const attacher = depth < 3 && t.name.toLowerCase().startsWith('attacher__');
     for (const tr of t.transforms) {
       if (tr.i) ids.add(tr.i);
+      if (tr.font && tr.text) fonts.add(tr.font);
       if (attacher && tr.text) attached.add(tr.text);
     }
   }
-  await Promise.all([...ids].map((id) => ws.assets.loadImage(id)));
+  await Promise.all([...[...ids].map((id) => ws.assets.loadImage(id)), ...[...fonts].map((f) => ws.assets.loadFont(f))]);
   const paths = new Set<string>();
   for (const text of attached) {
     const info = parseAttacher(text);
@@ -408,6 +413,7 @@ async function preloadScene(ws: Workspace, doc: SceneDocument): Promise<void> {
       const prefab = ws.prefab(l.source) ?? (await ws.assets.reanimAsync(l.source));
       if (prefab) await preloadImages(ws, prefab.tracks);
     } else if (l.kind === 'image') await ws.assets.loadImage(l.source);
+    else if (l.kind === 'text') await ws.assets.loadFont(l.source);
     else if (!ws.particleDef(l.source)) {
       const def = await ws.assets.particleAsync(l.source);
       for (const em of def?.emitters ?? []) if (em.image) await ws.assets.loadImage(em.image);

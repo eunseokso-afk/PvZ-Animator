@@ -62,6 +62,8 @@ export interface TimelineHooks {
   addParticleCue(doc: ReanimDocument, frame: number): void;
   renameTrack(doc: ReanimDocument, track: number): void;
   previewSound(path: string): void;
+  /** Items for the PARTS header's + button (add an image or text part). */
+  addPartMenu(doc: ReanimDocument): MenuItem[];
 }
 
 export class Timeline {
@@ -640,7 +642,7 @@ export class Timeline {
       ctx.fillStyle = C.dim;
       ctx.font = '600 10px system-ui, sans-serif';
       ctx.fillText(row.label, 8, y + 13);
-      if (row.section === 'anims' || row.section === 'cues') {
+      if (row.section === 'anims' || row.section === 'cues' || row.section === 'parts') {
         ctx.fillStyle = C.text;
         ctx.font = '14px system-ui, sans-serif';
         ctx.fillText('+', NAME_W - 18, y + 15);
@@ -790,6 +792,10 @@ export class Timeline {
       if (x > NAME_W - 26 && x < NAME_W) {
         if (row.section === 'anims') this.hooks.editRange(doc);
         else if (row.section === 'cues') this.hooks.addSoundCue(doc, doc.ui.frame);
+        else if (row.section === 'parts') {
+          const r = this.canvas.getBoundingClientRect();
+          showMenu(this.hooks.addPartMenu(doc), r.left + NAME_W - 20, r.top + y + 10);
+        }
       }
       return;
     }

@@ -7,7 +7,8 @@ import { parseAttacher, type AttacherInfo, type ReanimDefinition, type ReanimTra
 import type { AssetLibrary } from './assets';
 import { DEG, mul, type Mat } from './math';
 import { creditsHidesTongue } from './gameVisibility';
-import { textImage, type Renderer, type RGBA } from './renderer';
+import type { Renderer, RGBA } from './renderer';
+import { textImage } from './text';
 
 export type LoopMode = 'loop' | 'loopFullLastFrame' | 'once' | 'onceAndHold' | 'onceFullLastFrame' | 'onceAndHoldFullLastFrame';
 
@@ -219,9 +220,12 @@ export function drawReanim(
       }
     } else if (t.text && t.font) {
       // The game draws text only with a font; attacher tracks keep their spec in the text.
-      const img = textImage(t.text, t.font);
-      r.drawImage(img, 0, 0, img.width, img.height, m, c, 'normal');
-      opts.collect?.push({ trackIndex: ti, matrix: m, transform: t, width: img.width, height: img.height });
+      const img = textImage(assets, t.text, t.font);
+      if (img) {
+        const mt = mul(m, [1, 0, 0, 1, img.ox, img.oy]);
+        r.drawImage(img, 0, 0, img.width, img.height, mt, c, 'normal');
+        opts.collect?.push({ trackIndex: ti, matrix: mt, transform: t, width: img.width, height: img.height });
+      }
     } else if (track.name.toLowerCase() === 'fullscreen') {
       // DrawTrack: a "fullscreen" track fills the 800x600 screen with its colour, ignoring its transform.
       r.fillRect(opts.screen ?? base, SCREEN_W, SCREEN_H, c, 'normal');

@@ -18,7 +18,7 @@ const RULER_H = 22;
 const ROW_H = 22;
 const NAME_W = 210;
 
-const KIND_ICON: Record<string, string> = { reanim: '▶', particle: '✦', image: '▣' };
+const KIND_ICON: Record<string, string> = { reanim: '▶', particle: '✦', image: '▣', text: 'T' };
 const TWEEN_FILL = 'rgba(122, 104, 214, 0.32)';
 const SPAN_FILL = 'rgba(92, 118, 140, 0.28)';
 

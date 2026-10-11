@@ -184,3 +184,34 @@ export async function previewSound(ws: Workspace, ref: string, volume = 1): Prom
   if (buf) ws.audio.play(buf, volume);
   else ws.status(`Could not decode ${file.path}`, 'error');
 }
+
+let fontListSerial = 0;
+
+/**
+ * A font id field (FONT_*) that suggests the fonts in the loaded files. Any id can be
+ * typed; ids the game knows are drawn with its bitmap font once main.pak is open.
+ */
+export function fontInput(ws: Workspace, value: string, onChange: (font: string) => void): HTMLElement {
+  const id = `font-list-${fontListSerial++}`;
+  const list = h('datalist', { id }, ws.assets.fontIds().map((f) => h('option', { value: f })));
+  const input = h('input', {
+    type: 'text',
+    value,
+    class: 'wide mono',
+    list: id,
+    spellcheck: false,
+    placeholder: 'FONT_HOUSEOFTERROR28',
+    onchange: () => onChange(input.value.trim().toUpperCase()),
+  });
+  input.setAttribute('list', id);
+  const loaded = ws.assets.font(value);
+  const note = h('div', { class: 'dim small' }, !value ? '' : loaded ? `Bitmap font from ${loaded.path}` : loaded === null ? 'Not in the loaded files: shown with a similar system font' : 'Loading…');
+  return h('div', { class: 'font-input' }, input, list, note);
+}
+
+/** The font new text uses: PvZ's House of Terror if available, else the first known font. */
+export function defaultFont(ws: Workspace): string {
+  const ids = ws.assets.fontIds();
+  return ids.find((f) => f === 'FONT_HOUSEOFTERROR28') ?? ids[0] ?? 'FONT_HOUSEOFTERROR28';
+}
+

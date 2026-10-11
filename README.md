@@ -44,6 +44,15 @@ included in this repository.
 - Several scenes per project (Scenes tab), saved in project files. **Bake** turns a scene into a single
   `.reanim` (every part of every instance becomes a track) that the game can play as `anim_scene`.
 
+**Text**
+- Add text to a reanim (Edit ▸ Add text…, or the + on the timeline's PARTS row) or to a scene (Edit ▸ Add
+  text…, or ＋ Layer ▾). Pick a PvZ font such as `FONT_HOUSEOFTERROR28` in the inspector.
+- Text is drawn with the game's own bitmap fonts (PopCap ImageFont `data/*.txt` descriptors with their
+  layers, colours, offsets and kerning) when `main.pak` is open, and with a similar system font otherwise.
+  The demo assets include a small two-layer font, `FONT_DEMOFONT`.
+- In scenes a text layer's words can change at any keyframe (handy for lyrics), and its colour, position,
+  rotation, scale and alpha tween like other layers. Baking turns it into a reanim text track.
+
 **Particle editor**
 - Edits every emitter property: float tracks (`5`, `[min max]`, `1,80 0`, `EaseIn 0 1` …) with live
   validation and curve previews, flags, emitter shapes, image strips, particle and system fields.
@@ -128,6 +137,11 @@ corner at the transform origin. Some parts are hidden by the game's code rather 
 zombie hides its cone, bucket, screen door, flag, ducky tube, tongue and mustache, and the credits hide
 most dancers' tongues. **View ▸ In-game part visibility** (on by default) previews them the game's way;
 turn it off to see every part. The files themselves are never changed.
+
+**Fonts** — `resources.xml` maps `FONT_*` ids to descriptors such as `data/HouseofTerror28.txt`: a script
+of `Define`, `CreateLayer`, `LayerSetImage`, `LayerSetAscent`, `LayerSetCharWidths`, `LayerSetImageMap`,
+`LayerSetCharOffsets`, `LayerSetKerningPairs`, `LayerSetColorMult`… statements. Reanim text is laid out
+from the transform origin along the baseline (glyph tops at `-ascent`).
 
 **Compiled reanim** — `u32 0xDEADFED4`, `u32 uncompressedSize`, then zlib data holding the game's
 in-memory structs (schema hash, definition, tracks, transforms and length-prefixed strings).

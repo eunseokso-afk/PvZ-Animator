@@ -528,6 +528,17 @@ export class ReanimDocument extends DocumentBase<ReanimState> {
     return at;
   }
 
+  /** Add a text part (drawn in `font`, a FONT_* id, with its baseline's left end at x, y). */
+  addTextTrack(text: string, font: string, x = 0, y = 0, at = this.state.tracks.length): number {
+    this.checkpoint('Add text');
+    const n = this.frameCount;
+    const base: ReanimTransform = { ...DEFAULT_TRANSFORM, text, font, x, y };
+    const t = makeTrack(this.uniqueTrackName('text'), Array.from({ length: n }, () => ({ ...base })), false);
+    this.fresh.add(t);
+    this.state.tracks.splice(at, 0, t);
+    return at;
+  }
+
   removeTrack(index: number): void {
     if (!this.state.tracks[index]) return;
     this.checkpoint('Delete track');

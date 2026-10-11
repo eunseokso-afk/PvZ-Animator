@@ -9,11 +9,13 @@ import { apply, DEG, invert, type Mat } from '../engine/math';
 import type { Renderer } from '../engine/renderer';
 import { animRangeOf, interpolateTransform, transformMatrix } from '../engine/reanimRuntime';
 import { drawScene, type DrawnLayer, type SceneResolver } from '../engine/sceneRuntime';
+import { fontSizeHint } from '../engine/text';
 import { basename, stripExt } from '../engine/vfs';
 import { getAnimRanges, type ReanimTransform } from '../formats/reanim';
 import { evalLayer, poseMatrix, type LayerKey, type SceneDocument } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
-import type { MenuItem } from './widgets';
+import { defaultFont } from './pickers';
+import { promptText, type MenuItem } from './widgets';
 
 const HANDLE = 5;
 const ROT_DIST = 26;
@@ -379,11 +381,12 @@ export class SceneStage {
     return had;
   }
 
-  /** Double-click: edit the prefab of the instance under the pointer. */
+  /** Double-click: edit the prefab of the instance under the pointer, or a text layer's words. */
   dblclick(doc: SceneDocument, x: number, y: number): void {
     const hit = this.hitLayer(doc, x, y);
     const layer = doc.state.layers[hit];
     if (!layer) return;
+    if (layer.kind === 'text') return void this.editText(doc, hit);
     if (layer.kind !== 'image') void this.ws.editPrefab(layer.source, doc, layer);
   }
 
@@ -399,6 +402,30 @@ export class SceneStage {
     if (!pose) return;
     doc.setKey(li, doc.ui.frame, { x: pose.x + dx, y: pose.y + dy }, 'Nudge instance');
     this.ws.emit('change');
+  }
+
+  /** Change a text layer's words from the current frame on (making a key there). */
+  async editText(doc: SceneDocument, li: number): Promise<void> {
+    const layer = doc.state.layers[li];
+    const pose = layer && evalLayer(layer, doc.ui.frame);
+    if (!layer || !pose) return;
+    if (doc.isLocked(li)) return void this.ws.status(`Layer "${layer.name}" is locked.`);
+    const text = await promptText('Edit text', `Text from frame ${doc.ui.frame}`, pose.key.text);
+    if (text === null || text === pose.key.text) return;
+    doc.setKey(li, doc.ui.frame, { text }, 'Change text');
+    this.ws.emit('change');
+  }
+
+  /** Add a text layer centred near (x, y) on the stage. */
+  addText(doc: SceneDocument, text: string, x: number, y: number): void {
+    const font = defaultFont(this.ws);
+    const size = fontSizeHint(font);
+    // The text origin is its baseline's left end; centre the words roughly on the point.
+    const key = { x: Math.round(x - text.length * size * 0.28), y: Math.round(y + size * 0.35), text };
+    doc.ui.layer = doc.addLayer('text', font, text.length > 16 ? text.slice(0, 15) + '…' : text, key, doc.ui.frame);
+    doc.ui.cue = null;
+    this.ws.emit('change');
+    this.ws.status(`Added text at frame ${doc.ui.frame}. Change its words, font and colour in the inspector; new keys can change the words.`);
   }
 
   // ------------------------------------------------------------ adding instances

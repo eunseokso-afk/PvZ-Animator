@@ -6,7 +6,7 @@ import { isRangeTrack, type ReanimTransform } from '../formats/reanim';
 import { EASES, type ReanimDocument } from '../editor/reanimDoc';
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
-import { pickAsset, pickImage, previewSound, thumbnail } from './pickers';
+import { fontInput, pickAsset, pickImage, previewSound, thumbnail } from './pickers';
 import { checkbox, numberField, select, type NumberField } from './widgets';
 
 const hasClipboard = (ws: Workspace) => !!ws.clipboard;
@@ -245,7 +245,7 @@ export class ReanimInspector {
             'div',
             { class: 'insp-grid1' },
             h('label', { class: 'field-col' }, 'Text', this.textInput(t.text, (v) => set({ text: v }, 'Change text', true, true))),
-            h('label', { class: 'field-col' }, 'Font', this.textInput(t.font, (v) => set({ font: v }, 'Change font', true, true))),
+            h('label', { class: 'field-col' }, 'Font', fontInput(ws, t.font, (v) => set({ font: v }, 'Change font', true, true))),
           )
         : null;
 
@@ -263,7 +263,8 @@ export class ReanimInspector {
         : t.text && !t.font
           ? h('div', { class: 'dim small' }, 'Text is only drawn when a font is set, as in the game.')
           : null,
-      imageRow,
+      // Text parts have no image (their text and font are edited below).
+      !t.i && (t.text || t.font) ? null : imageRow,
       keyRow,
       visible,
       h('div', { class: 'insp-grid2' }, num('x', 'X', 1, 2, 'Translation X (px)'), num('y', 'Y', 1, 2, 'Translation Y (px)')),

@@ -10,6 +10,7 @@ import { parseCompiledReanim } from '../formats/reanimCompiled';
 import { parseParticleXml, type ParticleDefinition } from '../formats/particles';
 import { emptyManifest, parseResourcesXml, type ImageResource, type ResourceManifest } from '../formats/resources';
 import { decodeText } from '../formats/xml';
+import { parseImageFont, type FontDefinition } from '../formats/imageFont';
 import { basename, dirname, extname, IMAGE_EXTS, memoryFile, normPath, pathKey, SOUND_EXTS, stripExt, VirtualFS, type VFile } from './vfs';
 
 export interface LoadedImage {
@@ -27,6 +28,34 @@ export interface LoadedImage {
 }
 
 export type AssetKind = 'reanim' | 'particle' | 'image' | 'sound' | 'other';
+
+/** A PopCap ImageFont with its layer images (null where an image is missing). */
+export interface LoadedFont {
+  id: string;
+  path: string;
+  def: FontDefinition;
+  images: (LoadedImage | null)[];
+  /** Unique per load (text caches key on it). */
+  serial: number;
+}
+
+let fontSerial = 1;
+
+/** Font ids PvZ uses, offered when no resources.xml lists fonts (drawn with a system font until a pak is open). */
+export const COMMON_PVZ_FONTS = [
+  'FONT_HOUSEOFTERROR28',
+  'FONT_HOUSEOFTERROR20',
+  'FONT_HOUSEOFTERROR16',
+  'FONT_DWARVENTODCRAFT24',
+  'FONT_DWARVENTODCRAFT18',
+  'FONT_DWARVENTODCRAFT15',
+  'FONT_DWARVENTODCRAFT12',
+  'FONT_BRIANNETOD16',
+  'FONT_BRIANNETOD12',
+  'FONT_CONTINUUMBOLD14',
+  'FONT_PICO129',
+  'FONT_TINYBOLD',
+];
 
 /** 'definitions' keeps decoded images and sounds (only reanim/particle files changed). */
 export type InvalidateScope = 'all' | 'definitions';
@@ -85,6 +114,8 @@ export class AssetLibrary extends EventTarget {
   private reanimCache = new Map<string, ReanimDefinition | null>();
   private particles = new Map<string, Promise<ParticleDefinition | null>>();
   private particleCache = new Map<string, ParticleDefinition | null>();
+  private fonts = new Map<string, LoadedFont | null>();
+  private fontLoads = new Map<string, Promise<LoadedFont | null>>();
   /** Lower-case paths of user-imported xml files that parse as particles. */
   private extraParticleXml = new Set<string>();
   private pathToImageId = new Map<string, string>();
@@ -169,6 +200,8 @@ export class AssetLibrary extends EventTarget {
     if (scope === 'all') {
       this.images.clear();
       this.imageLoads.clear();
+      this.fonts.clear();
+      this.fontLoads.clear();
     }
     this.reanims.clear();
     this.reanimCache.clear();
@@ -336,6 +369,92 @@ export class AssetLibrary extends EventTarget {
       if (f) return f;
     }
     return this.alphaImageNear(stripExt(file.path));
+  }
+
+  // ------------------------------------------------------------------ fonts
+
+  /**
+   * The descriptor file of a font id: resources.xml first, then data/<NAME>.txt (as in
+   * FONT_HOUSEOFTERROR28 -> data/HouseofTerror28.txt), or the path itself. Null for a
+   * system font ("!sys:Arial") or one that is not in the loaded files.
+   */
+  resolveFont(id: string): VFile | null {
+    if (!id) return null;
+    const res = this.manifest.fonts.get(id.toUpperCase());
+    if (res) return res.path.startsWith('!') ? null : (this.vfs.findWithExt(res.path, ['txt']) ?? null);
+    const name = id.toUpperCase().startsWith('FONT_') ? id.slice(5) : id;
+    return this.vfs.findWithExt(`data/${name}`, ['txt']) ?? this.vfs.findWithExt(id, ['txt']) ?? null;
+  }
+
+  /** System font family for a "!sys:Family" font resource, if the id names one. */
+  systemFontFamily(id: string): string | undefined {
+    const path = this.manifest.fonts.get(id.toUpperCase())?.path;
+    return path?.toLowerCase().startsWith('!sys:') ? path.slice(5) : undefined;
+  }
+
+  /** Font ids to offer: resources.xml fonts and font descriptors in data/, else the usual PvZ ones. */
+  fontIds(): string[] {
+    const ids = new Set<string>();
+    for (const f of this.manifest.fonts.values()) ids.add(f.id);
+    for (const f of this.vfs.list()) {
+      const m = /^data\/([^/]+)\.txt$/i.exec(f.path);
+      if (m && !/^(lawnstrings|properties)/i.test(m[1])) ids.add(`FONT_${m[1].toUpperCase()}`);
+    }
+    // Without the game's resources.xml, also offer the usual PvZ font ids (drawn with a system font).
+    if (!this.manifest.fonts.size) for (const f of COMMON_PVZ_FONTS) ids.add(f);
+    return [...ids].sort();
+  }
+
+  /** Synchronous lookup: the loaded bitmap font, null if there is none (use a system font), undefined while loading. */
+  font(id: string): LoadedFont | null | undefined {
+    const key = id.toUpperCase();
+    if (this.fonts.has(key)) return this.fonts.get(key);
+    void this.loadFont(id);
+    return undefined;
+  }
+
+  loadFont(id: string): Promise<LoadedFont | null> {
+    const key = id.toUpperCase();
+    let p = this.fontLoads.get(key);
+    if (!p) {
+      p = this.decodeFont(id).then(
+        (f) => {
+          this.fonts.set(key, f);
+          this.dispatchEvent(new Event('image'));
+          return f;
+        },
+        (err) => {
+          console.warn(`Failed to load font ${id}`, err);
+          this.fonts.set(key, null);
+          return null;
+        },
+      );
+      this.fontLoads.set(key, p);
+    }
+    return p;
+  }
+
+  private async decodeFont(id: string): Promise<LoadedFont | null> {
+    const file = this.resolveFont(id);
+    if (!file) return null;
+    const dir = dirname(file.path);
+    const rel = (p: string) => normPath(dir ? `${dir}/${p}` : p);
+    // Read Include'd files first, so the parser can stay synchronous.
+    const texts = new Map<string, string>();
+    const pending = [file.path];
+    while (pending.length && texts.size < 16) {
+      const path = pending.shift()!;
+      if (texts.has(pathKey(path))) continue;
+      const f = this.vfs.findWithExt(path, ['txt']);
+      if (!f) continue;
+      const text = decodeText(await f.read());
+      texts.set(pathKey(path), text);
+      for (const m of text.matchAll(/\binclude\s+["']([^"']+)["']/gi)) pending.push(rel(m[1]));
+    }
+    const def = parseImageFont(texts.get(pathKey(file.path)) ?? '', (p) => texts.get(pathKey(rel(p))));
+    if (!def.layers.length) return null;
+    const images = await Promise.all(def.layers.map((l) => (l.image ? this.loadImage(rel(l.image)) : Promise.resolve(null))));
+    return { id, path: file.path, def, images, serial: fontSerial++ };
   }
 
   // ------------------------------------------------------------------ sounds

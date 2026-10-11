@@ -255,19 +255,89 @@ function buildScene(): SceneDocument {
   scene.setKey(shooter, 60, { tint: [1, 0.8, 0.8] });
   scene.addLayer('particle', 'particles/DemoSparkle.xml', 'Sparkle', { x: 470, y: 250 }, 30);
   scene.addSoundCue(30, 'sounds/demo_pop.wav', 0.9);
+  // Text in the demo bitmap font: the words change at a key, the size pops in with easing.
+  const title = scene.addLayer('text', 'FONT_DEMOFONT', 'Title', { x: 300, y: 90, text: 'Brains!', scaleX: 0.6, scaleY: 0.6, alpha: 0, ease: 'easeOut' }, 0);
+  scene.setKey(title, 12, { scaleX: 1.2, scaleY: 1.2, alpha: 1, ease: 'easeInOut' });
+  scene.setKey(title, 45, { x: 240, text: 'More brains!', scaleX: 1, scaleY: 1 });
   scene.clearHistory();
   scene.markSaved();
   scene.ui.layer = -1;
   return scene;
 }
 
+/**
+ * A two-layer PopCap ImageFont (data/DemoFont.txt, used as FONT_DEMOFONT): a dark
+ * outline layer under a golden fill, both from white glyph atlases tinted by
+ * LayerSetColorMult, the way PvZ's own fonts are built.
+ */
+async function makeFont(): Promise<{ path: string; data: Uint8Array }[]> {
+  const chars = Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i));
+  const size = 30;
+  const pad = 4;
+  const css = `bold ${size}px "Trebuchet MS", "Segoe UI", sans-serif`;
+  const probe = document.createElement('canvas').getContext('2d')!;
+  probe.font = css;
+  const widths = chars.map((c) => Math.round(probe.measureText(c).width));
+  const ascent = Math.ceil(probe.measureText('Hg').fontBoundingBoxAscent || size * 0.8);
+  const cellH = Math.ceil(size * 1.3) + pad * 2;
+  const perRow = 16;
+  const rowW = (r: number) => chars.slice(r * perRow, r * perRow + perRow).reduce((s, _, i) => s + widths[r * perRow + i] + pad * 2, 0);
+  const rows = Math.ceil(chars.length / perRow);
+  const atlasW = Math.max(...Array.from({ length: rows }, (_, r) => rowW(r)));
+  const rects: [number, number, number, number][] = [];
+  let x = 0;
+  chars.forEach((_, i) => {
+    if (i % perRow === 0) x = 0;
+    rects.push([x, Math.floor(i / perRow) * cellH, widths[i] + pad * 2, cellH]);
+    x += widths[i] + pad * 2;
+  });
+  const atlas = (outline: boolean) =>
+    png(atlasW, rows * cellH, (ctx) => {
+      ctx.font = css;
+      ctx.textBaseline = 'alphabetic';
+      ctx.lineJoin = 'round';
+      ctx.fillStyle = ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 6;
+      chars.forEach((c, i) => {
+        const [rx, ry] = rects[i];
+        if (outline) ctx.strokeText(c, rx + pad, ry + pad + ascent);
+        else ctx.fillText(c, rx + pad, ry + pad + ascent);
+      });
+    });
+  const q = (c: string) => `"${c.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const txt = [
+    '// PvZ Animator demo font (original): an outline layer under a fill layer.',
+    `Define CharList ( ${chars.map(q).join(', ')} );`,
+    `Define WidthList ( ${widths.join(', ')} );`,
+    `Define RectList ( ${rects.map((r) => `(${r.join(', ')})`).join(', ')} );`,
+    `Define OffsetList ( ${chars.map(() => `(${-pad}, 0)`).join(', ')} );`,
+    'CreateLayer Outline;',
+    "LayerSetImage Outline 'DemoFontOutline.png';",
+    `LayerSetAscent Outline ${ascent + pad};`,
+    'LayerSetSpacing Outline 1;',
+    'LayerSetCharWidths Outline CharList WidthList;',
+    'LayerSetImageMap Outline CharList RectList;',
+    'LayerSetCharOffsets Outline CharList OffsetList;',
+    'LayerSetColorMult Outline (0.18, 0.1, 0.02, 1);',
+    'CreateLayer Main Outline;',
+    "LayerSetImage Main 'DemoFont.png';",
+    'LayerSetColorMult Main (1, 0.86, 0.3, 1);',
+    `SetDefaultPointSize ${size};`,
+  ].join('\n');
+  return [
+    { path: 'data/DemoFont.txt', data: new TextEncoder().encode(txt) },
+    { path: 'data/DemoFont.png', data: await atlas(false) },
+    { path: 'data/DemoFontOutline.png', data: await atlas(true) },
+  ];
+}
+
 export async function loadDemoAssets(ws: Workspace): Promise<void> {
-  const files = [...(await makeImages()), ...makeSounds()];
+  const files = [...(await makeImages()), ...makeSounds(), ...(await makeFont())];
   files.push({ path: 'particles/DemoSparkle.xml', data: new TextEncoder().encode(PARTICLE_XML) });
   const reanim = buildReanim();
   files.push({ path: 'reanim/DemoPlant.reanim', data: new TextEncoder().encode(serializeReanimXml(reanim.toDefinition(true))) });
   await ws.assets.importFiles(files, 'demo');
   await ws.openAsset('reanim/DemoPlant.reanim');
   ws.addScene(buildScene());
-  ws.status('Loaded demo assets: a prefab with idle/shoot animations, a particle effect, two sounds and a demo scene (see the Scenes tab).', 'success');
+  ws.status('Loaded demo assets: a prefab with idle/shoot animations, a particle effect, two sounds, a bitmap font and a demo scene (see the Scenes tab).', 'success');
 }

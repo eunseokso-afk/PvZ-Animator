@@ -14,7 +14,7 @@ import { downloadBlob, h, isTextInput, pickFiles } from './dom';
 import { applyToLibrary, bakeSceneDialog, exportCurrentDoc, exportFrames, exportPak, exportVideo, extractFile, loadProject, saveProject, uniqueSceneName } from './exporters';
 import { ReanimInspector } from './inspector';
 import { ParticleInspector, ParticlePanel } from './particleEditor';
-import { clearThumbnails, pickAsset, pickImage, previewSound } from './pickers';
+import { clearThumbnails, defaultFont, pickAsset, pickImage, previewSound } from './pickers';
 import { SceneInspector } from './sceneInspector';
 import { SceneTimeline } from './sceneTimeline';
 import { Timeline } from './timeline';
@@ -61,6 +61,10 @@ export class App {
       addParticleCue: (doc, frame) => void this.addParticleCue(doc, frame),
       renameTrack: (doc, ti) => void this.renameTrack(doc, ti),
       previewSound: (p) => p && void previewSound(ws, p),
+      addPartMenu: (doc) => [
+        { label: 'Image part…', action: () => void this.addPartFromPicker(doc) },
+        { label: 'Text part…', action: () => void this.addTextPart(doc) },
+      ],
     });
     this.reanimInspector = new ReanimInspector(ws);
     this.particleInspector = new ParticleInspector(ws);
@@ -343,6 +347,7 @@ export class App {
       items.push(
         { separator: true },
         { label: 'Add part from image…', action: () => void this.addPartFromPicker(r) },
+        { label: 'Add text…', action: () => void this.addTextPart(r) },
         { label: 'Copy pose', shortcut: 'Ctrl+C', disabled: ti < 0, action: () => this.copyPose() },
         { label: 'Paste pose', shortcut: 'Ctrl+V', disabled: ti < 0 || !ws.clipboard, action: () => this.pastePose() },
         { label: 'Toggle key', shortcut: 'K', disabled: ti < 0, action: () => this.toggleKey() },
@@ -707,6 +712,13 @@ export class App {
           if (r) add('image', r.path);
         },
       },
+      {
+        label: 'Add text…',
+        action: async () => {
+          const text = await promptText('Add text', 'Text', 'Brains!');
+          if (text) this.viewport.sceneStage.addText(doc, text, ...center());
+        },
+      },
       { label: 'Add sound cue…', action: () => void this.addSceneSoundCue(doc, doc.ui.frame) },
     ];
   }
@@ -930,6 +942,17 @@ export class App {
     doc.ui.cue = { kind: 'particle', uid: cue.uid };
     this.ws.invalidatePreviews();
     this.ws.emit('change');
+  }
+
+  /** Add a text part, drawn with a PvZ font (the game needs a font to show text). */
+  private async addTextPart(doc: ReanimDocument) {
+    const text = await promptText('Add text', 'Text', 'Hello, neighbor!');
+    if (!text) return;
+    const ti = doc.addTextTrack(text, defaultFont(this.ws), 0, 0);
+    doc.ui.track = ti;
+    doc.ui.cue = null;
+    this.ws.emit('change');
+    this.ws.status(`Added text part "${doc.state.tracks[ti].name}". Pick its font and change the text in the inspector; it starts at the reanim's origin.`);
   }
 
   private async addPartFromPicker(doc: ReanimDocument) {

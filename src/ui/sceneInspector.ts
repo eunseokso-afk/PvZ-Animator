@@ -6,7 +6,7 @@ import { evalLayer, INSTANCE_LOOPS, keyIndexAt, type LayerKey, type SceneDocumen
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
 import { uniqueSceneName } from './exporters';
-import { pickAsset, pickImage, previewSound, thumbnail } from './pickers';
+import { fontInput, pickAsset, pickImage, previewSound, thumbnail } from './pickers';
 import { checkbox, numberField, select, type NumberField } from './widgets';
 
 function toHex(rgb: [number, number, number]): string {
@@ -267,8 +267,36 @@ export class SceneInspector {
       },
     });
 
+    const textInput =
+      layer.kind === 'text'
+        ? h('input', {
+            type: 'text',
+            class: 'wide',
+            value: pose?.key.text ?? '',
+            disabled: locked,
+            placeholder: 'Type the words…',
+            onchange: (e: Event) => set({ text: (e.target as HTMLInputElement).value }, 'Change text'),
+          })
+        : null;
     const sourceRow =
-      layer.kind === 'image'
+      layer.kind === 'text'
+        ? h(
+            'div',
+            { class: 'form-col' },
+            h('label', { class: 'field-col' }, 'Text (changes at keys)', textInput),
+            h(
+              'label',
+              { class: 'field-col' },
+              'Font',
+              fontInput(ws, layer.source, (font) => {
+                if (!font || font === layer.source) return;
+                if (doc.isLocked(li)) return set({}, 'Change font');
+                doc.edit('Change font', (s) => (s.layers[li].source = font));
+                ws.emit('change');
+              }),
+            ),
+          )
+        : layer.kind === 'image'
         ? h(
             'div',
             { class: 'insp-image' },
@@ -401,7 +429,7 @@ export class SceneInspector {
       h(
         'section',
         { class: 'insp-section' },
-        h('h3', null, layer.kind === 'reanim' ? '▶ Prefab instance' : layer.kind === 'particle' ? '✦ Particle effect' : '▣ Image', locked ? h('span', { class: 'dim small' }, '  🔒 locked') : null),
+        h('h3', null, layer.kind === 'reanim' ? '▶ Prefab instance' : layer.kind === 'particle' ? '✦ Particle effect' : layer.kind === 'text' ? 'T Text' : '▣ Image', locked ? h('span', { class: 'dim small' }, '  🔒 locked') : null),
         h('label', { class: 'field-col' }, 'Layer name', nameInput),
         sourceRow,
         keyRow,
@@ -421,7 +449,7 @@ export class SceneInspector {
         h(
           'div',
           { class: 'insp-key' },
-          h('span', { class: 'dim small' }, 'Tint'),
+          h('span', { class: 'dim small' }, layer.kind === 'text' ? 'Color' : 'Tint'),
           tint,
           h('button', { class: 'btn small', onclick: () => set({ tint: [1, 1, 1] }, 'Reset tint') }, 'Reset'),
           checkbox('Visible', pose.visible, (v) => set({ visible: v }, v ? 'Show layer' : 'Hide layer')),

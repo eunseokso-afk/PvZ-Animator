@@ -483,29 +483,3 @@ export function premultipliedPixels(src: CanvasImageSource & { width: number; he
   scratch.width = scratch.height = 1; // release the backing store
   return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 }
-
-const textCache = new Map<string, LoadedImage>();
-let textSerial = 1_000_000;
-
-/** Render a text string into a white image (for reanim text tracks). */
-export function textImage(text: string, fontHint: string): LoadedImage {
-  const key = fontHint + '\u0000' + text;
-  let img = textCache.get(key);
-  if (img) return img;
-  const size = /(\d+)/.exec(fontHint)?.[1] ?? '18';
-  const font = `bold ${size}px "Trebuchet MS", "Segoe UI", sans-serif`;
-  const c = document.createElement('canvas');
-  const ctx = c.getContext('2d')!;
-  ctx.font = font;
-  const metrics = ctx.measureText(text);
-  c.width = Math.max(1, Math.ceil(metrics.width) + 4);
-  c.height = Math.ceil(parseInt(size, 10) * 1.4);
-  ctx.font = font;
-  ctx.fillStyle = '#fff';
-  ctx.textBaseline = 'top';
-  ctx.fillText(text, 2, 2);
-  img = { path: `text:${text}`, source: c, width: c.width, height: c.height, rows: 1, cols: 1, celWidth: c.width, celHeight: c.height, serial: textSerial++ };
-  if (textCache.size > 200) textCache.clear();
-  textCache.set(key, img);
-  return img;
-}
