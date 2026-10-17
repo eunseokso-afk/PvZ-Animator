@@ -6,8 +6,8 @@
 
 import { clamp } from '../engine/math';
 import { basename } from '../engine/vfs';
-import { EASES } from '../editor/reanimDoc';
-import { cameraLayer, keyIndexAt, type SceneDocument, type SceneLayer } from '../editor/sceneDoc';
+import { CURVE_PRESETS } from '../editor/easeCurve';
+import { cameraLayer, easeProgress, keyId, keyIndexAt, SCENE_EASES, type KeyRef, type SceneDocument, type SceneLayer } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
 import { C, envelopeOf, roundRect } from './timeline';
@@ -26,8 +26,10 @@ type Row = { kind: 'header'; label: string } | { kind: 'sound' } | { kind: 'laye
 
 type Drag =
   | { kind: 'scrub' }
-  | { kind: 'select'; from: number }
-  | { kind: 'moveKey'; layer: number; from: number; to: number }
+  /** A marquee from (frame `from`, row `row`): selects the frames on the start layer and the keys inside. */
+  | { kind: 'select'; from: number; row: number; to: number; toRow: number }
+  /** Selected keys dragged together by `delta` frames. */
+  | { kind: 'moveKeys'; refs: KeyRef[]; ids: Set<string>; from: number; delta: number }
   | { kind: 'reorder'; layer: number; target: number; startY: number; moved: boolean }
   | { kind: 'cue'; uid: number; from: number; to: number; moved: boolean };
 
@@ -161,8 +163,7 @@ export class SceneTimeline {
       const doc = this.doc;
       if (!doc) return;
       if (!cameraLayer(doc.state)) {
-        doc.ui.layer = doc.addCamera();
-        doc.ui.cue = null;
+        doc.selectOnly(doc.addCamera());
         doc.ui.cameraView = true;
       } else doc.ui.cameraView = !doc.ui.cameraView;
       ws.emit('change');
@@ -447,9 +448,33 @@ export class SceneTimeline {
       const tween = !!next && key.ease !== 'hold' && next.visible;
       ctx.fillStyle = tween ? TWEEN_FILL : SPAN_FILL;
       ctx.fillRect(x0 + 1, y + 3, x1 - x0 - 1, ROW_H - 6);
-      if (tween && x1 - x0 > cw * 2) {
+      if (tween && key.ease !== 'linear' && x1 - x0 - cw >= 36) {
+        // Wide enough: draw the tween's easing curve between its keys.
+        const cx0 = x0 + cw;
+        const cx1 = x1 - cw * 0.2;
+        let lo = 0;
+        let hi = 1;
+        const n = Math.max(8, Math.min(48, Math.round((cx1 - cx0) / 3)));
+        const ys: number[] = [];
+        for (let i = 0; i <= n; i++) {
+          const v = easeProgress(key, i / n);
+          ys.push(v);
+          lo = Math.min(lo, v);
+          hi = Math.max(hi, v);
+        }
+        ctx.strokeStyle = key.ease === 'custom' ? 'rgba(124, 214, 255, 0.85)' : 'rgba(240,166,74,0.85)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ys.forEach((v, i) => {
+          const px = cx0 + ((cx1 - cx0) * i) / n;
+          const py = y + ROW_H - 5 - ((v - lo) / (hi - lo)) * (ROW_H - 10);
+          if (i) ctx.lineTo(px, py);
+          else ctx.moveTo(px, py);
+        });
+        ctx.stroke();
+      } else if (tween && x1 - x0 > cw * 2) {
         const mid = y + ROW_H / 2;
-        ctx.strokeStyle = key.ease === 'linear' ? 'rgba(200,190,255,0.75)' : 'rgba(240,166,74,0.85)';
+        ctx.strokeStyle = key.ease === 'linear' ? 'rgba(200,190,255,0.75)' : key.ease === 'custom' ? 'rgba(124, 214, 255, 0.85)' : 'rgba(240,166,74,0.85)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(x0 + cw, mid);
@@ -460,7 +485,9 @@ export class SceneTimeline {
         ctx.stroke();
       }
     }
-    if (selected) {
+    const drag = this.drag;
+    const inMarquee = drag?.kind === 'select' && ri >= Math.min(drag.row, drag.toRow) && ri <= Math.max(drag.row, drag.toRow);
+    if (selected || inMarquee) {
       ctx.strokeStyle = C.sel;
       ctx.lineWidth = 1;
       ctx.strokeRect(this.frameX(lo) + 0.5, y + 1.5, (hi - lo + 1) * cw - 1, ROW_H - 3);
@@ -468,19 +495,27 @@ export class SceneTimeline {
     // Keyframes: filled dot = key, hollow = blank keyframe (hidden), ring = animation restarts.
     const r = Math.max(2.5, Math.min(4.5, cw / 3));
     keys.forEach((key, k) => {
-      const f = this.drag?.kind === 'moveKey' && this.drag.layer === row.index && this.drag.from === key.frame ? this.drag.to : key.frame;
+      const id = keyId(layer.uid, key.frame);
+      const moving = drag?.kind === 'moveKeys' && drag.ids.has(id);
+      const f = moving ? key.frame + drag.delta : key.frame;
+      const picked = doc.ui.keys.has(id);
       const cx = this.frameX(f) + cw / 2;
       if (cx < NAME_W - cw || cx > this.cssW + cw) return;
       const mid = y + ROW_H / 2;
       const prev = keys[k - 1];
       const restarts = layer.kind !== 'image' && (k === 0 || key.restart || !prev || prev.anim !== key.anim || prev.loop !== key.loop || prev.startFrame !== key.startFrame || prev.speed !== key.speed || prev.visible !== key.visible);
+      if (picked) {
+        // A selected key: a highlight behind the dot.
+        ctx.fillStyle = 'rgba(255, 211, 77, 0.35)';
+        ctx.fillRect(this.frameX(f) + 1, y + 2, Math.max(cw - 1, 3), ROW_H - 4);
+      }
       ctx.beginPath();
       ctx.arc(cx, mid, r, 0, Math.PI * 2);
       if (key.visible) {
-        ctx.fillStyle = selected ? '#ffffff' : '#e8edf5';
+        ctx.fillStyle = picked ? C.sel : selected ? '#ffffff' : '#e8edf5';
         ctx.fill();
       } else {
-        ctx.strokeStyle = '#e8edf5';
+        ctx.strokeStyle = picked ? C.sel : '#e8edf5';
         ctx.lineWidth = 1.2;
         ctx.stroke();
       }
@@ -535,9 +570,10 @@ export class SceneTimeline {
       ctx.fillText('+', NAME_W - 18, y + 16);
       return;
     }
-    const selected = (row.kind === 'layer' && row.index === doc.ui.layer) || (row.kind === 'sound' && !!doc.ui.cue);
+    const selected = (row.kind === 'layer' && doc.isSelected(row.index)) || (row.kind === 'sound' && !!doc.ui.cue);
     if (selected) {
-      ctx.fillStyle = 'rgba(255, 211, 77, 0.14)';
+      // The main selected layer (the one the inspector edits) is brighter.
+      ctx.fillStyle = row.kind === 'layer' && row.index !== doc.ui.layer ? 'rgba(255, 211, 77, 0.08)' : 'rgba(255, 211, 77, 0.14)';
       ctx.fillRect(0, y, NAME_W, ROW_H);
     }
     ctx.fillStyle = 'rgba(0,0,0,0.25)';
@@ -676,20 +712,80 @@ export class SceneTimeline {
     const li = row.index;
     const layer = doc.state.layers[li];
     doc.ui.cue = null;
+    const mod = e.ctrlKey || e.metaKey;
     if (x < NAME_W) {
       if (x < 22) return void (toggle(doc.ui.hidden, layer.uid), this.ws.emit('change'));
       if (x < 40) return void (toggle(doc.ui.locked, layer.uid), this.ws.emit('change'));
-      doc.ui.layer = li;
-      this.drag = { kind: 'reorder', layer: li, target: li, startY: y, moved: false };
+      if (mod) {
+        // Ctrl/⌘-click adds or removes a layer.
+        doc.toggleSelected(li);
+      } else if (e.shiftKey && doc.selectedLayer) {
+        // Shift-click selects the layers between the selected one and this one.
+        const rows = this.rows.flatMap((r) => (r.kind === 'layer' ? [r.index] : []));
+        const a = rows.indexOf(doc.ui.layer);
+        const b = rows.indexOf(li);
+        for (const i of rows.slice(Math.min(a, b), Math.max(a, b) + 1)) if (!doc.isSelected(i)) doc.toggleSelected(i, true);
+        doc.toggleSelected(li, true);
+      } else {
+        doc.selectOnly(li);
+        this.drag = { kind: 'reorder', layer: li, target: li, startY: y, moved: false };
+      }
       this.ws.emit('change');
       return;
     }
+    const onKey = layer.keys.some((k) => k.frame === frame);
+    const id = keyId(layer.uid, frame);
+    if (onKey && (mod || e.shiftKey)) {
+      // Ctrl/⌘-click toggles a key in the selection, Shift-click adds it.
+      if (mod && doc.ui.keys.has(id)) doc.ui.keys.delete(id);
+      else doc.ui.keys.add(id);
+      doc.toggleSelected(li, true);
+      if (doc.ui.keys.has(id)) this.startKeyDrag(doc, frame);
+      this.ws.setFrame(frame);
+      return;
+    }
     if (e.shiftKey && doc.ui.layer === li) return this.ws.setFrame(frame, true);
-    doc.ui.layer = li;
-    // A press on a key dot drags the key, whether or not its layer was selected.
-    if (!e.shiftKey && !doc.isLocked(li) && layer.keys.some((k) => k.frame === frame)) this.drag = { kind: 'moveKey', layer: li, from: frame, to: frame };
-    else this.drag = { kind: 'select', from: frame };
+    if (onKey) {
+      // A press on a key selects it (keeping the selection if it is part of it) and drags the selected keys.
+      if (!doc.ui.keys.has(id)) {
+        doc.selectOnly(li);
+        doc.ui.keys.add(id);
+      } else doc.toggleSelected(li, true);
+      this.startKeyDrag(doc, frame);
+    } else {
+      if (!mod) doc.selectOnly(li);
+      else doc.toggleSelected(li, true);
+      const ri = this.rows.indexOf(row);
+      this.drag = { kind: 'select', from: frame, row: ri, to: frame, toRow: ri };
+    }
     this.ws.setFrame(frame);
+  }
+
+  /** Start dragging the selected keys (the ones on unlocked layers). */
+  private startKeyDrag(doc: SceneDocument, frame: number) {
+    const refs = doc.selectedKeys().filter((r) => !doc.isLocked(r.layer));
+    if (!refs.length) return;
+    const ids = new Set(refs.map((r) => keyId(doc.state.layers[r.layer].uid, r.frame)));
+    this.drag = { kind: 'moveKeys', refs, ids, from: frame, delta: 0 };
+  }
+
+  /** Select the keys inside the marquee, and the layers it spans (the start layer stays the main one). */
+  private marqueeSelect(doc: SceneDocument, drag: Extract<Drag, { kind: 'select' }>) {
+    const f0 = Math.min(drag.from, drag.to);
+    const f1 = Math.max(drag.from, drag.to);
+    const r0 = Math.min(drag.row, drag.toRow);
+    const r1 = Math.max(drag.row, drag.toRow);
+    const main = doc.ui.layer;
+    doc.ui.keys.clear();
+    doc.ui.extra.clear();
+    for (let ri = r0; ri <= r1; ri++) {
+      const row = this.rows[ri];
+      if (row?.kind !== 'layer') continue;
+      const layer = doc.state.layers[row.index];
+      if (!layer) continue;
+      if (row.index !== main) doc.ui.extra.add(layer.uid);
+      for (const k of layer.keys) if (k.frame >= f0 && k.frame <= f1) doc.ui.keys.add(keyId(layer.uid, k.frame));
+    }
   }
 
   private onMove(e: PointerEvent) {
@@ -702,15 +798,25 @@ export class SceneTimeline {
       case 'scrub':
         this.ws.setFrame(frame);
         break;
-      case 'select':
+      case 'select': {
         doc.ui.frameEnd = drag.from;
         doc.ui.frame = frame;
+        drag.to = frame;
+        const ri = clamp(this.yToRow(y), 0, this.rows.length - 1);
+        drag.toRow = this.rows[ri]?.kind === 'layer' ? ri : drag.toRow;
+        this.marqueeSelect(doc, drag);
         this.ws.emit('change');
         break;
-      case 'moveKey':
-        drag.to = frame;
+      }
+      case 'moveKeys': {
+        // Keep every moving key inside the scene.
+        const frames = drag.refs.map((r) => r.frame);
+        const lo = -Math.min(...frames);
+        const hi = doc.state.length - 1 - Math.max(...frames);
+        drag.delta = clamp(frame - drag.from, lo, hi);
         this.draw();
         break;
+      }
       case 'reorder': {
         if (Math.abs(y - drag.startY) > 4) drag.moved = true;
         const row = this.rows[this.yToRow(y)];
@@ -732,7 +838,10 @@ export class SceneTimeline {
     this.drag = null;
     if (this.canvas.hasPointerCapture(e.pointerId)) this.canvas.releasePointerCapture(e.pointerId);
     if (!doc || !drag) return;
-    if (drag.kind === 'moveKey' && drag.to !== drag.from && doc.moveKey(drag.layer, drag.from, drag.to)) doc.ui.frame = doc.ui.frameEnd = drag.to;
+    if (drag.kind === 'moveKeys' && drag.delta) {
+      if (doc.moveKeys(drag.refs, drag.delta)) doc.ui.frame = doc.ui.frameEnd = drag.from + drag.delta;
+      else this.ws.status('The keys can’t go there: one would land on another key.');
+    }
     if (drag.kind === 'reorder' && drag.moved && drag.target !== drag.layer) doc.moveLayer(drag.layer, drag.target);
     if (drag.kind === 'cue' && drag.moved && drag.to !== drag.from) doc.updateSoundCue(drag.uid, { frame: drag.to }, 'Move sound cue');
     this.ws.emit('change');
@@ -763,7 +872,15 @@ export class SceneTimeline {
     if (row.kind === 'layer') {
       const li = row.index;
       const layer = doc.state.layers[li];
-      doc.ui.layer = li;
+      // Right-clicking a selected key (or layer) keeps the selection, so menu items can act on all of it.
+      const id = keyId(layer.uid, frame);
+      if (x >= NAME_W && layer.keys.some((k) => k.frame === frame)) {
+        if (!doc.ui.keys.has(id)) {
+          doc.selectOnly(li);
+          doc.ui.keys.add(id);
+        } else doc.toggleSelected(li, true);
+      } else if (doc.isSelected(li)) doc.toggleSelected(li, true);
+      else doc.selectOnly(li);
       if (x >= NAME_W) doc.ui.frame = doc.ui.frameEnd = frame;
       ws.emit('change');
       if (x >= NAME_W) items.push(...this.keyMenu(doc, li, layer, frame), { separator: true });
@@ -785,17 +902,45 @@ export class SceneTimeline {
     const ki = keyIndexAt(layer, frame);
     const key = layer.keys[ki];
     const locked = doc.isLocked(li);
+    // Several keys selected (including this one): easing and clearing act on all of them.
+    const picked = isKey && doc.ui.keys.has(keyId(layer.uid, frame)) ? doc.selectedKeys().filter((r) => !doc.isLocked(r.layer)) : [];
+    const targets: KeyRef[] = picked.length > 1 ? picked : [{ layer: li, frame }];
+    const many = targets.length > 1;
+    const easing: MenuItem = {
+      label: many ? `Easing (${targets.length} keys)` : 'Easing',
+      disabled: !key || locked,
+      submenu: [
+        ...SCENE_EASES.map((ea) => ({
+          label: ea.id === 'custom' ? 'Custom curve (edit in the inspector)' : ea.label,
+          checked: !many && key?.ease === ea.id,
+          action: () => (doc.setEases(targets, ea.id), emit()),
+        })),
+        { separator: true },
+        { label: 'Curve presets', submenu: CURVE_PRESETS.map((p) => ({ label: p.label, action: () => (doc.setEases(targets, 'custom', p.curve, `Easing: ${p.label}`), emit()) })) },
+      ],
+    };
+    if (many) {
+      return [
+        easing,
+        {
+          label: `Clear ${targets.length} keyframes`,
+          shortcut: 'Del',
+          action: () => {
+            const r = doc.removeKeys(targets);
+            if (r.kept) ws.status(`Kept ${r.kept} first keyframe${r.kept > 1 ? 's' : ''}: a layer starts at its first key.`);
+            emit();
+          },
+        },
+        { label: 'Deselect keys', action: () => (doc.ui.keys.clear(), emit()) },
+      ];
+    }
     return [
       { label: 'Insert keyframe', shortcut: 'F6', disabled: isKey || locked, action: () => (doc.toggleKey(li, frame), emit()) },
       { label: 'Insert blank keyframe (hide)', shortcut: 'F7', disabled: locked, action: () => (doc.setKey(li, frame, { visible: false }, 'Insert blank keyframe'), emit()) },
       { label: 'Show from here', disabled: !key || key.visible || locked, action: () => (doc.setKey(li, frame, { visible: true }, 'Show layer'), emit()) },
       // The first key is where the layer starts; it can be dragged but not cleared.
       { label: 'Clear keyframe', shortcut: 'Shift+F6', disabled: !isKey || ki === 0 || locked, action: () => (doc.removeKey(li, frame), emit()) },
-      {
-        label: 'Easing',
-        disabled: !key || locked,
-        submenu: EASES.map((ea) => ({ label: ea.label, checked: key?.ease === ea.id, action: () => (doc.setEase(li, frame, ea.id), emit()) })),
-      },
+      easing,
       ...(layer.kind === 'reanim' || layer.kind === 'particle'
         ? [{ label: layer.kind === 'particle' ? 'Restart effect here' : 'Restart animation here', checked: isKey && key?.restart, disabled: locked, action: () => (doc.setKey(li, frame, { restart: !(isKey && key?.restart) }, 'Toggle restart'), emit()) }]
         : []),

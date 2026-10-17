@@ -1,12 +1,13 @@
 /** Right-hand panel for scenes: stage settings, the selected layer's keyframe properties, sound cues. */
 
 import { getAnimRanges } from '../formats/reanim';
-import { EASES } from '../editor/reanimDoc';
-import { CAMERA_PRESETS, cameraLayer, evalLayer, INSTANCE_LOOPS, keyIndexAt, type LayerKey, type LayerPose, type SceneDocument } from '../editor/sceneDoc';
+import { CURVE_PRESETS, curveForEase, reverseCurve, type EaseCurve } from '../editor/easeCurve';
+import { CAMERA_PRESETS, cameraLayer, evalLayer, INSTANCE_LOOPS, keyIndexAt, SCENE_EASES, type KeyRef, type LayerKey, type LayerPose, type SceneDocument, type SceneEase } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
 import { uniqueSceneName } from './exporters';
 import { fontInput, pickAsset, pickImage, previewSound, thumbnail } from './pickers';
+import { CurveEditor } from './curveEditor';
 import { checkbox, numberField, select, type NumberField } from './widgets';
 
 function toHex(rgb: [number, number, number]): string {
@@ -26,6 +27,8 @@ export class SceneInspector {
   private alphaSlider: { el: HTMLInputElement; get(p: LayerPose): number } | null = null;
   /** A scrub or slider drag is in progress: update values in place, never rebuild under the pointer. */
   private gesture = false;
+  /** A tween preview is playing (requestAnimationFrame id). */
+  private previewing = 0;
   uniformScale = true;
 
   constructor(
@@ -59,10 +62,19 @@ export class SceneInspector {
     const ki = layer ? keyIndexAt(layer, frame) : -1;
     const key = layer?.keys[ki];
     const s = doc.state;
+    const targets = this.easeTargets(doc);
     const sig = [
       doc.id,
-      this.ws.playing ? 'playing' : frame,
+      this.ws.playing || this.previewing ? 'playing' : frame,
       doc.ui.layer,
+      [...doc.ui.extra].join(),
+      // The easing section shows the tweens it edits.
+      targets.map((t) => {
+        const l = doc.state.layers[t.layer];
+        const k = l?.keys[keyIndexAt(l, t.frame)];
+        const n = l?.keys[keyIndexAt(l, t.frame) + 1];
+        return `${l?.uid}:${k?.frame}:${k?.ease}:${n?.frame}:${n?.visible}:${k?.ease === 'custom' ? JSON.stringify(k.curve) : ''}:${l && doc.ui.locked.has(l.uid)}`;
+      }).join(),
       layer?.uid,
       layer?.name,
       layer?.source,
@@ -93,7 +105,10 @@ export class SceneInspector {
     this.fields.clear();
     this.alphaSlider = null;
     const scroll = this.el.scrollTop;
-    this.el.replaceChildren(this.sceneSection(doc), doc.ui.cue ? this.cueSection(doc) : layer ? this.layerSection(doc) : this.hint());
+    this.el.replaceChildren(
+      this.sceneSection(doc),
+      doc.ui.cue ? this.cueSection(doc) : doc.selectedLayers().length > 1 ? this.multiSection(doc) : layer ? this.layerSection(doc) : this.hint(),
+    );
     this.el.scrollTop = scroll;
   }
 
@@ -112,7 +127,7 @@ export class SceneInspector {
       { class: 'insp-hint' },
       h('p', null, 'Drag a prefab (reanim), particle effect or image from the library onto the stage to add it as a layer.'),
       h('p', null, 'Select an instance to edit it. Moving, rotating or scaling sets a keyframe at the current frame; frames between keyframes are tweened.'),
-      h('p', null, 'Double-click an instance to edit its prefab.'),
+      h('p', null, 'Double-click an instance to edit its prefab. Shift-click or drag a rectangle to select several layers; drag across the timeline to select keyframes and ease them together.'),
       h('p', { class: 'dim' }, 'Space play · ←/→ frame · F6 keyframe · F7 blank keyframe · F5 insert frame · Alt+arrows nudge'),
     );
   }
@@ -210,8 +225,7 @@ export class SceneInspector {
             class: 'btn small',
             title: 'A camera pans, zooms and turns the view; exports and bakes see what it sees',
             onclick: () => {
-              doc.ui.layer = doc.addCamera();
-              doc.ui.cue = null;
+              doc.selectOnly(doc.addCamera());
               ws.emit('change');
             },
           },
@@ -440,19 +454,6 @@ export class SceneInspector {
         },
         isKey ? 'Remove key' : 'Make key',
       ),
-      key
-        ? select(
-            EASES.map((e) => ({ value: e.id, label: isCamera && e.id === 'hold' ? 'Static (hold until next key)' : e.label })),
-            key.ease,
-            (v) => {
-              if (doc.isLocked(li)) return set({}, 'Set easing');
-              if (ws.playing) ws.pause();
-              doc.setEase(li, doc.ui.frame, v);
-              ws.emit('change');
-            },
-            `Tween from key ${key.frame} to the next key`,
-          )
-        : null,
     );
 
     if (!pose) {
@@ -553,6 +554,8 @@ export class SceneInspector {
       ),
     ];
 
+    sections.push(this.easingSection(doc, this.easeTargets(doc)));
+
     if (isCamera) {
       const others = doc.state.layers.filter((l) => l.kind !== 'camera');
       const followOptions = [{ value: '0', label: 'Nothing (free camera)' }, ...others.map((l) => ({ value: String(l.uid), label: l.name }))];
@@ -641,6 +644,204 @@ export class SceneInspector {
     }
     return h('div', null, ...sections);
   }
+
+  /** The tweens the easing controls edit: the selected keys, or the selected layers' tweens at the playhead. */
+  private easeTargets(doc: SceneDocument): KeyRef[] {
+    const keys = doc.selectedKeys();
+    if (keys.length) return keys;
+    return doc.selectedLayers().map((layer) => ({ layer, frame: doc.ui.frame }));
+  }
+
+  /** Easing of the tweens in `targets`: a built-in ease, a preset or a hand-drawn curve. */
+  private easingSection(doc: SceneDocument, all: KeyRef[]) {
+    const ws = this.ws;
+    const targets = all.filter((t) => !doc.isLocked(t.layer));
+    // The curve shown is the main layer's (or the first target's).
+    const ref = targets.find((t) => t.layer === doc.ui.layer) ?? targets[0] ?? all[0];
+    const layer = ref && doc.state.layers[ref.layer];
+    const ki = layer ? keyIndexAt(layer, ref.frame) : -1;
+    const key = layer?.keys[ki];
+    const next = layer?.keys[ki + 1];
+    const tweens = (t: KeyRef) => {
+      const l = doc.state.layers[t.layer];
+      const i = keyIndexAt(l, t.frame);
+      const n = l.keys[i + 1];
+      return i >= 0 && !!n && n.visible;
+    };
+    const live = targets.filter(tweens);
+    const section = h('section', { class: 'insp-section insp-easing' });
+    const title = h('h3', null, 'Easing');
+    section.append(title);
+    if (!key || !layer) {
+      section.append(h('p', { class: 'dim small' }, 'Nothing here yet.'));
+      return section;
+    }
+    const isCamera = layer.kind === 'camera';
+    const many = targets.length > 1;
+    title.append(
+      h('span', { class: 'dim small' }, many ? `  ${live.length} tween${live.length === 1 ? '' : 's'}` : next ? `  key ${key.frame} → ${next.frame}` : `  from key ${key.frame}`),
+    );
+    const locked = !targets.length;
+    const curveOf = (k: LayerKey): EaseCurve => (k.ease === 'custom' && k.curve ? k.curve : curveForEase(k.ease));
+    let begun = false;
+    const apply = (ease: SceneEase, curve: EaseCurve | null, label: string, final: boolean) => {
+      if (ws.playing) ws.pause();
+      doc.setEases(targets, ease, curve, begun ? null : label);
+      begun = !final;
+      ws.emit(final ? 'change' : 'frame');
+    };
+    const editor = new CurveEditor(curveOf(key), {
+      height: 170,
+      onBegin: () => {
+        begun = false;
+        this.gesture = true;
+      },
+      onChange: (c, final) => {
+        if (final) this.gesture = false;
+        apply('custom', c, 'Edit easing curve', final);
+      },
+    });
+    editor.set(curveOf(key), key.ease === 'hold');
+    editor.setDisabled(locked || !live.length);
+
+    const easeSelect = select(
+      SCENE_EASES.map((e) => ({ value: e.id, label: e.id === 'hold' && isCamera ? 'Static (hold until next key)' : e.id === 'custom' ? 'Custom curve' : e.label })),
+      key.ease,
+      (v) => {
+        begun = false;
+        apply(v, null, 'Set easing', true);
+      },
+      many ? 'Easing of every selected tween' : `Tween from key ${key.frame} to the next key`,
+    );
+    easeSelect.disabled = locked;
+    const presetSelect = select(
+      [{ value: '', label: 'Curve preset…' }, ...CURVE_PRESETS.map((p) => ({ value: p.id, label: p.label }))],
+      '',
+      (v) => {
+        const p = CURVE_PRESETS.find((x) => x.id === v);
+        presetSelect.value = '';
+        if (!p) return;
+        begun = false;
+        apply('custom', p.curve, `Easing: ${p.label}`, true);
+      },
+      'Start from a ready-made curve',
+    );
+    presetSelect.disabled = locked;
+    section.append(
+      h('div', { class: 'insp-grid2' }, easeSelect, presetSelect),
+      editor.el,
+      h(
+        'div',
+        { class: 'insp-buttons' },
+        h(
+          'button',
+          {
+            class: 'btn small',
+            disabled: locked,
+            title: 'Play the curve backwards (an ease-in becomes an ease-out)',
+            onclick: () => {
+              begun = false;
+              apply('custom', reverseCurve(editor.value), 'Reverse easing', true);
+            },
+          },
+          '⇄ Reverse',
+        ),
+        h(
+          'button',
+          {
+            class: 'btn small',
+            disabled: !live.length,
+            title: 'Play this tween on the stage',
+            onclick: () => this.previewTween(doc, ref, editor),
+          },
+          '▶ Preview',
+        ),
+      ),
+      h(
+        'p',
+        { class: 'dim small' },
+        !live.length
+          ? 'No tween from this key yet: add a key further along the layer to ease into it.'
+          : `${many ? 'Applies to every selected tween. ' : ''}Drag points and handles; double-click the curve to add a point, a point to remove it. Alt breaks a point’s handles.`,
+      ),
+    );
+    return section;
+  }
+
+  /** Play one tween on the stage, with a marker running along its curve. */
+  private previewTween(doc: SceneDocument, ref: KeyRef, editor: CurveEditor) {
+    const ws = this.ws;
+    const layer = doc.state.layers[ref.layer];
+    const i = layer ? keyIndexAt(layer, ref.frame) : -1;
+    const a = layer?.keys[i];
+    const b = layer?.keys[i + 1];
+    if (!a || !b) return;
+    if (ws.playing) ws.pause();
+    cancelAnimationFrame(this.previewing);
+    const from = a.frame;
+    const span = b.frame - a.frame;
+    const ms = (span / doc.state.fps) * 1000;
+    const start = performance.now();
+    const stop = () => {
+      cancelAnimationFrame(this.previewing);
+      this.previewing = 0;
+      window.removeEventListener('pointerdown', stop, true);
+      editor.setMarker(null);
+      ws.emit('change');
+    };
+    window.addEventListener('pointerdown', stop, true);
+    const step = (now: number) => {
+      const t = Math.min(1, (now - start) / ms);
+      ws.setFrame(Math.round(from + t * span));
+      editor.setMarker(t);
+      if (t < 1 && ws.scene === doc) this.previewing = requestAnimationFrame(step);
+      else setTimeout(stop, 250);
+    };
+    this.previewing = requestAnimationFrame(step);
+  }
+
+  /** Several layers are selected: what applies to all of them. */
+  private multiSection(doc: SceneDocument) {
+    const ws = this.ws;
+    const sel = doc.selectedLayers();
+    const names = sel.map((i) =>
+      h(
+        'button',
+        {
+          class: `chip${i === doc.ui.layer ? ' on' : ''}`,
+          title: 'Edit only this layer',
+          onclick: () => {
+            doc.selectOnly(i);
+            ws.emit('change');
+          },
+        },
+        doc.state.layers[i].name,
+      ),
+    );
+    const anyLocked = sel.some((i) => doc.isLocked(i));
+    return h(
+      'div',
+      null,
+      h(
+        'section',
+        { class: 'insp-section' },
+        h('h3', null, `${sel.length} layers selected`),
+        h('div', { class: 'chip-row' }, names),
+        h(
+          'div',
+          { class: 'insp-buttons' },
+          h('button', { class: 'btn small', title: 'Keyframe every selected layer at the playhead (F6)', onclick: () => this.multiAction('key') }, '◆ Key all'),
+          h('button', { class: 'btn small', title: 'Duplicate the selected layers (Ctrl+D)', onclick: () => this.multiAction('duplicate') }, 'Duplicate'),
+          h('button', { class: 'btn small danger', disabled: anyLocked, title: 'Delete the selected layers (Del)', onclick: () => this.multiAction('delete') }, 'Delete'),
+        ),
+        h('p', { class: 'dim small' }, 'Drag any of them on the stage to move them together; Alt+arrows nudge them all. Shift-click (stage or timeline) adds or removes a layer.'),
+      ),
+      this.easingSection(doc, this.easeTargets(doc)),
+    );
+  }
+
+  /** Multi-selection actions are the app's (they share the keyboard shortcuts' code). */
+  multiAction: (action: 'key' | 'duplicate' | 'delete') => void = () => {};
 
   private cueSection(doc: SceneDocument) {
     const ws = this.ws;

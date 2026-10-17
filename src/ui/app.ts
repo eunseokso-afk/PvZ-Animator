@@ -85,6 +85,14 @@ export class App {
       locked: (doc, li) => this.sceneLocked(doc, li),
     });
     this.sceneInspector = new SceneInspector(ws, { flip: (doc, li, v) => this.viewport.sceneStage.flip(doc, li, v) });
+    this.sceneInspector.multiAction = (action) => {
+      const sc = ws.scene;
+      if (!sc) return;
+      if (action === 'key') this.sceneKey('insert');
+      else if (action === 'duplicate') this.viewport.sceneStage.duplicateSelection(sc);
+      else this.deleteSceneSelection(sc);
+      ws.emit('change');
+    };
     this.browser = new AssetBrowser(ws, {
       openPak: () => void this.openPak(),
       openFolder: () => void this.openFolder(),
@@ -736,8 +744,7 @@ export class App {
       {
         label: cameraLayer(doc.state) ? 'Select camera' : 'Add camera',
         action: () => {
-          doc.ui.layer = doc.addCamera();
-          doc.ui.cue = null;
+          doc.selectOnly(doc.addCamera());
           ws.emit('change');
         },
       },
@@ -782,20 +789,62 @@ export class App {
     return true;
   }
 
-  /** F6 / F7 / Shift+F6 on the selected layer at the current frame. */
+  /** F6 / F7 / Shift+F6 on the selected layers at the current frame. */
   private sceneKey(action: 'insert' | 'blank' | 'clear' | 'toggle') {
     const doc = this.ws.scene;
     if (!doc || doc.ui.layer < 0) return;
-    const li = doc.ui.layer;
-    if (this.sceneLocked(doc, li)) return;
+    const sel = doc.selectedLayers();
+    if (sel.length === 1) {
+      const li = sel[0];
+      if (this.sceneLocked(doc, li)) return;
+      const f = doc.ui.frame;
+      const keys = doc.state.layers[li].keys;
+      const isKey = keys.some((k) => k.frame === f);
+      if (action === 'blank') doc.setKey(li, f, { visible: false }, 'Insert blank keyframe');
+      else if (action === 'clear' || (action === 'toggle' && isKey)) {
+        if (isKey && !doc.removeKey(li, f)) this.ws.status('The first keyframe is where the layer starts, so it stays. Drag it on the timeline to start the layer later.');
+      } else if (!isKey) doc.toggleKey(li, f);
+      this.ws.emit('change');
+      return;
+    }
+    // Several layers: the same action on each unlocked one, as one undo step.
+    const free = sel.filter((i) => !doc.isLocked(i));
+    if (free.length < sel.length) this.ws.status('Locked layers were left alone.');
     const f = doc.ui.frame;
-    const keys = doc.state.layers[li].keys;
-    const isKey = keys.some((k) => k.frame === f);
-    if (action === 'blank') doc.setKey(li, f, { visible: false }, 'Insert blank keyframe');
-    else if (action === 'clear' || (action === 'toggle' && isKey)) {
-      if (isKey && !doc.removeKey(li, f)) this.ws.status('The first keyframe is where the layer starts, so it stays. Drag it on the timeline to start the layer later.');
-    } else if (!isKey) doc.toggleKey(li, f);
+    const keyed = (i: number) => doc.state.layers[i].keys.some((k) => k.frame === f);
+    // Toggle: add keys unless every layer already has one here.
+    const clear = action === 'clear' || (action === 'toggle' && free.every(keyed));
+    if (clear) {
+      const r = doc.removeKeys(free.filter(keyed).map((layer) => ({ layer, frame: f })));
+      if (r.kept) this.ws.status(`Kept ${r.kept} first keyframe${r.kept > 1 ? 's' : ''}: a layer starts at its first key.`);
+    } else {
+      const patch = action === 'blank' ? { visible: false } : {};
+      doc.setKeys(f, free.filter((i) => action === 'blank' || !keyed(i)).map((layer) => ({ layer, patch })), action === 'blank' ? 'Insert blank keyframes' : 'Insert keyframes');
+    }
     this.ws.emit('change');
+  }
+
+  /** Delete: the selected keyframes if there are any, otherwise the selected layers. */
+  private deleteSceneSelection(doc: SceneDocument) {
+    const keys = doc.selectedKeys().filter((r) => !doc.isLocked(r.layer));
+    if (keys.length) {
+      const r = doc.removeKeys(keys);
+      if (r.removed) {
+        if (r.kept) this.ws.status(`Removed ${r.removed} keyframe${r.removed > 1 ? 's' : ''}; kept ${r.kept} first keyframe${r.kept > 1 ? 's' : ''} (a layer starts at its first key).`);
+        return;
+      }
+      // Only first keys were selected: they stay, so the layers go as before.
+      doc.ui.keys.clear();
+    }
+    const sel = doc.selectedLayers();
+    const free = sel.filter((i) => !doc.isLocked(i));
+    if (!free.length) {
+      if (sel.length) this.sceneLocked(doc, sel[0]);
+      return;
+    }
+    if (free.length < sel.length) this.ws.status('Locked layers were not deleted.');
+    if (sel.length === 1) doc.removeLayer(sel[0]);
+    else doc.removeLayers(free);
   }
 
   /** F5 / Shift+F5: insert or remove a frame on the selected layer, or on every layer. */
@@ -1162,7 +1211,7 @@ export class App {
         if (k === 'v' && r) return handled(), this.pastePose();
         if (k === 'd' && r && r.ui.track >= 0) return handled(), (r.ui.track = r.duplicateTrack(r.ui.track)), ws.emit('change');
         const sc = ws.scene;
-        if (k === 'd' && sc && sc.ui.layer >= 0) return handled(), (sc.ui.layer = sc.duplicateLayer(sc.ui.layer)), ws.emit('change');
+        if (k === 'd' && sc && sc.ui.layer >= 0) return handled(), this.viewport.sceneStage.duplicateSelection(sc), ws.emit('change');
         // Ctrl+F5 / Ctrl+Shift+F5: insert / remove a frame on every layer (and never reload the page).
         if (key === 'F5') {
           handled();
@@ -1280,8 +1329,7 @@ export class App {
       const n = doc.state.layers.length;
       if (!n) return;
       // The timeline lists the top layer first, so "down" goes to a lower index.
-      doc.ui.layer = li < 0 ? n - 1 : Math.max(0, Math.min(n - 1, li + (key === 'ArrowUp' ? 1 : -1)));
-      doc.ui.cue = null;
+      doc.selectOnly(li < 0 ? n - 1 : Math.max(0, Math.min(n - 1, li + (key === 'ArrowUp' ? 1 : -1))));
       ws.emit('change');
       return;
     }
@@ -1297,15 +1345,24 @@ export class App {
     if ((key === ']' || key === '[') && li >= 0) return handled(), doc.moveLayer(li, li + (key === ']' ? 1 : -1)), ws.emit('change');
     if (key === 'h' && li >= 0) {
       handled();
-      const uid = doc.state.layers[li].uid;
-      if (!doc.ui.hidden.delete(uid)) doc.ui.hidden.add(uid);
+      // Hide all selected layers, or show them all if they are all hidden.
+      const uids = doc.selectedLayers().map((i) => doc.state.layers[i].uid);
+      const hide = !uids.every((u) => doc.ui.hidden.has(u));
+      for (const u of uids) doc.ui.hidden[hide ? 'add' : 'delete'](u);
+      ws.emit('change');
+      return;
+    }
+    if (key === 'Escape' && (doc.ui.keys.size || doc.ui.extra.size)) {
+      handled();
+      doc.ui.keys.clear();
+      doc.ui.extra.clear();
       ws.emit('change');
       return;
     }
     if (key === 'Delete' || key === 'Backspace') {
       handled();
       if (doc.ui.cue) doc.removeSoundCue(doc.ui.cue.uid);
-      else if (li >= 0 && !this.sceneLocked(doc, li)) doc.removeLayer(li);
+      else this.deleteSceneSelection(doc);
       ws.emit('change');
     }
   }
@@ -1318,13 +1375,15 @@ export class App {
       ['← / →  or  , / .', 'Previous / next frame'],
       ['Home / End', 'First / last frame'],
       ['↑ / ↓', 'Select layer above / below'],
-      ['Alt + arrows', 'Nudge selected instance 1 px (Shift: 10 px)'],
-      ['F6 / K', 'Insert keyframe (K toggles)'],
+      ['Alt + arrows', 'Nudge the selected layers 1 px (Shift: 10 px)'],
+      ['F6 / K', 'Insert keyframe on the selected layers (K toggles)'],
       ['F7', 'Insert blank keyframe (hide the layer from here)'],
       ['Shift+F6', 'Clear keyframe'],
+      ['Shift / Ctrl+click', 'Add or remove a layer (stage, layer names) or a keyframe (timeline)'],
+      ['Esc', 'Deselect keyframes and extra layers'],
       ['F5 / Shift+F5', 'Insert / remove a frame on the selected layer'],
       ['Ctrl+F5 / Ctrl+Shift+F5', 'Insert / remove a frame on all layers'],
-      ['Del', 'Delete selected layer or sound cue'],
+      ['Del', 'Delete the selected keyframes, or else the selected layers (or sound cue)'],
       ['[ / ]', 'Send layer backward / forward'],
       ['H', 'Hide layer in the editor'],
       ['C', 'Look through the camera / see the whole world'],
@@ -1333,8 +1392,8 @@ export class App {
       ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],
       ['Ctrl+S', 'Save project'],
       ['Ctrl+E', 'Bake scene to .reanim'],
-      ['Mouse', 'Drag an instance to move it · corner handles scale (Shift: uniform) · top handle rotates (Shift snaps) · double-click edits the prefab · drag empty space to pan · wheel zooms'],
-      ['Timeline', 'Click a frame to select · drag a key to move it · double-click toggles a key · drag layer names to reorder · drop library items to add layers or sound cues'],
+      ['Mouse', 'Drag an instance to move it (and the rest of the selection) · drag empty space to select with a rectangle · corner handles scale (Shift: uniform) · top handle rotates (Shift snaps) · double-click edits the prefab · Space+drag, middle or right drag pans · wheel zooms'],
+      ['Timeline', 'Click a frame to select · drag across frames and layers to select keys · drag a key to move the selected keys · double-click toggles a key · drag layer names to reorder · drop library items to add layers or sound cues'],
     ];
     const rows: [string, string][] = this.ws.scene ? sceneRows : [
       ['Space', 'Play / pause'],

@@ -9,12 +9,18 @@
 import { Curve, warpTime } from '../formats/floatTrack';
 import { DEG, type Mat } from '../engine/math';
 import { DocumentBase, EASES, nextUid, type Ease, type SoundCue } from './reanimDoc';
+import { cloneCurve, curveForEase, evalCurve, normalizeCurve, type EaseCurve } from './easeCurve';
 
 /**
  * Text layers keep their font id (FONT_*) in `source` and their words in each key.
  * A scene has at most one camera layer: its keys place the camera's frame in the world.
  */
 export type LayerKind = 'reanim' | 'particle' | 'image' | 'text' | 'camera';
+
+/** A key's tween: a built-in ease, or its own curve (`LayerKey.curve`). */
+export type SceneEase = Ease | 'custom';
+
+export const SCENE_EASES: { id: SceneEase; label: string }[] = [...EASES.map((e) => ({ id: e.id as SceneEase, label: e.label })), { id: 'custom', label: 'Custom curve' }];
 
 /** How an instance plays its prefab animation (Animate: Loop / Play once / Single frame). */
 export type InstanceLoop = 'loop' | 'once' | 'single';
@@ -53,7 +59,9 @@ export interface LayerKey {
   /** Color multiply, 0..1 per channel. */
   tint: [number, number, number];
   /** Tween from this key to the next. */
-  ease: Ease;
+  ease: SceneEase;
+  /** The curve of a 'custom' ease (kept when switching to a built-in one, so switching back restores it). */
+  curve: EaseCurve | null;
   /** Reanim layers: anim_ track to play ('' = every frame). */
   anim: string;
   loop: InstanceLoop;
@@ -116,7 +124,7 @@ export interface LayerPose {
 
 export const TWEENED_PROPS = ['x', 'y', 'rotation', 'scaleX', 'scaleY', 'alpha', 'shake'] as const;
 
-const EASE_CURVE = new Map(EASES.map((e) => [e.id, e.curve]));
+const EASE_CURVE = new Map<SceneEase, Curve>(EASES.map((e) => [e.id, e.curve]));
 
 export function defaultKey(frame: number, patch: Partial<LayerKey> = {}): LayerKey {
   return {
@@ -131,6 +139,7 @@ export function defaultKey(frame: number, patch: Partial<LayerKey> = {}): LayerK
     visible: true,
     tint: [1, 1, 1],
     ease: 'linear',
+    curve: null,
     anim: '',
     loop: 'loop',
     speed: 1,
@@ -144,7 +153,7 @@ export function defaultKey(frame: number, patch: Partial<LayerKey> = {}): LayerK
 }
 
 export function cloneKey(k: LayerKey): LayerKey {
-  return { ...k, tint: [...k.tint] as [number, number, number] };
+  return { ...k, tint: [...k.tint] as [number, number, number], curve: k.curve ? cloneCurve(k.curve) : null };
 }
 
 export function cloneLayer(l: SceneLayer): SceneLayer {
@@ -170,11 +179,17 @@ function sameRun(a: LayerKey, b: LayerKey): boolean {
   return a.anim === b.anim && a.loop === b.loop && a.speed === b.speed && a.startFrame === b.startFrame && a.visible === b.visible;
 }
 
-/** How far (eased, 0..1) a frame is from key `k` towards `next`; 0 when they do not tween. */
+/** Eased progress at time t (0..1) of the tween that starts at key `k`. */
+export function easeProgress(k: Pick<LayerKey, 'ease' | 'curve'>, t: number): number {
+  if (k.ease === 'custom') return k.curve ? evalCurve(k.curve, t) : t;
+  return warpTime(t, EASE_CURVE.get(k.ease) ?? Curve.Linear);
+}
+
+/** How far (eased) a frame is from key `k` towards `next`; 0 when they do not tween. */
 function tweenFraction(k: LayerKey, next: LayerKey | undefined, frame: number): number {
   // Like Animate, a blank (hidden) keyframe ends the tween instead of being tweened towards.
   if (!next || !next.visible || k.ease === 'hold' || next.frame <= k.frame || frame <= k.frame) return 0;
-  return warpTime((frame - k.frame) / (next.frame - k.frame), EASE_CURVE.get(k.ease) ?? Curve.Linear);
+  return easeProgress(k, Math.min(1, (frame - k.frame) / (next.frame - k.frame)));
 }
 
 /**
@@ -203,7 +218,7 @@ export function evalLayer(layer: SceneLayer, frame: number, scene?: SceneState):
     segmentStart: k.frame,
   };
   const t = tweenFraction(k, next, frame);
-  if (t > 0 && next) {
+  if (t !== 0 && next) {
     for (const p of TWEENED_PROPS) pose[p] = k[p] + (next[p] - k[p]) * t;
     for (let c = 0; c < 3; c++) pose.tint[c] = k.tint[c] + (next.tint[c] - k.tint[c]) * t;
   }
@@ -216,7 +231,7 @@ export function evalLayer(layer: SceneLayer, frame: number, scene?: SceneState):
       return tp ? [key.x + tp.x, key.y + tp.y] : [key.x, key.y];
     };
     let [x, y] = at(k);
-    if (t > 0 && next) {
+    if (t !== 0 && next) {
       const b = at(next);
       x += (b[0] - x) * t;
       y += (b[1] - y) * t;
@@ -351,11 +366,26 @@ export interface SceneUiState {
   loopPlayback: boolean;
   /** Look at the stage through the camera (on) or see the whole world with the camera's frame (off). */
   cameraView: boolean;
+  /** Layers selected along with `layer` (uids; `layer` is the main one the inspector edits). */
+  extra: Set<number>;
+  /** Selected keyframes, as keyId(layer uid, frame). */
+  keys: Set<string>;
+}
+
+/** Identifies a keyframe in a selection. */
+export function keyId(uid: number, frame: number): string {
+  return `${uid}:${frame}`;
+}
+
+/** A keyframe (or the key governing a frame) on a layer, by layer index. */
+export interface KeyRef {
+  layer: number;
+  frame: number;
 }
 
 export class SceneDocument extends DocumentBase<SceneState> {
   readonly kind = 'scene' as const;
-  ui: SceneUiState = { layer: -1, frame: 0, frameEnd: 0, cue: null, hidden: new Set(), locked: new Set(), loopPlayback: true, cameraView: true };
+  ui: SceneUiState = { layer: -1, frame: 0, frameEnd: 0, cue: null, hidden: new Set(), locked: new Set(), loopPlayback: true, cameraView: true, extra: new Set(), keys: new Set() };
   /** Bumped on every change (particle previews and caches key on it). */
   revision = 0;
 
@@ -459,35 +489,38 @@ export class SceneDocument extends DocumentBase<SceneState> {
   }
 
   removeLayer(index: number): void {
-    if (!this.state.layers[index]) return;
-    this.edit('Delete layer', (s) => {
-      const uid = s.layers[index].uid;
-      // A camera that followed the layer stays where it was looking.
-      for (const k of cameraLayer(s)?.keys ?? []) {
-        if (k.follow !== uid) continue;
-        const tp = followTarget(s, k, k.frame);
-        k.x += tp?.x ?? 0;
-        k.y += tp?.y ?? 0;
-        k.follow = 0;
-      }
-      s.layers.splice(index, 1);
-    });
-    if (this.ui.layer >= this.state.layers.length) this.ui.layer = this.state.layers.length - 1;
+    const main = this.selectedLayer?.uid;
+    const gone = this.state.layers[index]?.uid;
+    if (!this.removeLayers([index])) return;
+    // Keep the selected layer, or select the one that took the deleted one's place.
+    this.ui.layer = main !== gone ? this.state.layers.findIndex((l) => l.uid === main) : Math.min(index, this.state.layers.length - 1);
   }
 
   duplicateLayer(index: number): number {
-    const src = this.state.layers[index];
-    if (!src || src.kind === 'camera') return index;
-    const copy = cloneLayer(src);
-    copy.uid = nextUid();
-    copy.seed = copy.uid;
-    copy.name = this.uniqueLayerName(src.name);
-    for (const k of copy.keys) {
-      k.x += 20;
-      k.y += 20;
-    }
-    this.edit('Duplicate layer', (s) => s.layers.splice(index + 1, 0, copy));
-    return index + 1;
+    return this.duplicateLayers([index])[0] ?? index;
+  }
+
+  /** Copy layers (not the camera), each just above its original, in one undo step; returns the copies' indices. */
+  duplicateLayers(indices: number[]): number[] {
+    const src = [...new Set(indices)].filter((i) => this.state.layers[i] && this.state.layers[i].kind !== 'camera').sort((a, b) => a - b);
+    if (!src.length) return [];
+    const uids: number[] = [];
+    this.edit(src.length > 1 ? 'Duplicate layers' : 'Duplicate layer', (s) => {
+      // From the top down, so inserting a copy never shifts a layer still to be copied.
+      for (const i of [...src].reverse()) {
+        const copy = cloneLayer(s.layers[i]);
+        copy.uid = nextUid();
+        copy.seed = copy.uid;
+        copy.name = this.uniqueLayerName(s.layers[i].name);
+        for (const k of copy.keys) {
+          k.x += 20;
+          k.y += 20;
+        }
+        s.layers.splice(i + 1, 0, copy);
+        uids.push(copy.uid);
+      }
+    });
+    return uids.reverse().map((u) => this.state.layers.findIndex((l) => l.uid === u));
   }
 
   moveLayer(from: number, to: number): void {
@@ -570,12 +603,187 @@ export class SceneDocument extends DocumentBase<SceneState> {
     return true;
   }
 
-  setEase(layerIndex: number, frame: number, ease: Ease): void {
-    const layer = this.state.layers[layerIndex];
+  setEase(layerIndex: number, frame: number, ease: SceneEase): void {
+    this.setEases([{ layer: layerIndex, frame }], ease);
+  }
+
+  /**
+   * Set the tween of the keys governing each frame (one undo step). A custom ease takes
+   * `curve`, or keeps the key's own curve, or starts from the curve of its current ease.
+   * Returns how many keys changed. Pass no label to continue the current undo step.
+   */
+  setEases(targets: KeyRef[], ease: SceneEase, curve?: EaseCurve | null, label: string | null = 'Set easing'): number {
+    const seen = new Set<LayerKey>();
+    for (const t of targets) {
+      const layer = this.state.layers[t.layer];
+      const i = layer ? keyIndexAt(layer, t.frame) : -1;
+      if (i >= 0) seen.add(layer.keys[i]);
+    }
+    if (!seen.size) return 0;
+    const c = curve ? normalizeCurve(curve) : null;
+    const apply = () => {
+      for (const k of seen) {
+        if (ease === 'custom') k.curve = c ? cloneCurve(c) : k.curve ?? curveForEase(k.ease);
+        k.ease = ease;
+      }
+    };
+    // The keys are live objects of this.state; a checkpoint snapshots copies, so they stay live.
+    if (label) this.edit(label, apply);
+    else this.touch(apply);
+    return seen.size;
+  }
+
+  // ------------------------------------------------------------ selection
+
+  /** Selected layer indices, the main one first. */
+  selectedLayers(): number[] {
+    const out = this.state.layers[this.ui.layer] ? [this.ui.layer] : [];
+    this.state.layers.forEach((l, i) => {
+      if (i !== this.ui.layer && this.ui.extra.has(l.uid)) out.push(i);
+    });
+    return out;
+  }
+
+  isSelected(index: number): boolean {
+    const l = this.state.layers[index];
+    return !!l && (index === this.ui.layer || this.ui.extra.has(l.uid));
+  }
+
+  /** Select one layer (or none with -1), dropping any multi-selection. */
+  selectOnly(index: number, keepKeys = false): void {
+    this.ui.layer = this.state.layers[index] ? index : -1;
+    this.ui.extra.clear();
+    if (!keepKeys) this.ui.keys.clear();
+    this.ui.cue = null;
+  }
+
+  /** Add a layer to the selection (it becomes the main one), or take it out. */
+  toggleSelected(index: number, on = !this.isSelected(index)): void {
+    const layer = this.state.layers[index];
     if (!layer) return;
-    const i = keyIndexAt(layer, frame);
-    if (i < 0) return;
-    this.edit('Set easing', (s) => (s.layers[layerIndex].keys[i].ease = ease));
+    this.ui.cue = null;
+    const main = this.state.layers[this.ui.layer];
+    if (on) {
+      if (main && main !== layer) this.ui.extra.add(main.uid);
+      this.ui.extra.delete(layer.uid);
+      this.ui.layer = index;
+    } else if (index === this.ui.layer) {
+      // The next selected layer becomes the main one.
+      const rest = this.selectedLayers().slice(1);
+      this.ui.layer = rest[0] ?? -1;
+      if (rest[0] !== undefined) this.ui.extra.delete(this.state.layers[rest[0]].uid);
+    } else this.ui.extra.delete(layer.uid);
+  }
+
+  /** Selected keyframes that still exist, by layer index (sorted by layer, then frame). */
+  selectedKeys(): KeyRef[] {
+    const out: KeyRef[] = [];
+    if (!this.ui.keys.size) return out;
+    this.state.layers.forEach((l, i) => {
+      for (const k of l.keys) if (this.ui.keys.has(keyId(l.uid, k.frame))) out.push({ layer: i, frame: k.frame });
+    });
+    return out;
+  }
+
+  /**
+   * Move keyframes by `delta` frames together (one undo step). Fails (false) if a key
+   * would leave the scene or land on a key that is not moving. The selection follows.
+   */
+  moveKeys(refs: KeyRef[], delta: number): boolean {
+    delta = Math.round(delta);
+    if (!delta || !refs.length) return false;
+    const byLayer = new Map<number, Set<number>>();
+    for (const r of refs) {
+      const layer = this.state.layers[r.layer];
+      if (!layer?.keys.some((k) => k.frame === r.frame)) continue;
+      if (!byLayer.has(r.layer)) byLayer.set(r.layer, new Set());
+      byLayer.get(r.layer)!.add(r.frame);
+    }
+    if (!byLayer.size) return false;
+    for (const [li, frames] of byLayer) {
+      for (const f of frames) {
+        const to = f + delta;
+        if (to < 0 || to >= this.state.length) return false;
+        if (!frames.has(to) && this.state.layers[li].keys.some((k) => k.frame === to)) return false;
+      }
+    }
+    const moved: string[] = [];
+    this.edit(byLayer.size === 1 && [...byLayer.values()][0].size === 1 ? 'Move keyframe' : 'Move keyframes', (s) => {
+      for (const [li, frames] of byLayer) {
+        const layer = s.layers[li];
+        for (const k of layer.keys) {
+          if (!frames.has(k.frame)) continue;
+          if (this.ui.keys.delete(keyId(layer.uid, k.frame))) moved.push(keyId(layer.uid, k.frame + delta));
+          k.frame += delta;
+        }
+        layer.keys.sort((a, b) => a.frame - b.frame);
+      }
+    });
+    for (const id of moved) this.ui.keys.add(id);
+    return true;
+  }
+
+  /**
+   * Remove keyframes (one undo step). A layer's first key is where it starts and stays;
+   * returns how many were removed and how many first keys were kept.
+   */
+  removeKeys(refs: KeyRef[]): { removed: number; kept: number } {
+    const drop = new Map<number, Set<number>>();
+    let kept = 0;
+    for (const r of refs) {
+      const layer = this.state.layers[r.layer];
+      const i = layer ? layer.keys.findIndex((k) => k.frame === r.frame) : -1;
+      if (i < 0) continue;
+      if (i === 0) {
+        kept++;
+        continue;
+      }
+      if (!drop.has(r.layer)) drop.set(r.layer, new Set());
+      drop.get(r.layer)!.add(r.frame);
+    }
+    let removed = 0;
+    if (drop.size) {
+      this.edit('Remove keyframes', (s) => {
+        for (const [li, frames] of drop) {
+          const layer = s.layers[li];
+          layer.keys = layer.keys.filter((k) => !frames.has(k.frame));
+          for (const f of frames) this.ui.keys.delete(keyId(layer.uid, f));
+          removed += frames.size;
+        }
+      });
+    }
+    return { removed, kept };
+  }
+
+  /** Set key properties on several layers at one frame (one undo step). */
+  setKeys(frame: number, patches: { layer: number; patch: Partial<LayerKey> }[], label: string): void {
+    const list = patches.filter((p) => this.state.layers[p.layer]);
+    if (!list.length) return;
+    this.edit(label, () => {
+      for (const { layer, patch } of list) {
+        const i = this.ensureKey(layer, frame);
+        Object.assign(this.state.layers[layer].keys[i], patch, { frame });
+      }
+    });
+  }
+
+  /** Delete several layers (one undo step); returns how many. */
+  removeLayers(indices: number[]): number {
+    const uids = new Set(indices.map((i) => this.state.layers[i]?.uid).filter((u): u is number => u !== undefined));
+    if (!uids.size) return 0;
+    this.edit(uids.size === 1 ? 'Delete layer' : 'Delete layers', (s) => {
+      // A camera that followed a deleted layer stays where it was looking.
+      for (const k of cameraLayer(s)?.keys ?? []) {
+        if (!uids.has(k.follow)) continue;
+        const tp = followTarget(s, k, k.frame);
+        k.x += tp?.x ?? 0;
+        k.y += tp?.y ?? 0;
+        k.follow = 0;
+      }
+      s.layers = s.layers.filter((l) => !uids.has(l.uid));
+    });
+    this.selectOnly(-1);
+    return uids.size;
   }
 
   /**

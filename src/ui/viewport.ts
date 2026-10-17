@@ -729,7 +729,7 @@ export class Viewport {
     }
     if (e.button !== 0) return;
     if (doc.kind === 'scene') {
-      if (this.sceneStage.down(doc, x, y)) this.drag = { kind: 'scene' };
+      if (this.sceneStage.down(doc, x, y, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey })) this.drag = { kind: 'scene' };
       else this.drag = { kind: 'pan', sx: x, sy: y, px: doc.view.panX, py: doc.view.panY, moved: false, button: 0, hit: -1 };
       return;
     }
@@ -937,8 +937,7 @@ export class Viewport {
         doc.ui.cue = null;
         this.ws.emit('change');
       } else if (drag.button === 0 && doc.kind === 'scene' && (doc.ui.layer !== -1 || doc.ui.cue)) {
-        doc.ui.layer = -1;
-        doc.ui.cue = null;
+        doc.selectOnly(-1);
         this.ws.emit('change');
       }
     }
@@ -958,8 +957,9 @@ export class Viewport {
     } else if (doc?.kind === 'scene') {
       const hit = this.sceneStage.hitLayer(doc, x, y);
       if (hit >= 0) {
-        doc.ui.layer = hit;
-        doc.ui.cue = null;
+        // Keep a multi-selection the layer is part of (the menu then acts on all of it).
+        if (doc.isSelected(hit)) doc.toggleSelected(hit, true);
+        else doc.selectOnly(hit);
         this.ws.emit('change');
         items.push(...this.sceneStage.layerMenu(doc, hit), { separator: true });
       }

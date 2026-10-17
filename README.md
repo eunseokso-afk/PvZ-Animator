@@ -40,6 +40,16 @@ included in this repository.
   loop / play-once / single-frame modes, speed and first frame — like a graphic symbol's looping options.
 - Animate-style timeline: F6 keyframe, F7 blank keyframe, F5 / Shift+F5 insert / remove a frame on the
   selected layer (Ctrl for all layers), drag keys, lock and hide layers, onion skin.
+- **Easing curve editor**: each tween can use a built-in ease, a preset (strong in/out, snap, wind-up,
+  overshoot, bounce, elastic…) or its own curve. Drag the curve's points and Bézier handles in the
+  inspector (double-click to add or remove a point, Alt to break a point's handles, y may go past the
+  ends to overshoot); the stage updates as you drag and ▶ Preview plays the tween. Tween bars on the
+  timeline draw their curve. It works the same for camera moves.
+- **Multi-selection**: Shift- or Ctrl-click instances on the stage or layer names on the timeline, or drag
+  a rectangle over empty stage space, to select several layers; dragging one moves them all, and
+  Alt+arrows, F6/F7, Ctrl+D, H and Delete act on all of them. On the timeline, drag across frames and
+  layers (or Shift/Ctrl-click keys) to select keyframes: drag them together, delete them, or set their
+  easing in one go. Pan the stage with Space+drag or the middle/right mouse button.
 - Double-click an instance to edit its prefab; a breadcrumb leads back and edits show up live.
 - Several scenes per project (Scenes tab), saved in project files. **Bake** turns a scene into a single
   `.reanim` (every part of every instance becomes a track) that the game can play as `anim_scene`.
@@ -47,7 +57,8 @@ included in this repository.
 **Camera**
 - Each scene can have one camera (🎥 on the timeline, or ＋ Layer ▾ ▸ Add camera). It is a layer whose
   keyframes place a frame in the world: move the frame to **pan**, size it to **zoom**, turn it to
-  **rotate**. Keys tween with the usual easing; **Static** (hold) keeps the camera still until the next key.
+  **rotate**. Keys tween with the usual easing or a custom curve; **Static** (hold) keeps the camera still
+  until the next key.
 - The inspector adds zoom, **shake** (tweens, so a key with 0 settles it), **follow** a layer (the camera's
   x/y become an offset, and starting or stopping to follow pans smoothly), a colour filter and a fade to
   black, plus one-click presets: Static, Push in, Pull out, Pan, Tilt, Shake and Reset.

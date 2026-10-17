@@ -15,6 +15,7 @@ import { writeZip } from '../formats/zip';
 import { ParticleDocument } from '../editor/particleDoc';
 import { nextUid, ReanimDocument, type Ease } from '../editor/reanimDoc';
 import { SceneDocument, type SceneState } from '../editor/sceneDoc';
+import { normalizeCurve } from '../editor/easeCurve';
 import type { EditorDocument, Workspace } from '../editor/workspace';
 import { downloadBlob, fileBytes, h } from './dom';
 import { alertDialog, checkbox, confirmDialog, numberField, openDialog, select } from './widgets';
@@ -311,6 +312,8 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
         k.tint = [...(k.tint ?? [1, 1, 1])] as [number, number, number];
         k.text ??= '';
         k.shake ??= 0;
+        k.curve = k.curve ? normalizeCurve(k.curve) : null;
+        if (k.ease === 'custom' && !k.curve) k.ease = 'linear';
         // A camera follows a layer by id.
         k.follow = (k.follow && uids.get(k.follow)) || 0;
       }

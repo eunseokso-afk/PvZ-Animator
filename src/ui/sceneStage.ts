@@ -21,7 +21,10 @@ const HANDLE = 5;
 const ROT_DIST = 26;
 
 type Drag =
-  | { kind: 'move'; layer: number; frame: number; sx: number; sy: number; x0: number; y0: number; began: boolean }
+  /** Moves every selected layer (`items`) by the pointer's world-space movement. */
+  | { kind: 'move'; layer: number; frame: number; sx: number; sy: number; items: { layer: number; x0: number; y0: number }[]; inv: Mat | null; began: boolean }
+  /** A selection rectangle in screen space; `base` is the selection it adds to (Shift/Ctrl). */
+  | { kind: 'marquee'; layer: number; x0: number; y0: number; x1: number; y1: number; base: number[] | null }
   | { kind: 'rotate'; layer: number; frame: number; pivot: [number, number]; startAngle: number; rot0: number; local: [number, number]; sx: number; sy: number; began: boolean }
   | {
       kind: 'scale';
@@ -186,8 +189,21 @@ export class SceneStage {
         continue;
       }
       if (d.layerIndex === doc.ui.layer) continue;
-      if (d.layerIndex === this.hover) outline(pts, 'rgba(120, 200, 255, 0.9)', 1);
+      if (doc.isSelected(d.layerIndex)) outline(pts, '#ffd34d', 1);
+      else if (d.layerIndex === this.hover) outline(pts, 'rgba(120, 200, 255, 0.9)', 1);
       else if (this.ws.settings.showBounds) outline(pts, 'rgba(120, 200, 255, 0.16)', 1);
+    }
+    const drag = this.drag;
+    if (drag?.kind === 'marquee') {
+      ctx.save();
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = 'rgba(255, 211, 77, 0.9)';
+      ctx.fillStyle = 'rgba(255, 211, 77, 0.08)';
+      const x = Math.min(drag.x0, drag.x1);
+      const y = Math.min(drag.y0, drag.y1);
+      ctx.fillRect(x, y, Math.abs(drag.x1 - drag.x0), Math.abs(drag.y1 - drag.y0));
+      ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(Math.abs(drag.x1 - drag.x0)), Math.round(Math.abs(drag.y1 - drag.y0)));
+      ctx.restore();
     }
     if (this.throughCamera(doc)) {
       // Looking through the camera: say so, so moving things is not confused with moving the world.
@@ -201,6 +217,11 @@ export class SceneStage {
     if (!sel || this.ws.playing) return;
     const pts = this.corners(sel);
     if (!pts) return;
+    if (doc.selectedLayers().length > 1) {
+      // Several layers: they move together; handles are for one layer at a time.
+      outline(pts, '#ffd34d', 2);
+      return;
+    }
     if (doc.isLocked(sel.layerIndex)) {
       // Locked: show what is selected, but offer no handles.
       outline(pts, 'rgba(160, 160, 160, 0.8)', 1);
@@ -284,7 +305,7 @@ export class SceneStage {
 
   private hitHandle(doc: SceneDocument, x: number, y: number): { kind: 'rotate' } | { kind: 'scale'; corner: number } | null {
     const sel = this.drawn.find((d) => d.layerIndex === doc.ui.layer);
-    if (!sel || this.ws.playing) return null;
+    if (!sel || this.ws.playing || doc.ui.extra.size) return null;
     const layer = doc.state.layers[sel.layerIndex];
     if (!layer || doc.ui.locked.has(layer.uid)) return null;
     const rot = this.rotateHandle(sel);
@@ -309,11 +330,15 @@ export class SceneStage {
 
   // ------------------------------------------------------------ dragging
 
-  /** Returns true if the pointer-down was handled (otherwise the viewport pans). */
-  down(doc: SceneDocument, x: number, y: number): boolean {
+  /**
+   * Pointer down on the stage: handles transform the selected layer; a click selects
+   * (Shift or Ctrl/⌘ adds or removes) and drags the selection; empty space starts a marquee.
+   */
+  down(doc: SceneDocument, x: number, y: number, mods: { shift?: boolean; ctrl?: boolean } = {}): boolean {
     if (this.ws.playing) this.ws.pause();
     const frame = doc.ui.frame;
-    const handle = this.hitHandle(doc, x, y);
+    const additive = !!(mods.shift || mods.ctrl);
+    const handle = additive ? null : this.hitHandle(doc, x, y);
     if (handle) {
       const sel = this.drawn.find((d) => d.layerIndex === doc.ui.layer)!;
       const layer = doc.state.layers[sel.layerIndex];
@@ -353,21 +378,72 @@ export class SceneStage {
       return true;
     }
     const hit = this.hitLayer(doc, x, y);
-    if (hit < 0) return false;
-    if (doc.ui.layer !== hit || doc.ui.cue) {
-      doc.ui.layer = hit;
-      doc.ui.cue = null;
+    if (hit < 0) {
+      this.drag = { kind: 'marquee', layer: doc.ui.layer, x0: x, y0: y, x1: x, y1: y, base: additive ? doc.selectedLayers() : null };
+      return true;
+    }
+    if (additive) {
+      doc.toggleSelected(hit);
+      this.ws.emit('change');
+      if (!doc.isSelected(hit)) return true;
+    } else if (doc.isSelected(hit)) {
+      // Part of the selection: it becomes the main layer and the whole selection moves.
+      if (doc.ui.layer !== hit || doc.ui.cue) {
+        doc.toggleSelected(hit, true);
+        this.ws.emit('change');
+      }
+    } else {
+      doc.selectOnly(hit);
       this.ws.emit('change');
     }
-    const pose = evalLayer(doc.state.layers[hit], frame, doc.state);
-    if (!pose) return true;
-    this.drag = { kind: 'move', layer: hit, frame, sx: x, sy: y, x0: pose.x, y0: pose.y, began: false };
+    const items = doc
+      .selectedLayers()
+      .filter((i) => !doc.isLocked(i))
+      .flatMap((i) => {
+        const pose = evalLayer(doc.state.layers[i], frame, doc.state);
+        return pose ? [{ layer: i, x0: pose.x, y0: pose.y }] : [];
+      });
+    if (!items.some((it) => it.layer === hit)) return true;
+    // Screen -> world as it is now: moving the camera (or what it follows) must not feed back into the drag.
+    this.drag = { kind: 'move', layer: hit, frame, sx: x, sy: y, items, inv: invert(this.worldView(doc, frame)), began: false };
     return true;
+  }
+
+  /** Layers whose outline touches a screen rectangle (the camera only when it is wholly inside). */
+  private inRect(doc: SceneDocument, x0: number, y0: number, x1: number, y1: number): number[] {
+    const out: number[] = [];
+    for (const d of this.drawn) {
+      const layer = doc.state.layers[d.layerIndex];
+      const pts = this.corners(d);
+      if (!layer || !pts || doc.ui.locked.has(layer.uid)) continue;
+      const xs = pts.map((p) => p[0]);
+      const ys = pts.map((p) => p[1]);
+      const [bx0, by0, bx1, by1] = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+      const inside = layer.kind === 'camera' ? bx0 >= x0 && bx1 <= x1 && by0 >= y0 && by1 <= y1 : bx1 >= x0 && bx0 <= x1 && by1 >= y0 && by0 <= y1;
+      if (inside && !out.includes(d.layerIndex)) out.push(d.layerIndex);
+    }
+    return out;
+  }
+
+  private marquee(doc: SceneDocument, drag: Extract<Drag, { kind: 'marquee' }>) {
+    const hits = this.inRect(doc, Math.min(drag.x0, drag.x1), Math.min(drag.y0, drag.y1), Math.max(drag.x0, drag.x1), Math.max(drag.y0, drag.y1));
+    const want = new Set([...(drag.base ?? []), ...hits]);
+    // Keep the main layer if it is still selected; otherwise the topmost layer caught.
+    const main = want.has(drag.layer) ? drag.layer : [...want].sort((a, b) => b - a)[0] ?? -1;
+    doc.selectOnly(main, !!drag.base);
+    for (const i of want) if (i !== main) doc.ui.extra.add(doc.state.layers[i].uid);
   }
 
   move(doc: SceneDocument, x: number, y: number, shift: boolean): void {
     const drag = this.drag;
     if (!drag) return;
+    if (drag.kind === 'marquee') {
+      drag.x1 = x;
+      drag.y1 = y;
+      if (Math.abs(x - drag.x0) + Math.abs(y - drag.y0) >= 3) this.marquee(doc, drag);
+      this.ws.emit('change');
+      return;
+    }
     const layer = doc.state.layers[drag.layer];
     if (!layer) return;
     if (drag.kind !== 'move' && !drag.began) {
@@ -379,20 +455,20 @@ export class SceneStage {
     }
     if (drag.kind === 'move') {
       // World-space movement (through the camera's zoom and turn when looking through it).
-      const [ax, ay] = this.toWorld(doc, drag.sx, drag.sy, drag.frame);
-      const [bx, by] = this.toWorld(doc, x, y, drag.frame);
+      const [ax, ay] = drag.inv ? apply(drag.inv, drag.sx, drag.sy) : this.toWorld(doc, drag.sx, drag.sy, drag.frame);
+      const [bx, by] = drag.inv ? apply(drag.inv, x, y) : this.toWorld(doc, x, y, drag.frame);
       let dx = bx - ax;
       let dy = by - ay;
       if (!drag.began) {
         if (Math.abs(x - drag.sx) + Math.abs(y - drag.sy) < 3) return;
         drag.began = true;
-        doc.checkpoint(layer.kind === 'camera' ? 'Move camera' : 'Move instance');
+        doc.checkpoint(drag.items.length > 1 ? 'Move layers' : layer.kind === 'camera' ? 'Move camera' : 'Move instance');
       }
       if (shift) {
         if (Math.abs(dx) > Math.abs(dy)) dy = 0;
         else dx = 0;
       }
-      doc.setKey(drag.layer, drag.frame, { x: Math.round(drag.x0 + dx), y: Math.round(drag.y0 + dy) });
+      for (const it of drag.items) doc.setKey(it.layer, drag.frame, { x: Math.round(it.x0 + dx), y: Math.round(it.y0 + dy) });
     } else if (drag.kind === 'rotate') {
       const [wx, wy] = this.toWorld(doc, x, y, drag.frame);
       let rot = drag.rot0 + (Math.atan2(wy - drag.pivot[1], wx - drag.pivot[0]) - drag.startAngle) / DEG;
@@ -451,10 +527,15 @@ export class SceneStage {
   }
 
   up(): boolean {
-    const had = !!this.drag;
+    const drag = this.drag;
     this.drag = null;
-    if (had) this.ws.emit('change');
-    return had;
+    const doc = this.ws.scene;
+    if (drag?.kind === 'marquee' && doc && Math.abs(drag.x1 - drag.x0) + Math.abs(drag.y1 - drag.y0) < 3 && !drag.base) {
+      // A click on empty space selects nothing.
+      doc.selectOnly(-1);
+    }
+    if (drag) this.ws.emit('change');
+    return !!drag;
   }
 
   /** Double-click: edit the prefab of the instance under the pointer or a text layer's words, or look through the camera. */
@@ -472,17 +553,27 @@ export class SceneStage {
     if (layer.kind !== 'image') void this.ws.editPrefab(layer.source, doc, layer);
   }
 
+  /** Duplicate the selected layers (not the camera); the copies become the selection. */
+  duplicateSelection(doc: SceneDocument): void {
+    const copies = doc.duplicateLayers(doc.selectedLayers());
+    if (!copies.length) return;
+    doc.selectOnly(-1);
+    for (const i of copies) doc.toggleSelected(i, true);
+  }
+
   nudge(doc: SceneDocument, dx: number, dy: number): void {
-    const li = doc.ui.layer;
-    const layer = doc.state.layers[li];
-    if (!layer) return;
-    if (doc.isLocked(li)) {
-      this.ws.status(`Layer "${layer.name}" is locked.`);
+    const sel = doc.selectedLayers();
+    if (!sel.length) return;
+    const free = sel.filter((i) => !doc.isLocked(i));
+    if (!free.length) {
+      this.ws.status(sel.length > 1 ? 'The selected layers are locked.' : `Layer "${doc.state.layers[sel[0]].name}" is locked.`);
       return;
     }
-    const pose = evalLayer(layer, doc.ui.frame, doc.state);
-    if (!pose) return;
-    doc.setKey(li, doc.ui.frame, { x: pose.x + dx, y: pose.y + dy }, 'Nudge instance');
+    const patches = free.flatMap((i) => {
+      const pose = evalLayer(doc.state.layers[i], doc.ui.frame, doc.state);
+      return pose ? [{ layer: i, patch: { x: pose.x + dx, y: pose.y + dy } }] : [];
+    });
+    doc.setKeys(doc.ui.frame, patches, patches.length > 1 ? 'Nudge layers' : 'Nudge instance');
     this.ws.emit('change');
   }
 
@@ -507,7 +598,7 @@ export class SceneStage {
     const size = fontSizeHint(font);
     // The text origin is its baseline's left end; centre the words roughly on the point.
     const key = { x: Math.round(x - text.length * size * 0.28), y: Math.round(y + size * 0.35), text };
-    doc.ui.layer = doc.addLayer('text', font, text.length > 16 ? text.slice(0, 15) + '…' : text, key, doc.ui.frame);
+    doc.selectOnly(doc.addLayer('text', font, text.length > 16 ? text.slice(0, 15) + '…' : text, key, doc.ui.frame));
     doc.ui.cue = null;
     this.ws.emit('change');
     this.ws.status(`Added text at frame ${doc.ui.frame}. Change its words, font and colour in the inspector; new keys can change the words.`);
@@ -533,13 +624,13 @@ export class SceneStage {
       const box = await this.poseBounds(prefab.tracks, range.start);
       const cx = box ? (box[0] + box[2]) / 2 : 40;
       const cy = box ? (box[1] + box[3]) / 2 : 50;
-      doc.ui.layer = doc.addLayer('reanim', asset.path, name, { x: Math.round(x - cx), y: Math.round(y - cy), anim }, frame);
+      doc.selectOnly(doc.addLayer('reanim', asset.path, name, { x: Math.round(x - cx), y: Math.round(y - cy), anim }, frame));
     } else if (asset.kind === 'particle') {
-      doc.ui.layer = doc.addLayer('particle', asset.path, name, { x: Math.round(x), y: Math.round(y) }, frame);
+      doc.selectOnly(doc.addLayer('particle', asset.path, name, { x: Math.round(x), y: Math.round(y) }, frame));
     } else if (asset.kind === 'image') {
       const id = ws.assets.imageIdForPath(asset.path);
       const img = await ws.assets.loadImage(id);
-      doc.ui.layer = doc.addLayer('image', id, name, { x: Math.round(x - (img?.celWidth ?? 0) / 2), y: Math.round(y - (img?.celHeight ?? 0) / 2) }, frame);
+      doc.selectOnly(doc.addLayer('image', id, name, { x: Math.round(x - (img?.celWidth ?? 0) / 2), y: Math.round(y - (img?.celHeight ?? 0) / 2) }, frame));
     } else if (asset.kind === 'sound') {
       const cue = doc.addSoundCue(frame, asset.path);
       doc.ui.cue = { kind: 'sound', uid: cue.uid };
@@ -581,6 +672,35 @@ export class SceneStage {
     const emit = () => ws.emit('change');
     const pose = evalLayer(layer, doc.ui.frame);
     const locked = doc.isLocked(li);
+    // A right-click on one of several selected layers acts on all of them.
+    const sel = doc.isSelected(li) ? doc.selectedLayers() : [li];
+    if (sel.length > 1) {
+      const anyLocked = sel.some((i) => doc.isLocked(i));
+      return [
+        { label: `Duplicate ${sel.length} layers`, shortcut: 'Ctrl+D', action: () => (this.duplicateSelection(doc), emit()) },
+        { label: `Delete ${sel.length} layers`, shortcut: 'Del', disabled: anyLocked, action: () => (doc.removeLayers(sel), emit()) },
+        { separator: true },
+        {
+          label: 'Hide in editor',
+          checked: sel.every((i) => doc.ui.hidden.has(doc.state.layers[i].uid)),
+          action: () => {
+            const hide = !sel.every((i) => doc.ui.hidden.has(doc.state.layers[i].uid));
+            for (const i of sel) doc.ui.hidden[hide ? 'add' : 'delete'](doc.state.layers[i].uid);
+            emit();
+          },
+        },
+        {
+          label: 'Lock',
+          checked: sel.every((i) => doc.isLocked(i)),
+          action: () => {
+            const lock = !sel.every((i) => doc.isLocked(i));
+            for (const i of sel) doc.ui.locked[lock ? 'add' : 'delete'](doc.state.layers[i].uid);
+            emit();
+          },
+        },
+        { label: 'Select only this layer', action: () => (doc.selectOnly(li), emit()) },
+      ];
+    }
     return [
       ...(layer.kind === 'reanim' ? [{ label: 'Edit prefab', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc, layer) }] : []),
       ...(layer.kind === 'particle' ? [{ label: 'Edit effect', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc, layer) }] : []),
@@ -589,7 +709,7 @@ export class SceneStage {
         ? []
         : [
             { label: 'Flip horizontally', disabled: !pose || locked, action: () => (this.flip(doc, li, !pose!.flipX), emit()) },
-            { label: 'Duplicate', shortcut: 'Ctrl+D', action: () => ((doc.ui.layer = doc.duplicateLayer(li)), emit()) },
+            { label: 'Duplicate', shortcut: 'Ctrl+D', action: () => (doc.selectOnly(doc.duplicateLayer(li)), emit()) },
           ]),
       { label: 'Delete layer', shortcut: 'Del', disabled: locked, action: () => (doc.removeLayer(li), emit()) },
       { separator: true },

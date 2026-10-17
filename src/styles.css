@@ -821,6 +821,46 @@ details[open].insp-section > summary {
   flex-wrap: wrap;
   align-items: center;
 }
+/* easing curve editor */
+.curve-editor {
+  width: 100%;
+}
+.curve-canvas {
+  display: block;
+  width: 100%;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  outline: none;
+  touch-action: none;
+}
+.curve-canvas:focus-visible {
+  border-color: var(--sel);
+}
+.curve-canvas.disabled {
+  opacity: 0.55;
+}
+.curve-thumb {
+  vertical-align: middle;
+}
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.chip {
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-3);
+  color: var(--text);
+  cursor: pointer;
+}
+.chip.on {
+  border-color: var(--sel);
+  color: var(--sel);
+}
 .insp-foot {
   padding: 10px 12px;
   margin: 0;
