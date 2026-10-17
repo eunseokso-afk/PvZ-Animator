@@ -4,7 +4,7 @@
  * a point move together (a smooth curve) unless Alt is held.
  */
 
-import { CURVE_Y_MAX, CURVE_Y_MIN, cloneCurve, evalCurve, insertPoint, normalizeCurve, type EaseCurve } from '../editor/easeCurve';
+import { CURVE_Y_MAX, CURVE_Y_MIN, cloneCurve, curvesEqual, evalCurve, insertPoint, normalizeCurve, type EaseCurve } from '../editor/easeCurve';
 import { h } from './dom';
 
 export interface CurveEditorOptions {
@@ -51,19 +51,28 @@ export class CurveEditor {
     });
     this.canvas.addEventListener('dblclick', (e) => this.onDouble(e));
     this.canvas.addEventListener('keydown', (e) => {
-      if ((e.key === 'Delete' || e.key === 'Backspace') && this.selected > 0 && this.selected < this.curve.length - 1) {
-        e.preventDefault();
-        e.stopPropagation();
-        this.removePoint(this.selected);
-      } else if (e.key !== 'Escape') e.stopPropagation();
+      // Delete on the curve is about the curve: it must never reach the app (which would delete the layer).
+      // Every other key goes on to the app's shortcuts.
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (this.selected > 0 && this.selected < this.curve.length - 1) this.removePoint(this.selected);
     });
-    new ResizeObserver(() => this.draw()).observe(this.canvas);
+    const ro = new ResizeObserver(() => {
+      // The inspector replaces editors often: stop observing one that has left the page.
+      if (!this.canvas.isConnected) ro.disconnect();
+      else this.draw();
+    });
+    ro.observe(this.canvas);
   }
 
   /** Show a curve (not while it is being dragged). `step` draws a hold. */
   set(curve: EaseCurve, step = false): void {
     if (this.drag) return;
-    this.curve = normalizeCurve(curve);
+    const c = normalizeCurve(curve);
+    // Unchanged (e.g. the echo of this editor's own edit): keep the selected point as it is.
+    if (step === this.step && curvesEqual(c, this.curve)) return;
+    this.curve = c;
     this.step = step;
     if (this.selected >= this.curve.length) this.selected = -1;
     this.draw();
@@ -143,7 +152,8 @@ export class CurveEditor {
 
   private onDown(e: PointerEvent) {
     if (this.disabled || e.button !== 0) return;
-    this.canvas.focus();
+    // Focus (for Delete) without scrolling the panel, which would move the canvas under the pointer.
+    this.canvas.focus({ preventScroll: true });
     const [px, py] = this.pos(e);
     const hit = this.hit(px, py);
     if (!hit) {

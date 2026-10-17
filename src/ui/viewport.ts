@@ -55,6 +55,8 @@ export class Viewport {
   private drag: Drag | null = null;
   private hoverTrack = -1;
   private spaceDown = false;
+  /** A pan was dragged while Space was held (so releasing Space should not toggle playback). */
+  private spacePanned = false;
   private needsRender = true;
   private lastT = 0;
   private preview: { doc: ParticleDocument; revision: number; sys: ParticleSystem; deadFor: number } | null = null;
@@ -702,6 +704,7 @@ export class Viewport {
     window.addEventListener('keyup', (e) => {
       if (e.code === 'Space') this.spaceDown = false;
     });
+    ov.addEventListener('blur', () => (this.spaceDown = false));
     this.stage.addEventListener('dragover', (e) => {
       if (e.dataTransfer?.types.includes(ASSET_MIME)) {
         e.preventDefault();
@@ -717,6 +720,18 @@ export class Viewport {
     });
   }
 
+  /** Whether the stage has the keyboard focus (Space then pans while held, and plays on release). */
+  get stageFocused(): boolean {
+    return document.activeElement === this.ovCanvas;
+  }
+
+  /** True (once) if Space was used to pan since it was pressed. */
+  takeSpacePan(): boolean {
+    const panned = this.spacePanned;
+    this.spacePanned = false;
+    return panned;
+  }
+
   private onDown(e: PointerEvent) {
     const doc = this.ws.active;
     this.ovCanvas.focus();
@@ -724,6 +739,7 @@ export class Viewport {
     const [x, y] = this.localPos(e);
     this.ovCanvas.setPointerCapture(e.pointerId);
     if (e.button === 1 || e.button === 2 || this.spaceDown) {
+      if (this.spaceDown) this.spacePanned = true;
       this.drag = { kind: 'pan', sx: x, sy: y, px: doc.view.panX, py: doc.view.panY, moved: false, button: e.button, hit: -1 };
       return;
     }

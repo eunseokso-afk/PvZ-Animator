@@ -27,8 +27,11 @@ export class SceneInspector {
   private alphaSlider: { el: HTMLInputElement; get(p: LayerPose): number } | null = null;
   /** A scrub or slider drag is in progress: update values in place, never rebuild under the pointer. */
   private gesture = false;
-  /** A tween preview is playing (requestAnimationFrame id). */
-  private previewing = 0;
+  /** While a tween preview plays: the frame it started from (the panel stays on that frame's tweens). */
+  private previewFrom: number | null = null;
+  private stopPreview: (() => void) | null = null;
+  /** The live easing controls, updated in place (never rebuilt under a curve being edited). */
+  private easing: { editor: CurveEditor; sync(): void } | null = null;
   uniformScale = true;
 
   constructor(
@@ -57,7 +60,7 @@ export class SceneInspector {
   refresh(force = false): void {
     const doc = this.ws.scene;
     if (!doc) return;
-    const frame = doc.ui.frame;
+    const frame = this.previewFrom ?? doc.ui.frame;
     const layer = doc.selectedLayer;
     const ki = layer ? keyIndexAt(layer, frame) : -1;
     const key = layer?.keys[ki];
@@ -65,23 +68,25 @@ export class SceneInspector {
     const targets = this.easeTargets(doc);
     const sig = [
       doc.id,
-      this.ws.playing || this.previewing ? 'playing' : frame,
+      this.ws.playing ? 'playing' : frame,
       doc.ui.layer,
       [...doc.ui.extra].join(),
-      // The easing section shows the tweens it edits.
-      targets.map((t) => {
-        const l = doc.state.layers[t.layer];
-        const k = l?.keys[keyIndexAt(l, t.frame)];
-        const n = l?.keys[keyIndexAt(l, t.frame) + 1];
-        return `${l?.uid}:${k?.frame}:${k?.ease}:${n?.frame}:${n?.visible}:${k?.ease === 'custom' ? JSON.stringify(k.curve) : ''}:${l && doc.ui.locked.has(l.uid)}`;
-      }).join(),
+      // The tweens the easing section edits (their eases and curves are updated in place).
+      targets
+        .map((t) => {
+          const l = doc.state.layers[t.layer];
+          const i = l ? keyIndexAt(l, t.frame) : -1;
+          const n = l?.keys[i + 1];
+          return `${l?.uid}:${l?.keys[i]?.frame}:${n?.frame}:${n?.visible}:${l && doc.ui.locked.has(l.uid)}`;
+        })
+        .join(),
       layer?.uid,
       layer?.name,
       layer?.source,
       layer?.keys.length,
       ki,
       layer && doc.ui.locked.has(layer.uid),
-      key && JSON.stringify({ ...key, x: 0, y: 0, rotation: 0, scaleX: 0, scaleY: 0, alpha: 0, shake: 0 }),
+      key && JSON.stringify({ ...key, x: 0, y: 0, rotation: 0, scaleX: 0, scaleY: 0, alpha: 0, shake: 0, ease: 0, curve: 0 }),
       // The camera's follow list names the other layers.
       layer?.kind === 'camera' ? doc.state.layers.map((l) => `${l.uid}:${l.name}`).join() : '',
       doc.ui.cameraView,
@@ -104,6 +109,7 @@ export class SceneInspector {
     this.sig = sig;
     this.fields.clear();
     this.alphaSlider = null;
+    this.easing = null;
     const scroll = this.el.scrollTop;
     this.el.replaceChildren(
       this.sceneSection(doc),
@@ -113,6 +119,7 @@ export class SceneInspector {
   }
 
   private updateValues(doc: SceneDocument) {
+    this.easing?.sync();
     const layer = doc.selectedLayer;
     if (!layer) return;
     const pose = evalLayer(layer, this.ws.sceneFrame(doc), doc.state);
@@ -649,7 +656,8 @@ export class SceneInspector {
   private easeTargets(doc: SceneDocument): KeyRef[] {
     const keys = doc.selectedKeys();
     if (keys.length) return keys;
-    return doc.selectedLayers().map((layer) => ({ layer, frame: doc.ui.frame }));
+    const frame = this.previewFrom ?? doc.ui.frame;
+    return doc.selectedLayers().map((layer) => ({ layer, frame }));
   }
 
   /** Easing of the tweens in `targets`: a built-in ease, a preset or a hand-drawn curve. */
@@ -658,17 +666,14 @@ export class SceneInspector {
     const targets = all.filter((t) => !doc.isLocked(t.layer));
     // The curve shown is the main layer's (or the first target's).
     const ref = targets.find((t) => t.layer === doc.ui.layer) ?? targets[0] ?? all[0];
-    const layer = ref && doc.state.layers[ref.layer];
-    const ki = layer ? keyIndexAt(layer, ref.frame) : -1;
-    const key = layer?.keys[ki];
-    const next = layer?.keys[ki + 1];
-    const tweens = (t: KeyRef) => {
+    // Keys are looked up afresh each time: undo/redo replace the state's objects.
+    const keyOf = (t: KeyRef): { key?: LayerKey; next?: LayerKey } => {
       const l = doc.state.layers[t.layer];
-      const i = keyIndexAt(l, t.frame);
-      const n = l.keys[i + 1];
-      return i >= 0 && !!n && n.visible;
+      const i = l ? keyIndexAt(l, t.frame) : -1;
+      return { key: l?.keys[i], next: l?.keys[i + 1] };
     };
-    const live = targets.filter(tweens);
+    const { key, next } = ref ? keyOf(ref) : {};
+    const layer = ref && doc.state.layers[ref.layer];
     const section = h('section', { class: 'insp-section insp-easing' });
     const title = h('h3', null, 'Easing');
     section.append(title);
@@ -678,6 +683,10 @@ export class SceneInspector {
     }
     const isCamera = layer.kind === 'camera';
     const many = targets.length > 1;
+    const live = targets.filter((t) => {
+      const n = keyOf(t).next;
+      return !!n && n.visible;
+    });
     title.append(
       h('span', { class: 'dim small' }, many ? `  ${live.length} tween${live.length === 1 ? '' : 's'}` : next ? `  key ${key.frame} → ${next.frame}` : `  from key ${key.frame}`),
     );
@@ -701,18 +710,20 @@ export class SceneInspector {
         apply('custom', c, 'Edit easing curve', final);
       },
     });
-    editor.set(curveOf(key), key.ease === 'hold');
     editor.setDisabled(locked || !live.length);
 
     const easeSelect = select(
-      SCENE_EASES.map((e) => ({ value: e.id, label: e.id === 'hold' && isCamera ? 'Static (hold until next key)' : e.id === 'custom' ? 'Custom curve' : e.label })),
+      [{ value: '', label: 'Mixed' }, ...SCENE_EASES.map((e) => ({ value: e.id, label: e.id === 'hold' && isCamera ? 'Static (hold until next key)' : e.label }))],
       key.ease,
       (v) => {
+        if (!v) return;
         begun = false;
-        apply(v, null, 'Set easing', true);
+        apply(v as SceneEase, null, 'Set easing', true);
       },
       many ? 'Easing of every selected tween' : `Tween from key ${key.frame} to the next key`,
     );
+    // "Mixed" is only a label: picking any ease (even the main key's) then applies it to all.
+    easeSelect.options[0].disabled = true;
     easeSelect.disabled = locked;
     const presetSelect = select(
       [{ value: '', label: 'Curve preset…' }, ...CURVE_PRESETS.map((p) => ({ value: p.id, label: p.label }))],
@@ -727,32 +738,44 @@ export class SceneInspector {
       'Start from a ready-made curve',
     );
     presetSelect.disabled = locked;
+    const reverse = h(
+      'button',
+      {
+        class: 'btn small',
+        title: 'Play the curve backwards (an ease-in becomes an ease-out)',
+        onclick: () => {
+          begun = false;
+          apply('custom', reverseCurve(editor.value), 'Reverse easing', true);
+        },
+      },
+      '⇄ Reverse',
+    );
+    const sync = () => {
+      const cur = ref ? keyOf(ref).key : undefined;
+      if (!cur) return;
+      const mixed = live.some((t) => keyOf(t).key?.ease !== cur.ease);
+      easeSelect.options[0].hidden = !mixed;
+      easeSelect.value = mixed ? '' : cur.ease;
+      editor.set(curveOf(cur), cur.ease === 'hold');
+      // A hold has no curve to reverse.
+      reverse.disabled = locked || cur.ease === 'hold';
+    };
+    sync();
+    this.easing = { editor, sync };
     section.append(
       h('div', { class: 'insp-grid2' }, easeSelect, presetSelect),
       editor.el,
       h(
         'div',
         { class: 'insp-buttons' },
-        h(
-          'button',
-          {
-            class: 'btn small',
-            disabled: locked,
-            title: 'Play the curve backwards (an ease-in becomes an ease-out)',
-            onclick: () => {
-              begun = false;
-              apply('custom', reverseCurve(editor.value), 'Reverse easing', true);
-            },
-          },
-          '⇄ Reverse',
-        ),
+        reverse,
         h(
           'button',
           {
             class: 'btn small',
             disabled: !live.length,
             title: 'Play this tween on the stage',
-            onclick: () => this.previewTween(doc, ref, editor),
+            onclick: () => this.previewTween(doc, ref),
           },
           '▶ Preview',
         ),
@@ -768,36 +791,50 @@ export class SceneInspector {
     return section;
   }
 
-  /** Play one tween on the stage, with a marker running along its curve. */
-  private previewTween(doc: SceneDocument, ref: KeyRef, editor: CurveEditor) {
+  /** Play one tween on the stage with a marker running along its curve, then go back to where the playhead was. */
+  private previewTween(doc: SceneDocument, ref: KeyRef) {
     const ws = this.ws;
     const layer = doc.state.layers[ref.layer];
     const i = layer ? keyIndexAt(layer, ref.frame) : -1;
     const a = layer?.keys[i];
     const b = layer?.keys[i + 1];
     if (!a || !b) return;
+    this.stopPreview?.();
     if (ws.playing) ws.pause();
-    cancelAnimationFrame(this.previewing);
+    const back = doc.ui.frame;
     const from = a.frame;
     const span = b.frame - a.frame;
     const ms = (span / doc.state.fps) * 1000;
     const start = performance.now();
+    let raf = 0;
+    let timer = 0;
     const stop = () => {
-      cancelAnimationFrame(this.previewing);
-      this.previewing = 0;
+      if (this.stopPreview !== stop) return;
+      this.stopPreview = null;
+      cancelAnimationFrame(raf);
+      clearTimeout(timer);
       window.removeEventListener('pointerdown', stop, true);
-      editor.setMarker(null);
+      window.removeEventListener('keydown', stop, true);
+      this.previewFrom = null;
+      this.easing?.editor.setMarker(null);
+      // Back to the tween being edited (unless something else took over the playhead).
+      if (ws.scene === doc && !ws.playing) ws.setFrame(back);
       ws.emit('change');
     };
-    window.addEventListener('pointerdown', stop, true);
     const step = (now: number) => {
+      if (ws.scene !== doc || ws.playing) return stop();
       const t = Math.min(1, (now - start) / ms);
       ws.setFrame(Math.round(from + t * span));
-      editor.setMarker(t);
-      if (t < 1 && ws.scene === doc) this.previewing = requestAnimationFrame(step);
-      else setTimeout(stop, 250);
+      this.easing?.editor.setMarker(t);
+      if (t < 1) raf = requestAnimationFrame(step);
+      else timer = window.setTimeout(stop, 300);
     };
-    this.previewing = requestAnimationFrame(step);
+    this.previewFrom = back;
+    this.stopPreview = stop;
+    // Any click or key ends the preview (and then does what it does).
+    window.addEventListener('pointerdown', stop, true);
+    window.addEventListener('keydown', stop, true);
+    raf = requestAnimationFrame(step);
   }
 
   /** Several layers are selected: what applies to all of them. */

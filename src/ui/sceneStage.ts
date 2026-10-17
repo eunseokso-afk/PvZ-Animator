@@ -12,7 +12,7 @@ import { drawScene, type DrawnLayer, type SceneResolver } from '../engine/sceneR
 import { fontSizeHint } from '../engine/text';
 import { basename, stripExt } from '../engine/vfs';
 import { getAnimRanges, type ReanimTransform } from '../formats/reanim';
-import { cameraFrameMatrix, cameraMatrix, evalCamera, evalLayer, poseMatrix, type LayerKey, type SceneDocument } from '../editor/sceneDoc';
+import { cameraFrameMatrix, cameraMatrix, evalCamera, evalLayer, keyIndexAt, poseMatrix, type LayerKey, type SceneDocument } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
 import { defaultFont } from './pickers';
 import { promptText, type MenuItem } from './widgets';
@@ -22,18 +22,31 @@ const ROT_DIST = 26;
 
 type Drag =
   /** Moves every selected layer (`items`) by the pointer's world-space movement. */
-  | { kind: 'move'; layer: number; frame: number; sx: number; sy: number; items: { layer: number; x0: number; y0: number }[]; inv: Mat | null; began: boolean }
+  | {
+      kind: 'move';
+      layer: number;
+      frame: number;
+      sx: number;
+      sy: number;
+      items: { layer: number; x0: number; y0: number }[];
+      inv: Mat | null;
+      began: boolean;
+      /** Shift/Ctrl-press on a selected layer: a click (no drag) takes it out of the selection. */
+      toggleOnClick: boolean;
+    }
   /** A selection rectangle in screen space; `base` is the selection it adds to (Shift/Ctrl). */
   | { kind: 'marquee'; layer: number; x0: number; y0: number; x1: number; y1: number; base: number[] | null }
-  | { kind: 'rotate'; layer: number; frame: number; pivot: [number, number]; startAngle: number; rot0: number; local: [number, number]; sx: number; sy: number; began: boolean }
+  | { kind: 'rotate'; layer: number; frame: number; pivot: [number, number]; startAngle: number; rot0: number; local: [number, number]; sx: number; sy: number; inv: Mat | null; began: boolean }
   | {
       kind: 'scale';
+      inv: Mat | null;
       layer: number;
       frame: number;
       pivot: [number, number];
       local: [number, number];
       corner: [number, number];
-      inv: Mat;
+      /** World -> the layer's own space at the start of the drag. */
+      local0: Mat;
       sx0: number;
       sy0: number;
       sx: number;
@@ -112,9 +125,9 @@ export class SceneStage {
     return inv ? apply(inv, x, y) : this.host.toStage(doc, x, y);
   }
 
-  /** World coordinates of a stage point (where something at that spot of the picture really is). */
-  stageToWorld(doc: SceneDocument, x: number, y: number): [number, number] {
-    const cam = doc.ui.cameraView ? evalCamera(doc.state, this.ws.sceneFrame(doc)) : null;
+  /** World coordinates of a stage point at a frame (where something at that spot of the picture really is). */
+  stageToWorld(doc: SceneDocument, x: number, y: number, frame = doc.ui.frame): [number, number] {
+    const cam = doc.ui.cameraView ? evalCamera(doc.state, frame) : null;
     const inv = cam ? invert(cameraMatrix(doc.state, cam)) : null;
     return inv ? apply(inv, x, y) : [x, y];
   }
@@ -305,7 +318,7 @@ export class SceneStage {
 
   private hitHandle(doc: SceneDocument, x: number, y: number): { kind: 'rotate' } | { kind: 'scale'; corner: number } | null {
     const sel = this.drawn.find((d) => d.layerIndex === doc.ui.layer);
-    if (!sel || this.ws.playing || doc.ui.extra.size) return null;
+    if (!sel || this.ws.playing || doc.selectedLayers().length > 1) return null;
     const layer = doc.state.layers[sel.layerIndex];
     if (!layer || doc.ui.locked.has(layer.uid)) return null;
     const rot = this.rotateHandle(sel);
@@ -338,7 +351,8 @@ export class SceneStage {
     if (this.ws.playing) this.ws.pause();
     const frame = doc.ui.frame;
     const additive = !!(mods.shift || mods.ctrl);
-    const handle = additive ? null : this.hitHandle(doc, x, y);
+    // Shift on a handle snaps the rotation or keeps the scale uniform; Ctrl never transforms.
+    const handle = mods.ctrl ? null : this.hitHandle(doc, x, y);
     if (handle) {
       const sel = this.drawn.find((d) => d.layerIndex === doc.ui.layer)!;
       const layer = doc.state.layers[sel.layerIndex];
@@ -350,9 +364,11 @@ export class SceneStage {
       const m0 = cam ? cameraFrameMatrix(cam) : poseMatrix(pose);
       const pivot = apply(m0, local[0], local[1]);
       // The undo step and the key are made on the first real movement, so a click changes nothing.
+      // Screen -> world is frozen for the gesture: a camera following this layer must not feed back into it.
+      const screenInv = invert(this.worldView(doc, frame));
       if (handle.kind === 'rotate') {
-        const [wx, wy] = this.toWorld(doc, x, y);
-        this.drag = { kind: 'rotate', layer: sel.layerIndex, frame, pivot, startAngle: Math.atan2(wy - pivot[1], wx - pivot[0]), rot0: pose.rotation, local, sx: x, sy: y, began: false };
+        const [wx, wy] = screenInv ? apply(screenInv, x, y) : this.toWorld(doc, x, y);
+        this.drag = { kind: 'rotate', layer: sel.layerIndex, frame, pivot, startAngle: Math.atan2(wy - pivot[1], wx - pivot[0]), rot0: pose.rotation, local, sx: x, sy: y, inv: screenInv, began: false };
       } else {
         const cornerLocal: [number, number][] = [
           [x0, y0],
@@ -367,7 +383,8 @@ export class SceneStage {
           pivot,
           local,
           corner: cornerLocal[handle.corner],
-          inv: invert(m0) ?? [1, 0, 0, 1, 0, 0],
+          inv: screenInv,
+          local0: invert(m0) ?? [1, 0, 0, 1, 0, 0],
           sx0: pose.scaleX,
           sy0: pose.scaleY,
           sx: x,
@@ -382,10 +399,13 @@ export class SceneStage {
       this.drag = { kind: 'marquee', layer: doc.ui.layer, x0: x, y0: y, x1: x, y1: y, base: additive ? doc.selectedLayers() : null };
       return true;
     }
-    if (additive) {
-      doc.toggleSelected(hit);
+    let toggleOnClick = false;
+    if (additive && !doc.isSelected(hit)) {
+      doc.toggleSelected(hit, true);
       this.ws.emit('change');
-      if (!doc.isSelected(hit)) return true;
+    } else if (additive) {
+      // Already selected: a Shift/Ctrl click deselects it on release, a drag moves the selection (Shift constrains).
+      toggleOnClick = true;
     } else if (doc.isSelected(hit)) {
       // Part of the selection: it becomes the main layer and the whole selection moves.
       if (doc.ui.layer !== hit || doc.ui.cue) {
@@ -396,17 +416,33 @@ export class SceneStage {
       doc.selectOnly(hit);
       this.ws.emit('change');
     }
-    const items = doc
-      .selectedLayers()
-      .filter((i) => !doc.isLocked(i))
-      .flatMap((i) => {
-        const pose = evalLayer(doc.state.layers[i], frame, doc.state);
-        return pose ? [{ layer: i, x0: pose.x, y0: pose.y }] : [];
-      });
-    if (!items.some((it) => it.layer === hit)) return true;
+    const items = this.movable(doc, frame).flatMap((i) => {
+      const pose = evalLayer(doc.state.layers[i], frame, doc.state);
+      return pose ? [{ layer: i, x0: pose.x, y0: pose.y }] : [];
+    });
+    // (A camera following another selected layer is not in `items` but still drags the selection.)
+    if (!items.length || doc.isLocked(hit) || !doc.isSelected(hit)) {
+      if (toggleOnClick) doc.toggleSelected(hit, false);
+      return true;
+    }
     // Screen -> world as it is now: moving the camera (or what it follows) must not feed back into the drag.
-    this.drag = { kind: 'move', layer: hit, frame, sx: x, sy: y, items, inv: invert(this.worldView(doc, frame)), began: false };
+    this.drag = { kind: 'move', layer: hit, frame, sx: x, sy: y, items, inv: invert(this.worldView(doc, frame)), began: false, toggleOnClick };
     return true;
+  }
+
+  /**
+   * Selected layers a move or nudge changes: not locked ones, and not a camera that follows
+   * one of the others (its x/y are an offset from it, so it already comes along).
+   */
+  private movable(doc: SceneDocument, frame: number): number[] {
+    const sel = doc.selectedLayers().filter((i) => !doc.isLocked(i));
+    const uids = new Set(sel.map((i) => doc.state.layers[i].uid));
+    return sel.filter((i) => {
+      const layer = doc.state.layers[i];
+      if (layer.kind !== 'camera') return true;
+      const k = layer.keys[keyIndexAt(layer, frame)];
+      return !k?.follow || !uids.has(k.follow);
+    });
   }
 
   /** Layers whose outline touches a screen rectangle (the camera only when it is wholly inside). */
@@ -453,24 +489,26 @@ export class SceneStage {
       doc.checkpoint(drag.kind === 'rotate' ? `Rotate ${what}` : layer.kind === 'camera' ? 'Zoom camera' : 'Scale instance');
       doc.touch(() => doc.ensureKey(drag.layer, drag.frame));
     }
+    // Pointer -> world, through the view (and camera) as they were when the drag began.
+    const world = (px: number, py: number) => (drag.inv ? apply(drag.inv, px, py) : this.toWorld(doc, px, py, drag.frame));
     if (drag.kind === 'move') {
-      // World-space movement (through the camera's zoom and turn when looking through it).
-      const [ax, ay] = drag.inv ? apply(drag.inv, drag.sx, drag.sy) : this.toWorld(doc, drag.sx, drag.sy, drag.frame);
-      const [bx, by] = drag.inv ? apply(drag.inv, x, y) : this.toWorld(doc, x, y, drag.frame);
-      let dx = bx - ax;
-      let dy = by - ay;
       if (!drag.began) {
         if (Math.abs(x - drag.sx) + Math.abs(y - drag.sy) < 3) return;
         drag.began = true;
-        doc.checkpoint(drag.items.length > 1 ? 'Move layers' : layer.kind === 'camera' ? 'Move camera' : 'Move instance');
+        doc.checkpoint(drag.items.length > 1 || drag.items[0].layer !== drag.layer ? 'Move layers' : layer.kind === 'camera' ? 'Move camera' : 'Move instance');
       }
+      // Shift keeps to the screen's axes (also when looking through a turned camera).
+      let ex = x;
+      let ey = y;
       if (shift) {
-        if (Math.abs(dx) > Math.abs(dy)) dy = 0;
-        else dx = 0;
+        if (Math.abs(x - drag.sx) > Math.abs(y - drag.sy)) ey = drag.sy;
+        else ex = drag.sx;
       }
-      for (const it of drag.items) doc.setKey(it.layer, drag.frame, { x: Math.round(it.x0 + dx), y: Math.round(it.y0 + dy) });
+      const [ax, ay] = world(drag.sx, drag.sy);
+      const [bx, by] = world(ex, ey);
+      for (const it of drag.items) doc.setKey(it.layer, drag.frame, { x: Math.round(it.x0 + bx - ax), y: Math.round(it.y0 + by - ay) });
     } else if (drag.kind === 'rotate') {
-      const [wx, wy] = this.toWorld(doc, x, y, drag.frame);
+      const [wx, wy] = world(x, y);
       let rot = drag.rot0 + (Math.atan2(wy - drag.pivot[1], wx - drag.pivot[0]) - drag.startAngle) / DEG;
       if (shift) rot = Math.round(rot / 15) * 15;
       const pose = evalLayer(layer, drag.frame)!;
@@ -478,8 +516,8 @@ export class SceneStage {
       const patch = layer.kind === 'camera' ? {} : this.keepPivot({ ...pose, rotation: rot }, drag.local, drag.pivot);
       doc.setKey(drag.layer, drag.frame, { ...patch, rotation: Math.round(rot * 100) / 100 });
     } else {
-      const [wx, wy] = this.toWorld(doc, x, y, drag.frame);
-      const [lx, ly] = apply(drag.inv, wx, wy);
+      const [wx, wy] = world(x, y);
+      const [lx, ly] = apply(drag.local0, wx, wy);
       let fx = (lx - drag.local[0]) / (drag.corner[0] - drag.local[0] || 1);
       let fy = (ly - drag.local[1]) / (drag.corner[1] - drag.local[1] || 1);
       if (layer.kind === 'camera') {
@@ -530,6 +568,7 @@ export class SceneStage {
     const drag = this.drag;
     this.drag = null;
     const doc = this.ws.scene;
+    if (drag?.kind === 'move' && !drag.began && drag.toggleOnClick && doc) doc.toggleSelected(drag.layer, false);
     if (drag?.kind === 'marquee' && doc && Math.abs(drag.x1 - drag.x0) + Math.abs(drag.y1 - drag.y0) < 3 && !drag.base) {
       // A click on empty space selects nothing.
       doc.selectOnly(-1);
@@ -564,11 +603,15 @@ export class SceneStage {
   nudge(doc: SceneDocument, dx: number, dy: number): void {
     const sel = doc.selectedLayers();
     if (!sel.length) return;
-    const free = sel.filter((i) => !doc.isLocked(i));
+    const free = this.movable(doc, doc.ui.frame);
     if (!free.length) {
       this.ws.status(sel.length > 1 ? 'The selected layers are locked.' : `Layer "${doc.state.layers[sel[0]].name}" is locked.`);
       return;
     }
+    // Through a camera, the arrows move things on screen: map the step into the world.
+    const cam = this.throughCamera(doc, doc.ui.frame) ? evalCamera(doc.state, doc.ui.frame) : null;
+    const inv = cam && invert(cameraMatrix(doc.state, cam));
+    if (inv) [dx, dy] = [Math.round((inv[0] * dx + inv[2] * dy) * 100) / 100, Math.round((inv[1] * dx + inv[3] * dy) * 100) / 100];
     const patches = free.flatMap((i) => {
       const pose = evalLayer(doc.state.layers[i], doc.ui.frame, doc.state);
       return pose ? [{ layer: i, patch: { x: pose.x + dx, y: pose.y + dy } }] : [];

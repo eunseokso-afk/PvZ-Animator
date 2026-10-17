@@ -26,8 +26,12 @@ type Row = { kind: 'header'; label: string } | { kind: 'sound' } | { kind: 'laye
 
 type Drag =
   | { kind: 'scrub' }
-  /** A marquee from (frame `from`, row `row`): selects the frames on the start layer and the keys inside. */
-  | { kind: 'select'; from: number; row: number; to: number; toRow: number }
+  /**
+   * A marquee from (frame `from`, row `row`): selects the frames on the start layer and the keys
+   * inside, added to `base` (the selection when Ctrl/Shift was held). It starts once the pointer
+   * leaves the first cell, so a click with a little jitter is still a click.
+   */
+  | { kind: 'select'; from: number; row: number; to: number; toRow: number; moved: boolean; base: { keys: string[]; layers: number[] } | null }
   /** Selected keys dragged together by `delta` frames. */
   | { kind: 'moveKeys'; refs: KeyRef[]; ids: Set<string>; from: number; delta: number }
   | { kind: 'reorder'; layer: number; target: number; startY: number; moved: boolean }
@@ -753,10 +757,12 @@ export class SceneTimeline {
       } else doc.toggleSelected(li, true);
       this.startKeyDrag(doc, frame);
     } else {
-      if (!mod) doc.selectOnly(li);
+      const additive = mod || e.shiftKey;
+      const base = additive ? { keys: [...doc.ui.keys], layers: doc.selectedLayers().map((i) => doc.state.layers[i].uid) } : null;
+      if (!additive) doc.selectOnly(li);
       else doc.toggleSelected(li, true);
       const ri = this.rows.indexOf(row);
-      this.drag = { kind: 'select', from: frame, row: ri, to: frame, toRow: ri };
+      this.drag = { kind: 'select', from: frame, row: ri, to: frame, toRow: ri, moved: false, base };
     }
     this.ws.setFrame(frame);
   }
@@ -776,8 +782,8 @@ export class SceneTimeline {
     const r0 = Math.min(drag.row, drag.toRow);
     const r1 = Math.max(drag.row, drag.toRow);
     const main = doc.ui.layer;
-    doc.ui.keys.clear();
-    doc.ui.extra.clear();
+    doc.ui.keys = new Set(drag.base?.keys ?? []);
+    doc.ui.extra = new Set(drag.base?.layers ?? []);
     for (let ri = r0; ri <= r1; ri++) {
       const row = this.rows[ri];
       if (row?.kind !== 'layer') continue;
@@ -786,6 +792,8 @@ export class SceneTimeline {
       if (row.index !== main) doc.ui.extra.add(layer.uid);
       for (const k of layer.keys) if (k.frame >= f0 && k.frame <= f1) doc.ui.keys.add(keyId(layer.uid, k.frame));
     }
+    const mainUid = doc.selectedLayer?.uid;
+    if (mainUid !== undefined) doc.ui.extra.delete(mainUid);
   }
 
   private onMove(e: PointerEvent) {
@@ -804,7 +812,8 @@ export class SceneTimeline {
         drag.to = frame;
         const ri = clamp(this.yToRow(y), 0, this.rows.length - 1);
         drag.toRow = this.rows[ri]?.kind === 'layer' ? ri : drag.toRow;
-        this.marqueeSelect(doc, drag);
+        if (drag.to !== drag.from || drag.toRow !== drag.row) drag.moved = true;
+        if (drag.moved) this.marqueeSelect(doc, drag);
         this.ws.emit('change');
         break;
       }

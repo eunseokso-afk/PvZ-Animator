@@ -90,7 +90,7 @@ export class App {
       if (!sc) return;
       if (action === 'key') this.sceneKey('insert');
       else if (action === 'duplicate') this.viewport.sceneStage.duplicateSelection(sc);
-      else this.deleteSceneSelection(sc);
+      else this.deleteSceneLayers(sc);
       ws.emit('change');
     };
     this.browser = new AssetBrowser(ws, {
@@ -833,9 +833,20 @@ export class App {
         if (r.kept) this.ws.status(`Removed ${r.removed} keyframe${r.removed > 1 ? 's' : ''}; kept ${r.kept} first keyframe${r.kept > 1 ? 's' : ''} (a layer starts at its first key).`);
         return;
       }
-      // Only first keys were selected: they stay, so the layers go as before.
+      // Only first keys were selected. A plain click on one layer's first key is how a layer gets
+      // selected on the timeline, so Delete deletes that layer as it always did; anything bigger
+      // (a marquee, several keys) was about keyframes, and those stay.
+      if (keys.length > 1 || doc.ui.extra.size || keys[0].layer !== doc.ui.layer) {
+        this.ws.status('First keyframes stay: a layer starts at its first key. Select the layers to delete them.');
+        return;
+      }
       doc.ui.keys.clear();
     }
+    this.deleteSceneLayers(doc);
+  }
+
+  /** Delete the selected layers (not locked ones). */
+  private deleteSceneLayers(doc: SceneDocument) {
     const sel = doc.selectedLayers();
     const free = sel.filter((i) => !doc.isLocked(i));
     if (!free.length) {
@@ -1184,11 +1195,26 @@ export class App {
   // ------------------------------------------------------------ keyboard
 
   private bindKeys() {
+    window.addEventListener('keyup', (e) => {
+      if (e.key !== ' ' || !this.viewport.stageFocused || document.querySelector('.overlay')) return;
+      if (this.viewport.takeSpacePan()) return;
+      const doc = this.ws.active;
+      if (doc?.kind === 'particle') {
+        doc.ui.playing = !doc.ui.playing;
+        this.ws.emit('change');
+      } else if (doc) this.ws.togglePlay();
+    });
     window.addEventListener('keydown', (e) => {
       if (document.querySelector('.overlay')) return;
       if (isTextInput(e.target)) return;
       // Keep Space from also "clicking" whichever toolbar button has focus.
       if (e.key === ' ' && e.target instanceof HTMLButtonElement) e.target.blur();
+      // On the stage, Space held is the hand tool: play/pause happens on release if it did not pan.
+      if (e.key === ' ' && this.viewport.stageFocused && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        if (!e.repeat) this.viewport.takeSpacePan();
+        return;
+      }
       const ws = this.ws;
       const doc = ws.active;
       const r = ws.reanim;

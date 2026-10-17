@@ -201,6 +201,46 @@ describe('multi-selection', () => {
     expect(doc.state.layers).toHaveLength(5);
   });
 
+  it('restores the whole selection on undo and redo, and never keeps a stale or duplicate one', () => {
+    const doc = doc3();
+    doc.selectOnly(0);
+    doc.setKey(0, 3, { x: 3 }, 'nudge');
+    doc.toggleSelected(1);
+    expect(doc.selectedLayers()).toEqual([1, 0]);
+    doc.undo();
+    // The selection is what it was when 'nudge' happened: only A.
+    expect(doc.selectedLayers()).toEqual([0]);
+    expect([...doc.ui.extra]).toEqual([]);
+    doc.toggleSelected(0);
+    expect(doc.selectedLayers()).toEqual([]);
+    expect(doc.isSelected(0)).toBe(false);
+    // Duplicate two layers, undo: nothing selected refers to a copy.
+    doc.selectOnly(0);
+    doc.toggleSelected(2);
+    const copies = doc.duplicateLayers(doc.selectedLayers());
+    doc.selectOnly(copies[0]);
+    doc.toggleSelected(copies[1]);
+    doc.undo();
+    expect(doc.selectedLayers().map((i) => doc.state.layers[i].name).sort()).toEqual(['A', 'C']);
+    // Moving keys and undoing selects the keys where they were.
+    const b = doc.state.layers[1].uid;
+    doc.ui.keys = new Set([keyId(b, 10)]);
+    doc.moveKeys(doc.selectedKeys(), 2);
+    expect([...doc.ui.keys]).toEqual([keyId(b, 12)]);
+    doc.undo();
+    expect([...doc.ui.keys]).toEqual([keyId(b, 10)]);
+  });
+
+  it('keeps the same keys selected when frames are inserted or removed', () => {
+    const doc = doc3();
+    const b = doc.state.layers[1].uid;
+    doc.ui.keys = new Set([keyId(b, 20)]);
+    doc.shiftLayerFrames(1, 5, 2);
+    expect([...doc.ui.keys]).toEqual([keyId(b, 22)]);
+    doc.shiftFrames(0, 1);
+    expect([...doc.ui.keys]).toEqual([keyId(b, 23)]);
+  });
+
   it('keeps the selection when deleting another layer', () => {
     const doc = doc3();
     doc.selectOnly(2);

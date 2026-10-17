@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { cameraFrameMatrix, cameraMatrix, evalCamera, SceneDocument } from '../src/editor/sceneDoc';
+import { CURVE_PRESETS } from '../src/editor/easeCurve';
 import { bakeScene, drawScene } from '../src/engine/sceneRuntime';
 import { AssetLibrary, type LoadedImage } from '../src/engine/assets';
 import { apply, mul, type Mat } from '../src/engine/math';
@@ -128,6 +129,76 @@ describe('scene camera', () => {
     expect(evalCamera(doc.state, 60)!.x).toBeCloseTo(800);
     doc.cameraPreset(cam, 60, 'reset');
     expect(evalCamera(doc.state, 60)).toMatchObject({ x: 400, y: 300, zoom: 1, rotation: 0 });
+  });
+
+  it('zooms geometrically, so overshooting curves overshoot the zoom only a little', () => {
+    const { doc, cam } = scene();
+    doc.setKey(cam, 30, { scaleX: 0.25, scaleY: 0.25 }, 'push');
+    expect(evalCamera(doc.state, 15)!.zoom).toBeCloseTo(2);
+    doc.setEases([{ layer: cam, frame: 0 }], 'custom', CURVE_PRESETS.find((p) => p.id === 'elastic')!.curve);
+    const zooms = Array.from({ length: 61 }, (_, i) => evalCamera(doc.state, i / 2)!.zoom);
+    expect(Math.max(...zooms)).toBeLessThan(8);
+    expect(Math.min(...zooms)).toBeGreaterThan(0.5);
+  });
+
+  it('shakes by the same number of stage pixels at any zoom', () => {
+    const { doc, cam } = scene();
+    doc.setKey(cam, 0, { shake: 10, ease: 'hold', scaleX: 1 / 3, scaleY: 1 / 3 }, 'shake');
+    let most = 0;
+    for (let f = 0; f < 60; f++) {
+      const c = evalCamera(doc.state, f)!;
+      const [x] = apply(cameraMatrix(doc.state, c), 400, 300);
+      most = Math.max(most, Math.abs(x - 400));
+    }
+    expect(most).toBeLessThanOrEqual(10);
+    expect(most).toBeGreaterThan(3);
+  });
+
+  it('follows a layer that enters later without snapping', () => {
+    const { doc, cam } = scene();
+    doc.addLayer('image', 'IMAGE_X', 'Late', { x: 600, y: 300 }, 30);
+    const late = doc.state.layers.findIndex((l) => l.name === 'Late');
+    doc.setCameraFollow(doc.state.layers.findIndex((l) => l.kind === 'camera'), 0, doc.state.layers[late].uid);
+    expect(cam).toBeGreaterThanOrEqual(0);
+    // Until it enters, the target counts as standing where it will appear: the camera stays put.
+    for (const f of [0, 10, 29, 30, 31]) expect(evalCamera(doc.state, f)!.x).toBeCloseTo(400);
+  });
+
+  it('filters the background colour too', () => {
+    const { doc, cam } = scene();
+    doc.setKey(cam, 0, { tint: [0.5, 0, 1] }, 'filter');
+    const fills: number[][] = [];
+    const r = { drawImage() {}, fillRect: (_m: Mat, _w: number, _h: number, color: number[]) => void fills.push(color) } as unknown as Renderer;
+    drawScene(r, { assets: { image: () => null } as unknown as AssetLibrary, prefab: () => null }, doc.state, 0, [1, 0, 0, 1, 0, 0]);
+    expect(fills[0][1]).toBe(0);
+    expect(fills[0][0]).toBeCloseTo((0x4d / 255) * 0.5);
+  });
+
+  it('makes presets that keep a move in progress on time', () => {
+    const { doc, cam } = scene();
+    doc.state.length = 120;
+    // A linear pan from 400 to 700 over two seconds, then a shake in the middle of it.
+    doc.setKey(cam, 0, { ease: 'linear' }, 'linear');
+    doc.setKey(cam, 60, { x: 700 }, 'pan');
+    doc.cameraPreset(cam, 30, 'shake');
+    const xs = [31, 35, 50].map((f) => evalCamera(doc.state, f)!);
+    // Shake aside, the pan is where it was (shake is under 12 px).
+    expect(Math.abs(xs[0].x - 555)).toBeLessThan(13);
+    expect(Math.abs(xs[2].x - 650)).toBeLessThan(1);
+    expect(doc.state.layers[cam].keys.map((k) => [k.frame, k.ease])).toEqual([
+      [0, 'linear'],
+      [29, 'linear'],
+      [30, 'linear'],
+      [45, 'linear'],
+      [60, 'linear'],
+    ]);
+    // Static stops following and shaking, and holds where the camera is.
+    doc.cameraPreset(cam, 31, 'static');
+    const k = doc.state.layers[cam].keys.find((x) => x.frame === 31)!;
+    expect(k).toMatchObject({ ease: 'hold', shake: 0, follow: 0 });
+    // A pan replaces keys inside its second.
+    doc.cameraPreset(cam, 70, 'panRight');
+    expect(doc.state.layers[cam].keys.filter((x) => x.frame > 70 && x.frame < 100)).toHaveLength(0);
   });
 
   it('bakes through the camera', () => {

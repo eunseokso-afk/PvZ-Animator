@@ -156,7 +156,8 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
   const world = cam ? mul(view, cameraMatrix(scene, cam)) : view;
   const filter = cam?.tint ?? [1, 1, 1];
   if (opts.drawBackground !== false) {
-    r.fillRect(view, scene.width, scene.height, hexToRgba(scene.background), 'normal');
+    const bg = hexToRgba(scene.background);
+    r.fillRect(view, scene.width, scene.height, [bg[0] * filter[0], bg[1] * filter[1], bg[2] * filter[2], bg[3]], 'normal');
     if (scene.backgroundImage) {
       const img = assets.image(scene.backgroundImage);
       if (img) {

@@ -221,6 +221,13 @@ export function evalLayer(layer: SceneLayer, frame: number, scene?: SceneState):
   if (t !== 0 && next) {
     for (const p of TWEENED_PROPS) pose[p] = k[p] + (next[p] - k[p]) * t;
     for (let c = 0; c < 3; c++) pose.tint[c] = k.tint[c] + (next.tint[c] - k.tint[c]) * t;
+    if (layer.kind === 'camera') {
+      // A camera's frame size tweens geometrically: zooming 1x -> 4x passes 2x halfway, and an
+      // overshooting curve overshoots the zoom a little instead of shrinking the frame to nothing.
+      const a = Math.max(1e-3, Math.abs(k.scaleX));
+      const b = Math.max(1e-3, Math.abs(next.scaleX));
+      pose.scaleX = pose.scaleY = a * Math.pow(b / a, t);
+    }
   }
   if (scene && layer.kind === 'camera' && (k.follow || next?.follow)) {
     // A following camera key's x/y are an offset from the target. Tween between where each
@@ -326,11 +333,13 @@ export function evalCamera(scene: SceneState, frame: number): CameraState | null
     y += tp.y;
   }
   if (pose.shake > 0) {
-    // Smooth, deterministic wobble: a few sines at unrelated rates.
+    // Smooth, deterministic wobble: a few sines at unrelated rates. The strength is in stage
+    // pixels, so it is scaled by the frame size (the zoom would otherwise magnify it).
     const t = frame / Math.max(1, scene.fps);
     const w = (a: number, b: number, p: number, q: number) => 0.6 * Math.sin(2 * Math.PI * a * t + p) + 0.4 * Math.sin(2 * Math.PI * b * t + q);
-    x += pose.shake * w(7.3, 12.9, 0, 1.7);
-    y += pose.shake * w(8.1, 13.7, 0.5, 2.9);
+    const amp = pose.shake * Math.abs(pose.scaleX);
+    x += amp * w(7.3, 12.9, 0, 1.7);
+    y += amp * w(8.1, 13.7, 0.5, 2.9);
   }
   return { x, y, rotation: pose.rotation, zoom: 1 / Math.max(1e-3, Math.abs(pose.scaleX)), tint: [...pose.tint] as [number, number, number], fade: 1 - Math.max(0, Math.min(1, pose.alpha)) };
 }
@@ -339,7 +348,8 @@ export function evalCamera(scene: SceneState, frame: number): CameraState | null
 function followTarget(scene: SceneState, key: LayerKey, frame: number): LayerPose | null {
   if (!key.follow) return null;
   const target = scene.layers.find((l) => l.uid === key.follow && l.kind !== 'camera');
-  return (target && evalLayer(target, frame)) ?? null;
+  // Before the target appears, it counts as standing where it enters (so offsets stay offsets).
+  return (target && evalLayer(target, Math.max(frame, target.keys[0]?.frame ?? frame))) ?? null;
 }
 
 /** World -> stage matrix for a camera: its centre lands mid-stage, turned and zoomed. */
@@ -404,27 +414,52 @@ export class SceneDocument extends DocumentBase<SceneState> {
   }
 
   /** Which layer was selected when each undo snapshot was taken, so undo/redo can reselect it. */
-  private selectionOf = new WeakMap<SceneState, number>();
+  private selectionOf = new WeakMap<SceneState, { main?: number; extra: number[]; keys: string[] }>();
 
   protected snapshot(): SceneState {
     const copy = cloneSceneState(this.state);
-    const uid = this.selectedLayer?.uid;
-    if (uid !== undefined) this.selectionOf.set(copy, uid);
+    this.selectionOf.set(copy, { main: this.selectedLayer?.uid, extra: [...this.ui.extra], keys: [...this.ui.keys] });
     return copy;
   }
 
   protected afterRestore(): void {
     this.revision++;
-    const uid = this.selectionOf.get(this.state);
-    if (uid !== undefined) {
+    const saved = this.selectionOf.get(this.state);
+    if (saved) {
       // The restored snapshot becomes the live state; forget its selection so later edits don't reapply it.
       this.selectionOf.delete(this.state);
-      const i = this.state.layers.findIndex((l) => l.uid === uid);
+      const i = this.state.layers.findIndex((l) => l.uid === saved.main);
       if (i >= 0) this.ui.layer = i;
+      this.ui.extra = new Set(saved.extra);
+      this.ui.keys = new Set(saved.keys);
     }
     if (this.ui.layer >= this.state.layers.length) this.ui.layer = this.state.layers.length - 1;
     if (this.ui.frame >= this.state.length) this.ui.frame = this.ui.frameEnd = this.state.length - 1;
     if (this.ui.cue && !this.state.soundCues.some((c) => c.uid === this.ui.cue!.uid)) this.ui.cue = null;
+    this.pruneSelection();
+  }
+
+  /** Drop selected layers and keys that no longer exist (and the main layer from the extras). */
+  private pruneSelection(): void {
+    const main = this.selectedLayer?.uid;
+    const ids = new Set<string>();
+    const uids = new Set<number>();
+    for (const l of this.state.layers) {
+      uids.add(l.uid);
+      for (const k of l.keys) ids.add(keyId(l.uid, k.frame));
+    }
+    for (const u of this.ui.extra) if (u === main || !uids.has(u)) this.ui.extra.delete(u);
+    for (const id of this.ui.keys) if (!ids.has(id)) this.ui.keys.delete(id);
+  }
+
+  /** Run an edit that moves keys between frames, keeping the same keys selected. */
+  private keepingKeys(fn: () => void): void {
+    const picked: { layer: SceneLayer; key: LayerKey }[] = [];
+    if (this.ui.keys.size) for (const l of this.state.layers) for (const k of l.keys) if (this.ui.keys.has(keyId(l.uid, k.frame))) picked.push({ layer: l, key: k });
+    fn();
+    if (!picked.length) return;
+    this.ui.keys.clear();
+    for (const p of picked) if (p.layer.keys.includes(p.key)) this.ui.keys.add(keyId(p.layer.uid, p.key.frame));
   }
 
   get frameCount(): number {
@@ -672,6 +707,7 @@ export class SceneDocument extends DocumentBase<SceneState> {
       const rest = this.selectedLayers().slice(1);
       this.ui.layer = rest[0] ?? -1;
       if (rest[0] !== undefined) this.ui.extra.delete(this.state.layers[rest[0]].uid);
+      this.ui.extra.delete(layer.uid);
     } else this.ui.extra.delete(layer.uid);
   }
 
@@ -819,43 +855,69 @@ export class SceneDocument extends DocumentBase<SceneState> {
     if (!pose) return false;
     const sec = Math.max(1, Math.round(this.state.fps));
     const label = CAMERA_PRESETS.find((p) => p.id === preset)?.label ?? preset;
+    // Is the camera already in the middle of a move here? Then its timing is left alone.
+    const ki = keyIndexAt(layer, frame);
+    const k0 = layer.keys[ki];
+    const n0 = layer.keys[ki + 1];
+    const moving = !!n0 && n0.visible && k0.ease !== 'hold' && (k0.x !== n0.x || k0.y !== n0.y || k0.rotation !== n0.rotation || k0.scaleX !== n0.scaleX || k0.follow !== n0.follow);
     this.edit(`Camera: ${label}`, (s) => {
-      const at = (f: number, patch: Partial<LayerKey>) => {
+      const keyAt = (f: number) => {
         if (f >= s.length) s.length = f + 1;
-        const i = this.ensureKey(layerIndex, f);
-        Object.assign(s.layers[layerIndex].keys[i], patch, { frame: f });
+        return s.layers[layerIndex].keys[this.ensureKey(layerIndex, f)];
       };
-      const move = (patch: Partial<LayerKey>) => {
-        at(frame, { ease: pose.key.ease === 'hold' || pose.key.ease === 'linear' ? 'easeInOut' : pose.key.ease });
-        at(frame + sec, patch);
+      const at = (f: number, patch: Partial<LayerKey>) => Object.assign(keyAt(f), patch, { frame: f });
+      /** A one-second move from the playhead; `patch` gets the start and end keys. */
+      const move = (patch: (start: LayerKey, end: LayerKey) => Partial<LayerKey>) => {
+        const end = frame + sec;
+        const start = keyAt(frame);
+        // A camera standing still gets a gentle start and stop (a hand-made curve is kept).
+        if (!moving && (start.ease === 'hold' || start.ease === 'linear')) start.ease = 'easeInOut';
+        // The move takes exactly one second: keys inside it would interrupt it.
+        const l = s.layers[layerIndex];
+        l.keys = l.keys.filter((k) => k.frame <= frame || k.frame >= end);
+        const last = keyAt(end);
+        Object.assign(last, patch(start, last));
       };
       const r = pose.rotation * DEG;
       const pan = (s.width / 2) * pose.scaleX;
       switch (preset) {
-        case 'static':
-          at(frame, { ease: 'hold' });
+        case 'static': {
+          // Hold still in the world: no following and no shaking from here to the next key.
+          const tp = followTarget(s, pose.key, frame);
+          at(frame, { ease: 'hold', shake: 0, follow: 0, x: pose.x + (tp?.x ?? 0), y: pose.y + (tp?.y ?? 0) });
           break;
+        }
         case 'pushIn':
-          move({ scaleX: pose.scaleX / 1.5, scaleY: pose.scaleY / 1.5 });
+          move(() => ({ scaleX: pose.scaleX / 1.5, scaleY: pose.scaleY / 1.5 }));
           break;
         case 'pullOut':
-          move({ scaleX: pose.scaleX * 1.5, scaleY: pose.scaleY * 1.5 });
+          move(() => ({ scaleX: pose.scaleX * 1.5, scaleY: pose.scaleY * 1.5 }));
           break;
         case 'panLeft':
         case 'panRight': {
           const d = preset === 'panLeft' ? -pan : pan;
-          move({ x: Math.round(pose.x + Math.cos(r) * d), y: Math.round(pose.y + Math.sin(r) * d) });
+          const dx = Math.cos(r) * d;
+          const dy = Math.sin(r) * d;
+          move((start, end) => {
+            // Following the same layer at both ends: pan relative to it. Otherwise go through the world.
+            if (end.follow === start.follow) return { x: Math.round(pose.x + dx), y: Math.round(pose.y + dy) };
+            const a = followTarget(s, start, frame);
+            const b = followTarget(s, end, end.frame);
+            return { x: Math.round(pose.x + (a?.x ?? 0) + dx - (b?.x ?? 0)), y: Math.round(pose.y + (a?.y ?? 0) + dy - (b?.y ?? 0)) };
+          });
           break;
         }
         case 'tilt':
-          move({ rotation: pose.rotation + 10 });
+          move(() => ({ rotation: pose.rotation + 10 }));
           break;
         case 'shake': {
-          // Start at full strength: stop the previous key tweening the shake up to it.
+          // Start at full strength: stop the previous key tweening the shake up to it. A move in
+          // progress keeps its eases (and so its timing); the shake then fades along with it.
           const keys = s.layers[layerIndex].keys;
           const prev = keyIndexAt(s.layers[layerIndex], frame - 1);
           if (frame > 0 && prev >= 0 && keys[prev].frame < frame - 1 && keys[prev].ease !== 'hold') at(frame - 1, {});
-          at(frame, { shake: 12, ease: 'easeOut' });
+          // (A camera standing still, even on a hold, gets an ease-out so the shake can settle.)
+          at(frame, moving ? { shake: 12 } : { shake: 12, ease: 'easeOut' });
           at(frame + Math.max(1, Math.round(sec / 2)), { shake: 0 });
           break;
         }
@@ -872,7 +934,7 @@ export class SceneDocument extends DocumentBase<SceneState> {
     length = Math.max(1, Math.round(length));
     const dropped = { keys: 0, cues: 0 };
     if (length === this.state.length) return dropped;
-    this.edit('Change scene length', (s) => {
+    this.keepingKeys(() => this.edit('Change scene length', (s) => {
       s.length = length;
       for (const l of s.layers) {
         const kept = l.keys.filter((k) => k.frame < length);
@@ -888,7 +950,7 @@ export class SceneDocument extends DocumentBase<SceneState> {
       const cues = s.soundCues.filter((c) => c.frame < length);
       dropped.cues = s.soundCues.length - cues.length;
       s.soundCues = cues;
-    });
+    }));
     if (this.ui.frame >= length) this.ui.frame = this.ui.frameEnd = length - 1;
     return dropped;
   }
@@ -896,12 +958,14 @@ export class SceneDocument extends DocumentBase<SceneState> {
   /** Insert or remove frames at `at` on every layer and the sound cues, changing the scene length. */
   shiftFrames(at: number, count: number): void {
     if (count === 0) return;
-    this.edit(count > 0 ? 'Insert frames (all layers)' : 'Remove frames (all layers)', (s) => {
-      s.length = Math.max(1, s.length + count);
-      for (const l of s.layers) shiftKeys(l, at, count, s.length);
-      if (count < 0) s.soundCues = s.soundCues.filter((c) => c.frame < at || c.frame >= at - count);
-      for (const c of s.soundCues) if (c.frame >= at) c.frame = Math.max(0, c.frame + count);
-    });
+    this.keepingKeys(() =>
+      this.edit(count > 0 ? 'Insert frames (all layers)' : 'Remove frames (all layers)', (s) => {
+        s.length = Math.max(1, s.length + count);
+        for (const l of s.layers) shiftKeys(l, at, count, s.length);
+        if (count < 0) s.soundCues = s.soundCues.filter((c) => c.frame < at || c.frame >= at - count);
+        for (const c of s.soundCues) if (c.frame >= at) c.frame = Math.max(0, c.frame + count);
+      }),
+    );
     if (this.ui.frame >= this.state.length) this.ui.frame = this.ui.frameEnd = this.state.length - 1;
   }
 
@@ -911,10 +975,12 @@ export class SceneDocument extends DocumentBase<SceneState> {
    */
   shiftLayerFrames(layerIndex: number, at: number, count: number): void {
     if (count === 0 || !this.state.layers[layerIndex]) return;
-    this.edit(count > 0 ? 'Insert frames' : 'Remove frames', (s) => {
-      if (count > 0) s.length += count;
-      shiftKeys(s.layers[layerIndex], at, count, s.length);
-    });
+    this.keepingKeys(() =>
+      this.edit(count > 0 ? 'Insert frames' : 'Remove frames', (s) => {
+        if (count > 0) s.length += count;
+        shiftKeys(s.layers[layerIndex], at, count, s.length);
+      }),
+    );
   }
 
   addSoundCue(frame: number, sound: string, volume = 1): SoundCue {
