@@ -2,7 +2,7 @@
 
 import { getAnimRanges } from '../formats/reanim';
 import { EASES } from '../editor/reanimDoc';
-import { evalLayer, INSTANCE_LOOPS, keyIndexAt, type LayerKey, type SceneDocument } from '../editor/sceneDoc';
+import { CAMERA_PRESETS, cameraLayer, evalLayer, INSTANCE_LOOPS, keyIndexAt, type LayerKey, type LayerPose, type SceneDocument } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
 import { uniqueSceneName } from './exporters';
@@ -21,8 +21,9 @@ function fromHex(hex: string): [number, number, number] {
 export class SceneInspector {
   readonly el: HTMLElement;
   private sig = '';
-  private fields = new Map<string, NumberField>();
-  private alphaSlider: HTMLInputElement | null = null;
+  /** Number fields showing the selected layer's tweened values, updated in place as the playhead moves. */
+  private fields = new Map<string, { field: NumberField; get(p: LayerPose): number }>();
+  private alphaSlider: { el: HTMLInputElement; get(p: LayerPose): number } | null = null;
   /** A scrub or slider drag is in progress: update values in place, never rebuild under the pointer. */
   private gesture = false;
   uniformScale = true;
@@ -68,7 +69,11 @@ export class SceneInspector {
       layer?.keys.length,
       ki,
       layer && doc.ui.locked.has(layer.uid),
-      key && JSON.stringify({ ...key, x: 0, y: 0, rotation: 0, scaleX: 0, scaleY: 0, alpha: 0 }),
+      key && JSON.stringify({ ...key, x: 0, y: 0, rotation: 0, scaleX: 0, scaleY: 0, alpha: 0, shake: 0 }),
+      // The camera's follow list names the other layers.
+      layer?.kind === 'camera' ? doc.state.layers.map((l) => `${l.uid}:${l.name}`).join() : '',
+      doc.ui.cameraView,
+      !!cameraLayer(s),
       doc.ui.cue?.uid,
       s.width,
       s.height,
@@ -95,10 +100,10 @@ export class SceneInspector {
   private updateValues(doc: SceneDocument) {
     const layer = doc.selectedLayer;
     if (!layer) return;
-    const pose = evalLayer(layer, this.ws.sceneFrame(doc));
+    const pose = evalLayer(layer, this.ws.sceneFrame(doc), doc.state);
     if (!pose) return;
-    for (const [k, f] of this.fields) f.set(pose[k as 'x'] as number);
-    if (this.alphaSlider && !this.gesture) this.alphaSlider.value = String(pose.alpha);
+    for (const f of this.fields.values()) f.field.set(f.get(pose));
+    if (this.alphaSlider && !this.gesture) this.alphaSlider.el.value = String(this.alphaSlider.get(pose));
   }
 
   private hint() {
@@ -196,6 +201,24 @@ export class SceneInspector {
           ),
         ),
       ),
+      h(
+        'div',
+        { class: 'insp-buttons' },
+        h(
+          'button',
+          {
+            class: 'btn small',
+            title: 'A camera pans, zooms and turns the view; exports and bakes see what it sees',
+            onclick: () => {
+              doc.ui.layer = doc.addCamera();
+              doc.ui.cue = null;
+              ws.emit('change');
+            },
+          },
+          cameraLayer(s) ? '🎥 Select camera' : '🎥 Add camera',
+        ),
+        cameraLayer(s) ? checkbox('Look through camera (C)', doc.ui.cameraView, (v) => ((doc.ui.cameraView = v), ws.emit('change'))) : null,
+      ),
       h('div', { class: 'insp-stats' }, `${s.layers.length} layers · ${s.length} frames @ ${s.fps} fps (${(s.length / s.fps).toFixed(2)} s) · ${s.soundCues.length} sound cues`),
     );
   }
@@ -205,7 +228,8 @@ export class SceneInspector {
     const li = doc.ui.layer;
     const layer = doc.state.layers[li];
     const frame = doc.ui.frame;
-    const pose = evalLayer(layer, frame);
+    const pose = evalLayer(layer, frame, doc.state);
+    const isCamera = layer.kind === 'camera';
     const ki = keyIndexAt(layer, frame);
     const key = layer.keys[ki];
     const isKey = key?.frame === frame;
@@ -221,7 +245,42 @@ export class SceneInspector {
       doc.setKey(li, doc.ui.frame, patch, begin ? label : undefined);
       ws.emit(final ? 'change' : 'frame');
     };
-    const num = (prop: 'x' | 'y' | 'rotation' | 'scaleX' | 'scaleY' | 'alpha', label: string, step: number, precision: number, title: string, min?: number, max?: number) => {
+    /** A live number field; `toKey`/`fromPose` convert between what it shows and what keys hold. */
+    const field = (
+      name: string,
+      label: string,
+      step: number,
+      precision: number,
+      title: string,
+      fromPose: (p: LayerPose) => number,
+      toKey: (v: number) => Partial<LayerKey>,
+      min?: number,
+      max?: number,
+    ) => {
+      let begun = false;
+      const f = numberField({
+        label,
+        value: pose ? fromPose(pose) : 0,
+        step,
+        precision,
+        min,
+        max,
+        title,
+        onBegin: () => {
+          begun = true;
+          this.gesture = true;
+        },
+        onChange: (v, final) => {
+          if (final) this.gesture = false;
+          set(toKey(v), `Change ${label}`, final, begun);
+          begun = false;
+        },
+      });
+      this.fields.set(name, { field: f, get: fromPose });
+      f.input.disabled = locked;
+      return f.el;
+    };
+    const num = (prop: 'x' | 'y' | 'rotation' | 'scaleX' | 'scaleY' | 'alpha' | 'shake', label: string, step: number, precision: number, title: string, min?: number, max?: number) => {
       let begun = false;
       const f = numberField({
         label,
@@ -250,7 +309,7 @@ export class SceneInspector {
           begun = false;
         },
       });
-      this.fields.set(prop, f);
+      this.fields.set(prop, { field: f, get: (p) => p[prop] });
       f.input.disabled = locked;
       return f.el;
     };
@@ -278,8 +337,14 @@ export class SceneInspector {
             onchange: (e: Event) => set({ text: (e.target as HTMLInputElement).value }, 'Change text'),
           })
         : null;
-    const sourceRow =
-      layer.kind === 'text'
+    const sourceRow = isCamera
+      ? h(
+          'div',
+          { class: 'form-col' },
+          checkbox('Look through the camera (C)', doc.ui.cameraView, (v) => ((doc.ui.cameraView = v), ws.emit('change')), 'Off: see the whole world with the camera’s frame, to place and size it'),
+          h('p', { class: 'dim small' }, 'The frame is what the stage shows: move it to pan, size it to zoom, turn it to rotate. Exports and bakes see what the camera sees.'),
+        )
+      : layer.kind === 'text'
         ? h(
             'div',
             { class: 'form-col' },
@@ -377,7 +442,7 @@ export class SceneInspector {
       ),
       key
         ? select(
-            EASES.map((e) => ({ value: e.id, label: e.label })),
+            EASES.map((e) => ({ value: e.id, label: isCamera && e.id === 'hold' ? 'Static (hold until next key)' : e.label })),
             key.ease,
             (v) => {
               if (doc.isLocked(li)) return set({}, 'Set easing');
@@ -401,21 +466,30 @@ export class SceneInspector {
       );
     }
 
-    const tint = h('input', { type: 'color', value: toHex(pose.tint), title: 'Tint (color multiply)', onchange: () => set({ tint: fromHex(tint.value) }, 'Change tint') });
+    const tint = h('input', {
+      type: 'color',
+      value: toHex(pose.tint),
+      title: isCamera ? 'Colour filter: multiplies everything the camera sees' : 'Tint (color multiply)',
+      onchange: () => set({ tint: fromHex(tint.value) }, isCamera ? 'Change colour filter' : 'Change tint'),
+    });
+    // A camera's alpha is how much of the scene shows: the slider is its fade to black.
+    const sliderOf = (p: LayerPose) => (isCamera ? 1 - p.alpha : p.alpha);
     let alphaBegun = false;
     const alpha = h('input', {
       type: 'range',
       min: 0,
       max: 1,
       step: 0.01,
-      value: pose.alpha,
+      value: sliderOf(pose),
       class: 'alpha-slider',
+      title: isCamera ? 'Fade to black' : 'Opacity',
       onpointerdown: () => {
         alphaBegun = false;
         this.gesture = true;
       },
       oninput: () => {
-        set({ alpha: parseFloat(alpha.value) }, 'Change alpha', false, !alphaBegun);
+        const v = parseFloat(alpha.value);
+        set({ alpha: isCamera ? 1 - v : v }, isCamera ? 'Change fade' : 'Change alpha', false, !alphaBegun);
         alphaBegun = true;
       },
       onchange: () => {
@@ -423,39 +497,105 @@ export class SceneInspector {
         ws.emit('change');
       },
     });
-    this.alphaSlider = alpha;
+    this.alphaSlider = { el: alpha, get: sliderOf };
+    const following = isCamera && !!key?.follow;
 
     const sections: (HTMLElement | null)[] = [
       h(
         'section',
         { class: 'insp-section' },
-        h('h3', null, layer.kind === 'reanim' ? '▶ Prefab instance' : layer.kind === 'particle' ? '✦ Particle effect' : layer.kind === 'text' ? 'T Text' : '▣ Image', locked ? h('span', { class: 'dim small' }, '  🔒 locked') : null),
+        h('h3', null, layer.kind === 'reanim' ? '▶ Prefab instance' : layer.kind === 'particle' ? '✦ Particle effect' : layer.kind === 'text' ? 'T Text' : isCamera ? '🎥 Camera' : '▣ Image', locked ? h('span', { class: 'dim small' }, '  🔒 locked') : null),
         h('label', { class: 'field-col' }, 'Layer name', nameInput),
         sourceRow,
         keyRow,
-        h('div', { class: 'insp-grid2' }, num('x', 'X', 1, 1, 'Stage X (px)'), num('y', 'Y', 1, 1, 'Stage Y (px)')),
-        h('div', { class: 'insp-grid2' }, num('rotation', 'Rotation', 1, 2, 'Degrees, clockwise'), checkbox('Flip horizontally', pose.flipX, (v) => {
-            if (doc.isLocked(li)) return set({}, 'Flip');
-            if (ws.playing) ws.pause();
-            this.hooks.flip(doc, li, v);
-            ws.emit('change');
-          })),
-        h('div', { class: 'insp-grid2' }, num('scaleX', 'Scale X', 0.01, 3, 'Horizontal scale'), num('scaleY', 'Scale Y', 0.01, 3, 'Vertical scale')),
-        checkbox('Uniform scale', this.uniformScale, (v) => {
-          this.uniformScale = v;
-          this.refresh(true);
-        }),
-        h('div', { class: 'insp-alpha' }, num('alpha', 'Alpha', 0.01, 3, 'Opacity 0..1', 0, 1), alpha),
+        h(
+          'div',
+          { class: 'insp-grid2' },
+          num('x', following ? 'Offset X' : 'X', 1, 1, following ? 'Offset from the followed layer (px)' : isCamera ? 'Centre of the view, stage X (px)' : 'Stage X (px)'),
+          num('y', following ? 'Offset Y' : 'Y', 1, 1, following ? 'Offset from the followed layer (px)' : isCamera ? 'Centre of the view, stage Y (px)' : 'Stage Y (px)'),
+        ),
+        isCamera
+          ? h(
+              'div',
+              { class: 'insp-grid2' },
+              field('zoom', 'Zoom', 0.01, 3, '2 = everything twice as big', (p) => 1 / Math.max(1e-3, Math.abs(p.scaleX)), (v) => ({ scaleX: 1 / v, scaleY: 1 / v }), 0.05, 20),
+              num('rotation', 'Rotation', 1, 2, 'Degrees the camera turns, clockwise (the world turns the other way)'),
+            )
+          : h('div', { class: 'insp-grid2' }, num('rotation', 'Rotation', 1, 2, 'Degrees, clockwise'), checkbox('Flip horizontally', pose.flipX, (v) => {
+              if (doc.isLocked(li)) return set({}, 'Flip');
+              if (ws.playing) ws.pause();
+              this.hooks.flip(doc, li, v);
+              ws.emit('change');
+            })),
+        isCamera ? null : h('div', { class: 'insp-grid2' }, num('scaleX', 'Scale X', 0.01, 3, 'Horizontal scale'), num('scaleY', 'Scale Y', 0.01, 3, 'Vertical scale')),
+        isCamera
+          ? null
+          : checkbox('Uniform scale', this.uniformScale, (v) => {
+              this.uniformScale = v;
+              this.refresh(true);
+            }),
+        h(
+          'div',
+          { class: 'insp-alpha' },
+          isCamera ? field('fade', 'Fade', 0.01, 3, 'Fade to black: 0 clear, 1 black', (p) => 1 - p.alpha, (v) => ({ alpha: 1 - v }), 0, 1) : num('alpha', 'Alpha', 0.01, 3, 'Opacity 0..1', 0, 1),
+          alpha,
+        ),
         h(
           'div',
           { class: 'insp-key' },
-          h('span', { class: 'dim small' }, layer.kind === 'text' ? 'Color' : 'Tint'),
+          h('span', { class: 'dim small' }, layer.kind === 'text' ? 'Color' : isCamera ? 'Colour filter' : 'Tint'),
           tint,
-          h('button', { class: 'btn small', onclick: () => set({ tint: [1, 1, 1] }, 'Reset tint') }, 'Reset'),
-          checkbox('Visible', pose.visible, (v) => set({ visible: v }, v ? 'Show layer' : 'Hide layer')),
+          h('button', { class: 'btn small', onclick: () => set({ tint: [1, 1, 1] }, isCamera ? 'Reset colour filter' : 'Reset tint') }, 'Reset'),
+          isCamera
+            ? checkbox('Camera on', pose.visible, (v) => set({ visible: v }, v ? 'Camera on' : 'Camera off'), 'Off (a blank keyframe): the stage shows the world without the camera')
+            : checkbox('Visible', pose.visible, (v) => set({ visible: v }, v ? 'Show layer' : 'Hide layer')),
         ),
       ),
     ];
+
+    if (isCamera) {
+      const others = doc.state.layers.filter((l) => l.kind !== 'camera');
+      const followOptions = [{ value: '0', label: 'Nothing (free camera)' }, ...others.map((l) => ({ value: String(l.uid), label: l.name }))];
+      if (key?.follow && !others.some((l) => l.uid === key.follow)) followOptions.push({ value: String(key.follow), label: '(deleted layer)' });
+      const followSelect = select(followOptions, String(key?.follow ?? 0), (v) => {
+        if (doc.isLocked(li)) return set({}, 'Follow layer');
+        if (ws.playing) ws.pause();
+        doc.setCameraFollow(li, doc.ui.frame, Number(v));
+        ws.emit('change');
+      }, 'Keep a layer in view from this key on (its position is added to the camera’s)');
+      followSelect.disabled = locked;
+      sections.push(
+        h(
+          'section',
+          { class: 'insp-section' },
+          h('h3', null, 'Camera moves'),
+          h('div', { class: 'insp-grid2' }, num('shake', 'Shake', 1, 1, 'Shake strength in stage px (tweens, so a key with 0 settles it)', 0, 200), h('span')),
+          h('label', { class: 'field-col' }, 'Follow', followSelect),
+          h('p', { class: 'dim small' }, 'Presets start from the camera at the playhead (Static holds it still until the next key).'),
+          h(
+            'div',
+            { class: 'insp-buttons' },
+            CAMERA_PRESETS.map((p) =>
+              h(
+                'button',
+                {
+                  class: 'btn small',
+                  title: p.title,
+                  disabled: locked,
+                  onclick: () => {
+                    if (doc.isLocked(li)) return set({}, p.label);
+                    if (ws.playing) ws.pause();
+                    if (doc.cameraPreset(li, doc.ui.frame, p.id)) ws.status(`Camera: ${p.label}`);
+                    ws.emit('change');
+                  },
+                },
+                p.label,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
 
     if (layer.kind === 'reanim') {
       const prefab = ws.prefab(layer.source);

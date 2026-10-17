@@ -990,7 +990,9 @@ export class Viewport {
   onAssetDrop(asset: { kind: string; path: string }, pos: [number, number]): void {
     const scene = this.ws.scene;
     if (scene) {
-      const [sx, sy] = this.toWorld(scene, pos[0], pos[1]);
+      const [px, py] = this.toWorld(scene, pos[0], pos[1]);
+      // Through the camera, the drop lands where that spot of the picture is in the world.
+      const [sx, sy] = this.sceneStage.stageToWorld(scene, px, py);
       void this.sceneStage.addAsset(scene, asset, sx, sy);
       return;
     }

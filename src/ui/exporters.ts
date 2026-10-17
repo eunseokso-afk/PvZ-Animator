@@ -298,13 +298,21 @@ export async function loadProject(ws: Workspace, file: File): Promise<void> {
   for (const sc of p.scenes ?? []) {
     const state = sc.state;
     // Fresh ids so they never collide with ids handed out in this session.
+    const uids = new Map<number, number>();
     for (const l of state.layers) {
       // Keep particle randomness tied to the saved layer, not to this session's ids.
       l.seed ??= l.uid;
-      l.uid = nextUid();
+      const uid = nextUid();
+      uids.set(l.uid, uid);
+      l.uid = uid;
+    }
+    for (const l of state.layers) {
       for (const k of l.keys) {
         k.tint = [...(k.tint ?? [1, 1, 1])] as [number, number, number];
         k.text ??= '';
+        k.shake ??= 0;
+        // A camera follows a layer by id.
+        k.follow = (k.follow && uids.get(k.follow)) || 0;
       }
     }
     for (const c of state.soundCues) c.uid = nextUid();

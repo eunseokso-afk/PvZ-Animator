@@ -7,7 +7,7 @@
 import { clamp } from '../engine/math';
 import { basename } from '../engine/vfs';
 import { EASES } from '../editor/reanimDoc';
-import { keyIndexAt, type SceneDocument, type SceneLayer } from '../editor/sceneDoc';
+import { cameraLayer, keyIndexAt, type SceneDocument, type SceneLayer } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
 import { h, rafThrottle } from './dom';
 import { C, envelopeOf, roundRect } from './timeline';
@@ -18,7 +18,7 @@ const RULER_H = 22;
 const ROW_H = 22;
 const NAME_W = 210;
 
-const KIND_ICON: Record<string, string> = { reanim: '▶', particle: '✦', image: '▣', text: 'T' };
+const KIND_ICON: Record<string, string> = { reanim: '▶', particle: '✦', image: '▣', text: 'T', camera: '🎥' };
 const TWEEN_FILL = 'rgba(122, 104, 214, 0.32)';
 const SPAN_FILL = 'rgba(92, 118, 140, 0.28)';
 
@@ -65,6 +65,7 @@ export class SceneTimeline {
   private viewDoc = -1;
   private playBtn!: HTMLButtonElement;
   private loopBtn!: HTMLButtonElement;
+  private cameraBtn!: HTMLButtonElement;
   private soundBtn!: HTMLButtonElement;
   private frameField!: NumberField;
   private frameTotal!: HTMLElement;
@@ -156,6 +157,16 @@ export class SceneTimeline {
       if (!ws.soundEnabled) ws.audio.stopAll();
       this.syncToolbar();
     });
+    this.cameraBtn = btn('🎥', 'Camera', () => {
+      const doc = this.doc;
+      if (!doc) return;
+      if (!cameraLayer(doc.state)) {
+        doc.ui.layer = doc.addCamera();
+        doc.ui.cue = null;
+        doc.ui.cameraView = true;
+      } else doc.ui.cameraView = !doc.ui.cameraView;
+      ws.emit('change');
+    });
     const addBtn = btn('＋ Layer ▾', 'Add a prefab instance, particle effect, image or sound', (e) => {
       const doc = this.doc;
       if (!doc) return;
@@ -178,6 +189,7 @@ export class SceneTimeline {
       h(
         'div',
         { class: 'tl-group' },
+        this.cameraBtn,
         this.loopBtn,
         this.soundBtn,
         btn('－', 'Zoom timeline out', () => this.zoomCells(1 / 1.25)),
@@ -198,6 +210,13 @@ export class SceneTimeline {
     this.fpsField.set(doc.state.fps);
     this.lengthField.set(doc.state.length);
     this.loopBtn.classList.toggle('active', doc.ui.loopPlayback);
+    const hasCamera = !!cameraLayer(doc.state);
+    this.cameraBtn.classList.toggle('active', hasCamera && doc.ui.cameraView);
+    this.cameraBtn.title = hasCamera
+      ? doc.ui.cameraView
+        ? 'Looking through the camera (C): click to see the whole world and the camera frame'
+        : 'Seeing the whole world (C): click to look through the camera'
+      : 'Add a camera to pan, zoom and turn the view';
     this.soundBtn.textContent = ws.soundEnabled ? '🔊' : '🔇';
   }
 
@@ -538,7 +557,7 @@ export class SceneTimeline {
     ctx.fillText(hidden ? '◌' : '●', 8, y + 15);
     ctx.fillStyle = locked ? C.sel : '#5a606c';
     ctx.fillText(locked ? '🔒' : '·', 26, y + 15);
-    ctx.fillStyle = layer.kind === 'reanim' ? '#6fb6ff' : layer.kind === 'particle' ? '#f08ad8' : '#c9ceda';
+    ctx.fillStyle = layer.kind === 'reanim' ? '#6fb6ff' : layer.kind === 'particle' ? '#f08ad8' : layer.kind === 'camera' ? '#c9a8ff' : '#c9ceda';
     ctx.fillText(KIND_ICON[layer.kind], 42, y + 15);
     ctx.fillStyle = hidden ? C.dim : C.text;
     let name = layer.name;

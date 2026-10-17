@@ -5,14 +5,14 @@
  */
 
 import { imageAlphaAt } from '../engine/assets';
-import { apply, DEG, invert, type Mat } from '../engine/math';
+import { apply, DEG, invert, mul, type Mat } from '../engine/math';
 import type { Renderer } from '../engine/renderer';
 import { animRangeOf, interpolateTransform, transformMatrix } from '../engine/reanimRuntime';
 import { drawScene, type DrawnLayer, type SceneResolver } from '../engine/sceneRuntime';
 import { fontSizeHint } from '../engine/text';
 import { basename, stripExt } from '../engine/vfs';
 import { getAnimRanges, type ReanimTransform } from '../formats/reanim';
-import { evalLayer, poseMatrix, type LayerKey, type SceneDocument } from '../editor/sceneDoc';
+import { cameraFrameMatrix, cameraMatrix, evalCamera, evalLayer, poseMatrix, type LayerKey, type SceneDocument } from '../editor/sceneDoc';
 import type { Workspace } from '../editor/workspace';
 import { defaultFont } from './pickers';
 import { promptText, type MenuItem } from './widgets';
@@ -84,17 +84,48 @@ export class SceneStage {
       // Onion skin: neighbouring frames, faded, without the stage background.
       for (const g of [frame - 2, frame + 2]) {
         if (g < 0 || g >= doc.state.length) continue;
-        drawScene(r, { ...res, particles: undefined }, doc.state, g, view, { hidden, alpha: 0.25, drawBackground: false });
+        drawScene(r, { ...res, particles: undefined }, doc.state, g, view, { hidden, alpha: 0.25, drawBackground: false, camera: doc.ui.cameraView });
       }
     }
     this.drawn = [];
-    drawScene(r, res, doc.state, frame, view, { hidden, collect: this.drawn });
+    drawScene(r, res, doc.state, frame, view, { hidden, collect: this.drawn, camera: doc.ui.cameraView, cameraFrame: !doc.ui.cameraView });
+  }
+
+  /** Whether the stage currently shows the world through a camera. */
+  throughCamera(doc: SceneDocument, frame = this.ws.sceneFrame(doc)): boolean {
+    return doc.ui.cameraView && !!evalCamera(doc.state, frame);
+  }
+
+  /** Screen matrix for world coordinates: the stage view, through the camera when looking through it. */
+  private worldView(doc: SceneDocument, frame = this.ws.sceneFrame(doc)): Mat {
+    const view = this.host.view(doc);
+    const cam = doc.ui.cameraView ? evalCamera(doc.state, frame) : null;
+    return cam ? mul(view, cameraMatrix(doc.state, cam)) : view;
+  }
+
+  /** World coordinates of a screen point. */
+  private toWorld(doc: SceneDocument, x: number, y: number, frame?: number): [number, number] {
+    const inv = invert(this.worldView(doc, frame));
+    return inv ? apply(inv, x, y) : this.host.toStage(doc, x, y);
+  }
+
+  /** World coordinates of a stage point (where something at that spot of the picture really is). */
+  stageToWorld(doc: SceneDocument, x: number, y: number): [number, number] {
+    const cam = doc.ui.cameraView ? evalCamera(doc.state, this.ws.sceneFrame(doc)) : null;
+    const inv = cam ? invert(cameraMatrix(doc.state, cam)) : null;
+    return inv ? apply(inv, x, y) : [x, y];
   }
 
   private corners(d: DrawnLayer): [number, number][] | null {
     if (!d.local) return null;
     const [x0, y0, x1, y1] = d.local;
     return [apply(d.matrix, x0, y0), apply(d.matrix, x1, y0), apply(d.matrix, x1, y1), apply(d.matrix, x0, y1)];
+  }
+
+  /** The camera frame's label sits just above its top-left corner. */
+  private inCameraLabel(pts: [number, number][], x: number, y: number): boolean {
+    const [lx, ly] = pts[0];
+    return x >= lx && x <= lx + 90 && y >= ly - 20 && y <= ly;
   }
 
   private rotateHandle(d: DrawnLayer): [number, number] | null {
@@ -120,8 +151,8 @@ export class SceneStage {
     const s = doc.state;
     const [sx0, sy0] = apply(view, 0, 0);
     const [sx1, sy1] = apply(view, s.width, s.height);
-    // Dim the pasteboard around the stage.
-    ctx.fillStyle = 'rgba(10, 11, 14, 0.45)';
+    // Dim the pasteboard around the stage (nearly hide it through the camera: exports never show it).
+    ctx.fillStyle = this.throughCamera(doc) ? 'rgba(10, 11, 14, 0.82)' : 'rgba(10, 11, 14, 0.45)';
     ctx.fillRect(0, 0, cssW, sy0);
     ctx.fillRect(0, sy1, cssW, cssH - sy1);
     ctx.fillRect(0, sy0, sx0, sy1 - sy0);
@@ -139,11 +170,32 @@ export class SceneStage {
       ctx.stroke();
     };
     for (const d of this.drawn) {
-      if (d.layerIndex === doc.ui.layer) continue;
       const pts = this.corners(d);
       if (!pts) continue;
+      if (doc.state.layers[d.layerIndex]?.kind === 'camera') {
+        // The camera's frame (world view): what the camera sees, always shown.
+        ctx.save();
+        ctx.setLineDash([8, 5]);
+        outline(pts, d.layerIndex === this.hover || d.layerIndex === doc.ui.layer ? '#d7b8ff' : 'rgba(190, 150, 255, 0.85)', 2);
+        ctx.restore();
+        ctx.font = '600 12px system-ui, sans-serif';
+        ctx.fillStyle = 'rgba(40, 20, 70, 0.75)';
+        ctx.fillRect(pts[0][0], pts[0][1] - 19, 88, 18);
+        ctx.fillStyle = '#e4d2ff';
+        ctx.fillText('🎥 Camera', pts[0][0] + 6, pts[0][1] - 6);
+        continue;
+      }
+      if (d.layerIndex === doc.ui.layer) continue;
       if (d.layerIndex === this.hover) outline(pts, 'rgba(120, 200, 255, 0.9)', 1);
       else if (this.ws.settings.showBounds) outline(pts, 'rgba(120, 200, 255, 0.16)', 1);
+    }
+    if (this.throughCamera(doc)) {
+      // Looking through the camera: say so, so moving things is not confused with moving the world.
+      ctx.font = '600 11px system-ui, sans-serif';
+      ctx.fillStyle = 'rgba(40, 20, 70, 0.7)';
+      ctx.fillRect(sx0 + 6, sy0 + 6, 132, 18);
+      ctx.fillStyle = '#e4d2ff';
+      ctx.fillText('🎥 Camera view  (C)', sx0 + 12, sy0 + 19);
     }
     const sel = this.drawn.find((d) => d.layerIndex === doc.ui.layer);
     if (!sel || this.ws.playing) return;
@@ -180,9 +232,12 @@ export class SceneStage {
     ctx.lineTo(ox, oy + 6);
     ctx.stroke();
     const layer = doc.state.layers[sel.layerIndex];
-    const pose = layer ? evalLayer(layer, this.ws.sceneFrame(doc)) : null;
+    const pose = layer ? evalLayer(layer, this.ws.sceneFrame(doc), doc.state) : null;
     if (layer && pose) {
-      const label = `${layer.name}  x ${pose.x.toFixed(0)} y ${pose.y.toFixed(0)}  rot ${pose.rotation.toFixed(1)}°  ${pose.scaleX.toFixed(2)}×`;
+      const label =
+        layer.kind === 'camera'
+          ? `Camera  x ${pose.x.toFixed(0)} y ${pose.y.toFixed(0)}  rot ${pose.rotation.toFixed(1)}°  zoom ${(1 / Math.max(1e-3, Math.abs(pose.scaleX))).toFixed(2)}×`
+          : `${layer.name}  x ${pose.x.toFixed(0)} y ${pose.y.toFixed(0)}  rot ${pose.rotation.toFixed(1)}°  ${pose.scaleX.toFixed(2)}×`;
       ctx.font = '11px ui-monospace, monospace';
       const w = ctx.measureText(label).width + 8;
       const lx = Math.min(...pts.map((p) => p[0]));
@@ -201,6 +256,12 @@ export class SceneStage {
       const d = this.drawn[k];
       const layer = doc.state.layers[d.layerIndex];
       if (!layer || doc.ui.locked.has(layer.uid)) continue;
+      if (layer.kind === 'camera') {
+        // The camera frame is picked up by its border or its label, not its inside.
+        const pts = this.corners(d);
+        if (pts && (nearOutline(pts, x, y, 7) || this.inCameraLabel(pts, x, y))) return d.layerIndex;
+        continue;
+      }
       if (layer.kind === 'particle') {
         const [ox, oy] = apply(d.matrix, 0, 0);
         if (Math.hypot(ox - x, oy - y) <= 16) return d.layerIndex;
@@ -259,11 +320,13 @@ export class SceneStage {
       const pose = evalLayer(layer, frame)!;
       const [x0, y0, x1, y1] = sel.local!;
       const local: [number, number] = [(x0 + x1) / 2, (y0 + y1) / 2];
-      const m0 = poseMatrix(pose);
+      // A camera's frame is where it really looks (after following and shaking).
+      const cam = layer.kind === 'camera' ? evalCamera(doc.state, frame) : null;
+      const m0 = cam ? cameraFrameMatrix(cam) : poseMatrix(pose);
       const pivot = apply(m0, local[0], local[1]);
       // The undo step and the key are made on the first real movement, so a click changes nothing.
       if (handle.kind === 'rotate') {
-        const [wx, wy] = this.host.toStage(doc, x, y);
+        const [wx, wy] = this.toWorld(doc, x, y);
         this.drag = { kind: 'rotate', layer: sel.layerIndex, frame, pivot, startAngle: Math.atan2(wy - pivot[1], wx - pivot[0]), rot0: pose.rotation, local, sx: x, sy: y, began: false };
       } else {
         const cornerLocal: [number, number][] = [
@@ -296,7 +359,7 @@ export class SceneStage {
       doc.ui.cue = null;
       this.ws.emit('change');
     }
-    const pose = evalLayer(doc.state.layers[hit], frame);
+    const pose = evalLayer(doc.state.layers[hit], frame, doc.state);
     if (!pose) return true;
     this.drag = { kind: 'move', layer: hit, frame, sx: x, sy: y, x0: pose.x, y0: pose.y, began: false };
     return true;
@@ -310,16 +373,20 @@ export class SceneStage {
     if (drag.kind !== 'move' && !drag.began) {
       if (Math.abs(x - drag.sx) + Math.abs(y - drag.sy) < 3) return;
       drag.began = true;
-      doc.checkpoint(drag.kind === 'rotate' ? 'Rotate instance' : 'Scale instance');
+      const what = layer.kind === 'camera' ? 'camera' : 'instance';
+      doc.checkpoint(drag.kind === 'rotate' ? `Rotate ${what}` : layer.kind === 'camera' ? 'Zoom camera' : 'Scale instance');
       doc.touch(() => doc.ensureKey(drag.layer, drag.frame));
     }
     if (drag.kind === 'move') {
-      let dx = (x - drag.sx) / doc.view.zoom;
-      let dy = (y - drag.sy) / doc.view.zoom;
+      // World-space movement (through the camera's zoom and turn when looking through it).
+      const [ax, ay] = this.toWorld(doc, drag.sx, drag.sy, drag.frame);
+      const [bx, by] = this.toWorld(doc, x, y, drag.frame);
+      let dx = bx - ax;
+      let dy = by - ay;
       if (!drag.began) {
         if (Math.abs(x - drag.sx) + Math.abs(y - drag.sy) < 3) return;
         drag.began = true;
-        doc.checkpoint('Move instance');
+        doc.checkpoint(layer.kind === 'camera' ? 'Move camera' : 'Move instance');
       }
       if (shift) {
         if (Math.abs(dx) > Math.abs(dy)) dy = 0;
@@ -327,17 +394,26 @@ export class SceneStage {
       }
       doc.setKey(drag.layer, drag.frame, { x: Math.round(drag.x0 + dx), y: Math.round(drag.y0 + dy) });
     } else if (drag.kind === 'rotate') {
-      const [wx, wy] = this.host.toStage(doc, x, y);
+      const [wx, wy] = this.toWorld(doc, x, y, drag.frame);
       let rot = drag.rot0 + (Math.atan2(wy - drag.pivot[1], wx - drag.pivot[0]) - drag.startAngle) / DEG;
       if (shift) rot = Math.round(rot / 15) * 15;
       const pose = evalLayer(layer, drag.frame)!;
-      const patch = this.keepPivot({ ...pose, rotation: rot }, drag.local, drag.pivot);
+      // The camera turns about its own centre, so only its rotation changes.
+      const patch = layer.kind === 'camera' ? {} : this.keepPivot({ ...pose, rotation: rot }, drag.local, drag.pivot);
       doc.setKey(drag.layer, drag.frame, { ...patch, rotation: Math.round(rot * 100) / 100 });
     } else {
-      const [wx, wy] = this.host.toStage(doc, x, y);
+      const [wx, wy] = this.toWorld(doc, x, y, drag.frame);
       const [lx, ly] = apply(drag.inv, wx, wy);
       let fx = (lx - drag.local[0]) / (drag.corner[0] - drag.local[0] || 1);
       let fy = (ly - drag.local[1]) / (drag.corner[1] - drag.local[1] || 1);
+      if (layer.kind === 'camera') {
+        // Resizing the camera's frame zooms: it keeps the stage's shape and its centre.
+        const u = Math.max(0.02, (Math.abs(fx) + Math.abs(fy)) / 2);
+        const size = Math.round(drag.sx0 * u * 1000) / 1000;
+        doc.setKey(drag.layer, drag.frame, { scaleX: size, scaleY: size });
+        this.ws.emit('change');
+        return;
+      }
       if (shift) {
         const u = (Math.abs(fx) + Math.abs(fy)) / 2;
         fx = Math.sign(fx || 1) * u;
@@ -381,12 +457,18 @@ export class SceneStage {
     return had;
   }
 
-  /** Double-click: edit the prefab of the instance under the pointer, or a text layer's words. */
+  /** Double-click: edit the prefab of the instance under the pointer or a text layer's words, or look through the camera. */
   dblclick(doc: SceneDocument, x: number, y: number): void {
     const hit = this.hitLayer(doc, x, y);
     const layer = doc.state.layers[hit];
     if (!layer) return;
     if (layer.kind === 'text') return void this.editText(doc, hit);
+    if (layer.kind === 'camera') {
+      // Double-clicking the camera's frame looks through it.
+      doc.ui.cameraView = true;
+      this.ws.emit('change');
+      return;
+    }
     if (layer.kind !== 'image') void this.ws.editPrefab(layer.source, doc, layer);
   }
 
@@ -398,7 +480,7 @@ export class SceneStage {
       this.ws.status(`Layer "${layer.name}" is locked.`);
       return;
     }
-    const pose = evalLayer(layer, doc.ui.frame);
+    const pose = evalLayer(layer, doc.ui.frame, doc.state);
     if (!pose) return;
     doc.setKey(li, doc.ui.frame, { x: pose.x + dx, y: pose.y + dy }, 'Nudge instance');
     this.ws.emit('change');
@@ -503,8 +585,12 @@ export class SceneStage {
       ...(layer.kind === 'reanim' ? [{ label: 'Edit prefab', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc, layer) }] : []),
       ...(layer.kind === 'particle' ? [{ label: 'Edit effect', shortcut: 'dbl-click', action: () => void ws.editPrefab(layer.source, doc, layer) }] : []),
       ...(layer.kind === 'text' ? [{ label: 'Edit text…', shortcut: 'dbl-click', disabled: locked, action: () => void this.editText(doc, li) }] : []),
-      { label: 'Flip horizontally', disabled: !pose || locked, action: () => (this.flip(doc, li, !pose!.flipX), emit()) },
-      { label: 'Duplicate', shortcut: 'Ctrl+D', action: () => ((doc.ui.layer = doc.duplicateLayer(li)), emit()) },
+      ...(layer.kind === 'camera'
+        ? []
+        : [
+            { label: 'Flip horizontally', disabled: !pose || locked, action: () => (this.flip(doc, li, !pose!.flipX), emit()) },
+            { label: 'Duplicate', shortcut: 'Ctrl+D', action: () => ((doc.ui.layer = doc.duplicateLayer(li)), emit()) },
+          ]),
       { label: 'Delete layer', shortcut: 'Del', disabled: locked, action: () => (doc.removeLayer(li), emit()) },
       { separator: true },
       { label: 'Bring to front', disabled: li >= n - 1, action: () => (doc.moveLayer(li, n - 1), emit()) },
@@ -530,4 +616,16 @@ export class SceneStage {
       },
     ];
   }
+}
+
+/** Whether (x, y) is within `tol` pixels of the closed outline through `pts`. */
+function nearOutline(pts: [number, number][], x: number, y: number, tol: number): boolean {
+  for (let i = 0; i < pts.length; i++) {
+    const [ax, ay] = pts[i];
+    const [bx, by] = pts[(i + 1) % pts.length];
+    const len2 = (bx - ax) ** 2 + (by - ay) ** 2;
+    const t = len2 ? Math.max(0, Math.min(1, ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / len2)) : 0;
+    if (Math.hypot(x - (ax + t * (bx - ax)), y - (ay + t * (by - ay))) <= tol) return true;
+  }
+  return false;
 }

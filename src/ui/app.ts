@@ -7,7 +7,7 @@ import { interpolateTransform, transformMatrix } from '../engine/reanimRuntime';
 import { basename, extname, IMAGE_EXTS, SOUND_EXTS, stripExt, type VFile } from '../engine/vfs';
 import { isAnimTrackName, isRangeTrack } from '../formats/reanim';
 import { ReanimDocument } from '../editor/reanimDoc';
-import { cloneSceneState, SceneDocument } from '../editor/sceneDoc';
+import { cameraLayer, cloneSceneState, SceneDocument } from '../editor/sceneDoc';
 import type { EditorDocument, Workspace } from '../editor/workspace';
 import { AssetBrowser } from './assetBrowser';
 import { downloadBlob, h, isTextInput, pickFiles } from './dom';
@@ -79,7 +79,7 @@ export class App {
       dropAsset: (doc, asset, frame) => {
         if (!['reanim', 'particle', 'image'].includes(asset.kind)) return void ws.status('Only prefabs, particle effects, images and sounds can be added to a scene.');
         doc.ui.frame = doc.ui.frameEnd = frame;
-        void this.viewport.sceneStage.addAsset(doc, asset, doc.state.width / 2, doc.state.height / 2);
+        void this.viewport.sceneStage.addAsset(doc, asset, ...this.viewport.sceneStage.stageToWorld(doc, doc.state.width / 2, doc.state.height / 2));
       },
       shiftFrames: (doc, li, at, count) => this.shiftSceneFrames(doc, li, at, count),
       locked: (doc, li) => this.sceneLocked(doc, li),
@@ -393,6 +393,7 @@ export class App {
   private viewMenu(): MenuItem[] {
     const ws = this.ws;
     const s = ws.settings;
+    const sc = ws.scene;
     const toggle = (key: 'grid' | 'onion' | 'showBounds' | 'lawnGuide' | 'gameVisibility') => () => {
       s[key] = !s[key];
       ws.saveSettings();
@@ -408,6 +409,17 @@ export class App {
       { label: 'Show part outlines', shortcut: 'B', checked: s.showBounds, action: toggle('showBounds') },
       { label: 'Lawn cell guide (80×100)', shortcut: 'L', checked: s.lawnGuide, action: toggle('lawnGuide') },
       { label: 'In-game part visibility (hide what the game hides in code)', checked: s.gameVisibility, action: toggle('gameVisibility') },
+      ...(sc
+        ? [
+            {
+              label: 'Look through camera',
+              shortcut: 'C',
+              checked: sc.ui.cameraView && !!cameraLayer(sc.state),
+              disabled: !cameraLayer(sc.state),
+              action: () => this.toggleCameraView(sc),
+            },
+          ]
+        : []),
       {
         label: 'Background',
         submenu: (['dark', 'light', 'checker', 'lawn', 'night'] as const).map((b) => ({
@@ -688,7 +700,8 @@ export class App {
   /** "Add …" items for a scene (toolbar menu, Edit menu, timeline header). */
   private sceneAddMenu(doc: SceneDocument): MenuItem[] {
     const ws = this.ws;
-    const center = (): [number, number] => [doc.state.width / 2, doc.state.height / 2];
+    // The middle of what is on screen (through the camera, if looking through it).
+    const center = (): [number, number] => this.viewport.sceneStage.stageToWorld(doc, doc.state.width / 2, doc.state.height / 2);
     const add = (kind: string, path: string) => void this.viewport.sceneStage.addAsset(doc, { kind, path }, ...center());
     return [
       {
@@ -720,7 +733,26 @@ export class App {
         },
       },
       { label: 'Add sound cue…', action: () => void this.addSceneSoundCue(doc, doc.ui.frame) },
+      {
+        label: cameraLayer(doc.state) ? 'Select camera' : 'Add camera',
+        action: () => {
+          doc.ui.layer = doc.addCamera();
+          doc.ui.cue = null;
+          ws.emit('change');
+        },
+      },
     ];
+  }
+
+  /** Switch between looking through the scene's camera and seeing the whole world with its frame. */
+  private toggleCameraView(doc: SceneDocument) {
+    if (!cameraLayer(doc.state)) {
+      this.ws.status('This scene has no camera yet: add one with ＋ Layer ▸ Add camera (or the 🎥 button).');
+      return;
+    }
+    doc.ui.cameraView = !doc.ui.cameraView;
+    this.ws.status(doc.ui.cameraView ? 'Looking through the camera.' : 'Seeing the whole world: drag the camera’s frame to place it.');
+    this.ws.emit('change');
   }
 
   private async addSceneSoundCue(doc: SceneDocument, frame: number) {
@@ -1039,7 +1071,7 @@ export class App {
     const items: MenuItem[] = [];
     const sc = ws.scene;
     if (sc && (kind === 'reanim' || kind === 'particle' || kind === 'image')) {
-      items.push({ label: `Add to ${sc.name}`, action: () => void this.viewport.sceneStage.addAsset(sc, { kind, path: f.path }, sc.state.width / 2, sc.state.height / 2) });
+      items.push({ label: `Add to ${sc.name}`, action: () => void this.viewport.sceneStage.addAsset(sc, { kind, path: f.path }, ...this.viewport.sceneStage.stageToWorld(sc, sc.state.width / 2, sc.state.height / 2)) });
     }
     if (kind === 'reanim') items.push({ label: 'Edit prefab', action: () => void (sc ? ws.editPrefab(f.path, sc) : ws.openAsset(f.path)) });
     if (kind === 'particle') items.push({ label: 'Open', action: () => void ws.openAsset(f.path) });
@@ -1261,6 +1293,7 @@ export class App {
     if (key === 'k' || key === 'K') return handled(), this.sceneKey('toggle');
     if (key === 'F5') return handled(), this.sceneFrames(!e.shiftKey);
     if (key === 'F2' && li >= 0) return handled(), void this.renameLayer(doc, li);
+    if (key === 'c' || key === 'C') return handled(), this.toggleCameraView(doc);
     if ((key === ']' || key === '[') && li >= 0) return handled(), doc.moveLayer(li, li + (key === ']' ? 1 : -1)), ws.emit('change');
     if (key === 'h' && li >= 0) {
       handled();
@@ -1294,6 +1327,7 @@ export class App {
       ['Del', 'Delete selected layer or sound cue'],
       ['[ / ]', 'Send layer backward / forward'],
       ['H', 'Hide layer in the editor'],
+      ['C', 'Look through the camera / see the whole world'],
       ['F2', 'Rename layer'],
       ['Ctrl+D', 'Duplicate layer'],
       ['Ctrl+Z / Ctrl+Y', 'Undo / redo'],

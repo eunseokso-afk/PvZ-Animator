@@ -44,6 +44,18 @@ included in this repository.
 - Several scenes per project (Scenes tab), saved in project files. **Bake** turns a scene into a single
   `.reanim` (every part of every instance becomes a track) that the game can play as `anim_scene`.
 
+**Camera**
+- Each scene can have one camera (🎥 on the timeline, or ＋ Layer ▾ ▸ Add camera). It is a layer whose
+  keyframes place a frame in the world: move the frame to **pan**, size it to **zoom**, turn it to
+  **rotate**. Keys tween with the usual easing; **Static** (hold) keeps the camera still until the next key.
+- The inspector adds zoom, **shake** (tweens, so a key with 0 settles it), **follow** a layer (the camera's
+  x/y become an offset, and starting or stopping to follow pans smoothly), a colour filter and a fade to
+  black, plus one-click presets: Static, Push in, Pull out, Pan, Tilt, Shake and Reset.
+- Press **C** to switch between looking through the camera and seeing the whole world with the camera's
+  frame (drag its border to move it, its corners to zoom, its top handle to rotate; double-click it to
+  look through it). Video, PNG and sprite-sheet exports and **Bake** show what the camera sees (baking
+  keeps its motion; the reanim format has no room for the filter or fade).
+
 **Text**
 - Add text to a reanim (Edit ▸ Add text…, or the + on the timeline's PARTS row) or to a scene (Edit ▸ Add
   text…, or ＋ Layer ▾). Pick a PvZ font such as `FONT_HOUSEOFTERROR28` in the inspector.

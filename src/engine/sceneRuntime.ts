@@ -6,7 +6,7 @@
 import { gameHiddenTracks } from './gameVisibility';
 import { DEFAULT_TRANSFORM, isRangeTrack, type ReanimDefinition, type ReanimTransform } from '../formats/reanim';
 import type { LayerPose, SceneLayer, SceneState } from '../editor/sceneDoc';
-import { evalLayer, poseMatrix } from '../editor/sceneDoc';
+import { cameraFrameMatrix, cameraMatrix, evalCamera, evalLayer, poseMatrix } from '../editor/sceneDoc';
 import type { AssetLibrary } from './assets';
 import { apply, invert, mul, type Mat } from './math';
 import type { ParticleSystem } from './particleSystem';
@@ -118,6 +118,10 @@ export interface SceneDrawOptions {
   /** Multiply every layer's alpha (onion skins). */
   alpha?: number;
   drawBackground?: boolean;
+  /** Look through the scene's camera (default). False shows the world as it is. */
+  camera?: boolean;
+  /** When not looking through the camera, collect its frame so it can be selected and dragged. */
+  cameraFrame?: boolean;
 }
 
 function boundsOf(parts: DrawTrackInfo[], inv: Mat | null): [number, number, number, number] | null {
@@ -147,23 +151,37 @@ function boundsOf(parts: DrawTrackInfo[], inv: Mat | null): [number, number, num
 /** Draw a scene at a (possibly fractional) frame. `view` maps stage space to the canvas. */
 export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, frame: number, view: Readonly<Mat>, opts: SceneDrawOptions = {}): void {
   const assets = res.assets;
+  // The camera turns world coordinates into stage coordinates; `view` maps the stage to the screen.
+  const cam = opts.camera === false ? null : evalCamera(scene, frame);
+  const world = cam ? mul(view, cameraMatrix(scene, cam)) : view;
+  const filter = cam?.tint ?? [1, 1, 1];
   if (opts.drawBackground !== false) {
     r.fillRect(view, scene.width, scene.height, hexToRgba(scene.background), 'normal');
     if (scene.backgroundImage) {
       const img = assets.image(scene.backgroundImage);
       if (img) {
-        const m = mul(view, [scene.width / img.celWidth, 0, 0, scene.height / img.celHeight, 0, 0]);
-        r.drawImage(img, 0, 0, img.celWidth, img.celHeight, m, [1, 1, 1, 1], 'normal');
+        // The backdrop belongs to the world, so the camera pans and zooms over it.
+        const m = mul(world, [scene.width / img.celWidth, 0, 0, scene.height / img.celHeight, 0, 0]);
+        r.drawImage(img, 0, 0, img.celWidth, img.celHeight, m, [filter[0], filter[1], filter[2], 1], 'normal');
       }
     }
   }
   const alphaMul = opts.alpha ?? 1;
   scene.layers.forEach((layer, index) => {
     if (opts.hidden?.(layer)) return;
+    if (layer.kind === 'camera') {
+      // Not drawn; in world view its frame can be picked up and moved like a layer.
+      const fc = opts.cameraFrame && opts.camera === false ? evalCamera(scene, frame) : null;
+      if (fc && opts.collect) {
+        const m = mul(view, cameraFrameMatrix(fc));
+        opts.collect.push({ layerIndex: index, matrix: m, local: [-scene.width / 2, -scene.height / 2, scene.width / 2, scene.height / 2], parts: [] });
+      }
+      return;
+    }
     const pose = evalLayer(layer, frame);
     if (!pose || !pose.visible || pose.alpha <= 0) return;
-    const m = mul(view, poseMatrix(pose));
-    const color: RGBA = [pose.tint[0], pose.tint[1], pose.tint[2], Math.max(0, Math.min(1, pose.alpha * alphaMul))];
+    const m = mul(world, poseMatrix(pose));
+    const color: RGBA = [pose.tint[0] * filter[0], pose.tint[1] * filter[1], pose.tint[2] * filter[2], Math.max(0, Math.min(1, pose.alpha * alphaMul))];
     const parts: DrawTrackInfo[] = [];
     if (layer.kind === 'reanim') {
       const prefab = res.prefab(layer.source);
@@ -215,6 +233,8 @@ export function drawScene(r: Renderer, res: SceneResolver, scene: SceneState, fr
       opts.collect.push({ layerIndex: index, matrix: m, local, parts });
     }
   });
+  // The camera's fade darkens the whole picture, on top of everything.
+  if (cam && cam.fade > 0) r.fillRect(view, scene.width, scene.height, [0, 0, 0, cam.fade], 'normal');
 }
 
 export function hexToRgba(hex: string): RGBA {
@@ -261,8 +281,23 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
   // One anim track covering the whole scene, so the game can play it by name.
   tracks.push({ name: unique('anim_scene'), transforms: Array.from({ length: n }, () => ({ ...DEFAULT_TRANSFORM, f: 0 })) });
 
+  // The camera is baked into every part: each frame's world -> stage matrix comes first.
+  const IDENTITY: Mat = [1, 0, 0, 1, 0, 0];
+  const cams: Mat[] = [];
+  let camTinted = false;
+  let camFaded = false;
+  for (let f = 0; f < n; f++) {
+    const c = evalCamera(scene, f);
+    cams.push(c ? cameraMatrix(scene, c) : IDENTITY);
+    if (c && c.tint.some((v) => Math.abs(v - 1) > 1e-3)) camTinted = true;
+    if (c && c.fade > 1e-3) camFaded = true;
+  }
+  if (camTinted) warnings.push('The camera color filter was dropped: reanims have no per-track color.');
+  if (camFaded) warnings.push('The camera fade was dropped: reanims cannot darken the picture.');
+
   for (const layer of scene.layers) {
     const base = sanitize(layer.name);
+    if (layer.kind === 'camera') continue;
     if (layer.kind === 'particle') {
       warnings.push(`Particle layer "${layer.name}" was skipped: reanims cannot contain particle effects.`);
       continue;
@@ -276,7 +311,7 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
           continue;
         }
         if (pose.tint.some((c) => Math.abs(c - 1) > 1e-3)) tinted = true;
-        const d = decomposeMatrix(poseMatrix(pose));
+        const d = decomposeMatrix(mul(cams[f], poseMatrix(pose)));
         transforms.push({ ...DEFAULT_TRANSFORM, ...d, a: pose.alpha, i: imageIdFor(layer) });
       }
       tracks.push({ name: unique(base), transforms });
@@ -292,7 +327,7 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
           continue;
         }
         if (pose.tint.some((c) => Math.abs(c - 1) > 1e-3)) textColored = true;
-        const d = decomposeMatrix(poseMatrix(pose));
+        const d = decomposeMatrix(mul(cams[f], poseMatrix(pose)));
         transforms.push({ ...DEFAULT_TRANSFORM, ...d, a: pose.alpha, font: layer.source, text: pose.key.text });
       }
       tracks.push({ name: unique(base), transforms });
@@ -325,7 +360,7 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
         any = true;
         // A fullscreen fill ignores its transform in the game; only its alpha (and colour) matter.
         if (fullscreen) transforms.push({ ...t, f: 0, a: t.a * pose.alpha });
-        else transforms.push({ ...t, ...decomposeMatrix(mul(poseMatrix(pose), transformMatrix(t))), f: 0, a: t.a * pose.alpha });
+        else transforms.push({ ...t, ...decomposeMatrix(mul(cams[f], mul(poseMatrix(pose), transformMatrix(t)))), f: 0, a: t.a * pose.alpha });
       }
       // The game only treats tracks named attacher__* as attachers and "fullscreen" as a
       // screen fill, so keep those names (several tracks may share "fullscreen").
@@ -363,5 +398,6 @@ export function bakeScene(scene: SceneState, res: SceneResolver, imageIdFor: (la
 
 function round(v: number, digits: number): number {
   const p = 10 ** digits;
-  return Math.round(v * p) / p;
+  // (`|| 0` turns -0 into 0, so files never say "-0".)
+  return Math.round(v * p) / p || 0;
 }
